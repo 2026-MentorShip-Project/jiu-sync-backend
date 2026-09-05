@@ -1,3 +1,3 @@
-from django.shortcuts import render
+from rest_framework import viewsets  # noqa: F401
 
-# Create your views here.
+# Views for this app go here.
