@@ -1,10 +1,13 @@
-from .base import *  # noqa: F401,F403
-from .base import env
+from .base import *  # noqa: F403
+from .base import ALLOWED_HOSTS, SECRET_KEY, env
 
 DEBUG = False
 
-if not ALLOWED_HOSTS:  # noqa: F405
+if not ALLOWED_HOSTS:
     raise RuntimeError("DJANGO_ALLOWED_HOSTS must be set in production")
+
+if not SECRET_KEY or SECRET_KEY.startswith("django-insecure-"):
+    raise RuntimeError("DJANGO_SECRET_KEY must be set to a real secret in production")
 
 SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=True)
 SESSION_COOKIE_SECURE = True

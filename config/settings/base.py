@@ -36,6 +36,7 @@ DJANGO_APPS = [
 THIRD_PARTY_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
 ]
 
@@ -115,16 +116,24 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 
-# Email — console backend by default; override SMTP in prod via env.
+# Email (Django 6.1 MAILERS API) — console backend by default; override SMTP
+# in prod via env. Notifications per PRD §5 (finalized / deadline / board
+# update, only to participants who filled in an email).
 
-EMAIL_BACKEND = env(
-    "EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend"
-)
-EMAIL_HOST = env("EMAIL_HOST", default="")
-EMAIL_PORT = env.int("EMAIL_PORT", default=587)
-EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
-EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
-EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+MAILERS = {
+    "default": {
+        "BACKEND": env(
+            "EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend"
+        ),
+        "OPTIONS": {
+            "host": env("EMAIL_HOST", default=""),
+            "port": env.int("EMAIL_PORT", default=587),
+            "username": env("EMAIL_HOST_USER", default=""),
+            "password": env("EMAIL_HOST_PASSWORD", default=""),
+            "use_tls": env.bool("EMAIL_USE_TLS", default=True),
+        },
+    },
+}
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="jiu-sync@example.com")
 
 
@@ -157,17 +166,15 @@ SIMPLE_JWT = {
 # CORS — frontend SPA origin(s), comma-separated in env.
 
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
-CORS_ALLOW_CREDENTIALS = True
-
+# Auth is a JWT Authorization header, not a cookie — no cross-site credentials needed.
 
 # Celery — background tasks: 7-day soft-delete expiry sweep, Email
-# notifications (finalized / deadline / board update).
+# notifications (finalized / deadline / board update). Fire-and-forget: no
+# result backend, nothing queries task results.
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="redis://localhost:6379/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
 
 

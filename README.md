@@ -8,7 +8,7 @@
 - `apps/accounts` `apps/events` `apps/recommendations` `apps/notifications` — 空 app 骨架，待 openspec change 填入
 - `config/celery.py` — Celery app（broker/backend 走 Redis）
 - `docker-compose.yml` — 本地 Postgres + Redis
-- `openspec/` — SDD 工作流程，詳見 `openspec/AGENTS.md`
+- `openspec/` — SDD 工作流程，指令規則詳見 `CLAUDE.md`
 
 ## 開發啟動
 
@@ -20,10 +20,10 @@ uv run python manage.py migrate
 uv run python manage.py runserver
 ```
 
-Celery worker：
+Celery worker（`DJANGO_SETTINGS_MODULE` 必須明確指定，無預設值）：
 
 ```bash
-uv run celery -A config worker -l info
+DJANGO_SETTINGS_MODULE=config.settings.dev uv run celery -A config worker -l info
 ```
 
 ## 後續開發

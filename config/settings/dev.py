@@ -1,4 +1,5 @@
-from .base import *  # noqa: F401,F403
+from .base import *  # noqa: F403
+from .base import CORS_ALLOWED_ORIGINS
 
 DEBUG = True
 ALLOWED_HOSTS = ["*"]
