@@ -29,3 +29,13 @@ DJANGO_SETTINGS_MODULE=config.settings.dev uv run celery -A config worker -l inf
 ## 後續開發
 
 功能規格與實作透過 OpenSpec 走：`openspec/changes/` 提案 → 審核 → apply → archive。
+
+## Branch 規範
+
+- `main`：穩定版，只接受來自 `develop` 的 PR
+- `develop`：整合分支（GitHub default branch），所有 feature 分支從這裡切出
+- `feature/<name>`：從 `develop` 切出，開發完成後 PR 回 `develop`
+
+規則：**禁止直接 push 到 `main`/`develop`，一律走 PR + code review 後 merge。**
+
+> Branch protection（強制 PR review 才能 merge）需要 GitHub Pro/Team 付費方案，目前 org 是 free plan、repo 是 private，GitHub 端規則暫時無法設定，此規範現階段靠團隊自律遵守。org 升級方案後補上 `main`/`develop` 的 required PR review 保護規則。
