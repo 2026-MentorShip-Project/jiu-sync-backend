@@ -1,4 +1,6 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
@@ -30,5 +32,20 @@ def verify_google_id_token(token: str) -> dict:
 
     if claims.get("iss") not in _VALID_ISSUERS:
         raise GoogleTokenError("Invalid token issuer")
+
+    sub = claims.get("sub")
+    if not sub:
+        raise GoogleTokenError("Token is missing a stable subject identifier")
+
+    email = claims.get("email")
+    if not email:
+        raise GoogleTokenError("Token is missing an email claim")
+    try:
+        validate_email(email)
+    except ValidationError as exc:
+        raise GoogleTokenError("Token email claim is not a valid email address") from exc
+
+    if claims.get("email_verified") is not True:
+        raise GoogleTokenError("Token email claim is not verified by Google")
 
     return claims

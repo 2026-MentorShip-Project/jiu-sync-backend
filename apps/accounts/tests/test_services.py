@@ -12,6 +12,7 @@ def _base_claims(**overrides):
     claims = {
         "sub": "1234567890",
         "email": "host@example.com",
+        "email_verified": True,
         "aud": TEST_CLIENT_ID,
         "iss": "accounts.google.com",
         "exp": 9999999999,
@@ -76,3 +77,38 @@ def test_underlying_value_error_is_wrapped_as_google_token_error(mock_verify):
 
     with pytest.raises(GoogleTokenError):
         verify_google_id_token("some-expired-or-malformed-token")
+
+
+@override_settings(GOOGLE_OAUTH_CLIENT_ID=TEST_CLIENT_ID)
+@patch("apps.accounts.services.id_token.verify_oauth2_token")
+def test_missing_sub_raises_google_token_error(mock_verify):
+    """claims 缺少 sub → 拋出 GoogleTokenError，不直接回傳 claims。"""
+    claims = _base_claims()
+    del claims["sub"]
+    mock_verify.return_value = claims
+
+    with pytest.raises(GoogleTokenError):
+        verify_google_id_token("token-missing-sub")
+
+
+@override_settings(GOOGLE_OAUTH_CLIENT_ID=TEST_CLIENT_ID)
+@patch("apps.accounts.services.id_token.verify_oauth2_token")
+def test_missing_email_raises_google_token_error(mock_verify):
+    """claims 缺少 email → 拋出 GoogleTokenError。"""
+    claims = _base_claims()
+    del claims["email"]
+    mock_verify.return_value = claims
+
+    with pytest.raises(GoogleTokenError):
+        verify_google_id_token("token-missing-email")
+
+
+@override_settings(GOOGLE_OAUTH_CLIENT_ID=TEST_CLIENT_ID)
+@patch("apps.accounts.services.id_token.verify_oauth2_token")
+def test_email_not_verified_raises_google_token_error(mock_verify):
+    """claims 的 email_verified 為 False（或缺少）→ 拋出 GoogleTokenError。"""
+    claims = _base_claims(email_verified=False)
+    mock_verify.return_value = claims
+
+    with pytest.raises(GoogleTokenError):
+        verify_google_id_token("token-email-not-verified")

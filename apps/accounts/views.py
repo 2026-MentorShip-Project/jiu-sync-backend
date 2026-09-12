@@ -1,3 +1,5 @@
+import logging
+
 from django.db import IntegrityError, transaction
 from rest_framework import generics
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -11,6 +13,8 @@ from config.exceptions import ApiError
 from .models import User
 from .serializers import GoogleLoginSerializer, UserSerializer
 from .services import GoogleTokenError, verify_google_id_token
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleLoginView(APIView):
@@ -28,7 +32,10 @@ class GoogleLoginView(APIView):
         try:
             claims = verify_google_id_token(serializer.validated_data["idToken"])
         except GoogleTokenError as exc:
-            raise ApiError(str(exc), code="INVALID_ID_TOKEN", status_code=401) from exc
+            logger.warning("Google id_token verification failed: %s", exc)
+            raise ApiError(
+                "Google 登入驗證失敗，請重新登入", code="INVALID_ID_TOKEN", status_code=401
+            ) from exc
 
         google_sub = claims["sub"]
         email = claims["email"]
@@ -37,14 +44,34 @@ class GoogleLoginView(APIView):
 
         try:
             with transaction.atomic():
-                user = User.objects.create(
-                    google_sub=google_sub,
+                user = User.objects.create_user(
                     email=email,
+                    google_sub=google_sub,
                     display_name=display_name,
                     avatar_url=avatar_url,
                 )
-        except IntegrityError:
-            user = User.objects.get(google_sub=google_sub)
+        except IntegrityError as exc:
+            diag = getattr(exc.__cause__, "diag", None)
+            constraint_name = getattr(diag, "constraint_name", None)
+            if constraint_name == "accounts_user_google_sub_key":
+                user = User.objects.get(google_sub=google_sub)
+            else:
+                # Not (unambiguously) the google_sub race we expect. Before
+                # treating this as a genuine cross-account email conflict,
+                # rule out the case where this *is* the same account and
+                # Postgres simply happened to report the email constraint
+                # first (both unique constraints can be violated at once on
+                # a normal returning-user login, since email and google_sub
+                # both already match the existing row) — see design.md
+                # Post-review 修正 2.
+                existing_user = User.objects.filter(google_sub=google_sub).first()
+                if existing_user is None:
+                    raise ApiError(
+                        "此 email 已被另一個帳號使用",
+                        code="EMAIL_ALREADY_IN_USE",
+                        status_code=409,
+                    ) from exc
+                user = existing_user
 
         user.email = email
         user.display_name = display_name
@@ -79,7 +106,19 @@ class LogoutView(APIView):
         refresh_token = request.data.get("refresh")
 
         try:
-            RefreshToken(refresh_token).blacklist()
+            token = RefreshToken(refresh_token)
+        except TokenError as exc:
+            raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
+
+        if str(token["user_id"]) != str(request.user.id):
+            raise ApiError(
+                "只能撤銷自己的刷新憑證",
+                code="REFRESH_TOKEN_NOT_YOURS",
+                status_code=403,
+            )
+
+        try:
+            token.blacklist()
         except TokenError as exc:
             raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
 

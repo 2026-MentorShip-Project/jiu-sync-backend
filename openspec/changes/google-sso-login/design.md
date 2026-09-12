@@ -39,6 +39,36 @@
 - `POST /api/auth/logout/` — body `{refresh}`，把它加進 blacklist
 - `GET /api/me/` — `IsAuthenticated`，回傳目前主揪的個人資料
 
+## Post-review 補充決策（2026-09-13）
+
+實作完成後的 code review 抓到幾個真的問題，逐項確認並修正，不是重新設計：
+
+**修正 1：get-or-create 必須真的走 `UserManager.create_user()`，不能用 `User.objects.create()`。**
+原本的實作直接呼叫 `User.objects.create(google_sub=..., email=..., ...)`——這是 Django 預設 manager 的 `.create()`，跟自訂的 `UserManager.create_user()` 是兩個不同方法，`.create()` 完全不會呼叫 `set_unusable_password()`。實測確認：這樣建出來的使用者 `password == ""`、`has_usable_password() == True`，直接違反本文件前面「沒有可用密碼」這個決策。改成呼叫 `User.objects.create_user(email=..., google_sub=..., display_name=..., avatar_url=...)`。
+
+**修正 2：`IntegrityError` 要分辨是撞到哪個 unique constraint，不能無條件假設是 `google_sub`。**
+`email` 欄位也是 `unique=True`。情境：既有使用者 A（`google_sub=A`, `email=x@example.com`），另一個 Google 帳號 B 登入、Google 回傳的 email 剛好也是 `x@example.com`（`google_sub=B`）——`create_user()` 會因為 `email` unique constraint 失敗，但原本的 `except IntegrityError` 無條件執行 `get(google_sub=B)`，查不到（B 從未成功建立）→ 未處理的 `User.DoesNotExist` → 500。
+
+處理方式：捕捉到 `IntegrityError` 後，用 `exc.__cause__.diag.constraint_name`（psycopg 提供，Postgres-only 這個專案適用）判斷實際撞到哪個 constraint：
+- 是 `google_sub` 的 unique constraint → 這才是原本設計要處理的並發情境，走 `get(google_sub=...)`
+- 是 `email` 的 unique constraint（或任何其他非預期的 constraint）→ **拒絕登入**，拋 `ApiError(message, code="EMAIL_ALREADY_IN_USE", status_code=409)`。不自動合併帳號、不靜默覆蓋——已跟使用者確認這個政策：不同 Google 帳號共用 email 是異常情況，MVP 階段直接擋下最安全，比自動合併風險低。
+
+**修正 3：Google claims 要驗證必要欄位存在、且 `email_verified` 為真，不能直接信任簽章驗證通過就等於欄位齊全。**
+`verify_google_id_token` 目前只驗證簽章（audience/issuer），驗證通過後 view 直接 `claims["sub"]`／`claims["email"]`——如果 claims 缺這些欄位會 `KeyError` → 未格式化的 500。改為在 `services.py` 裡驗證完簽章後，額外檢查：
+- `sub` 存在且非空字串
+- `email` 存在、非空、格式合法（`django.core.validators.validate_email`）
+- `email_verified` 為 `True`（已跟使用者確認：要求這項，但不限制 Workspace 網域——`hd` claim 不驗證，這是對外公開登入的產品，不該限定特定公司網域）
+
+任何一項不符合都視同驗證失敗，拋 `GoogleTokenError`（沿用原本的 401／`INVALID_ID_TOKEN`，不需要為這幾種情況另外開新的 code——對前端來說都是「這個 Google 登入不被接受」，原因對使用者來說不需要細分）。
+
+**已跟使用者確認、這次不處理**：`is_active=False` 的使用者登入時目前沒有攔截檢查——這個專案目前完全沒有任何介面會把 `is_active` 設成 `False`（沒有停權功能），所以現在補這個檢查測不出真正的行為、只是防禦性程式碼。留到真的有停權功能的 change 一起做，不在這裡預先猜測停權後應該回什麼。
+
+**修正 4：Google 驗證失敗的錯誤訊息不能把第三方套件的原始例外文字直接回給前端。**
+原本 `GoogleLoginView` 直接 `raise ApiError(str(exc), code="INVALID_ID_TOKEN", status_code=401)`，`str(exc)` 是 `google-auth` 套件或本文件修正 3 新增的驗證邏輯產生的原始訊息，會讓對外 API 的措辭綁死第三方套件版本、也可能透露不必要的驗證細節。改為：對外 `message` 固定用一句通用文字（例如「Google 登入驗證失敗，請重新登入」），原始例外內容改用 `logging.getLogger(__name__).warning(...)` 記在伺服器端（不記錄 token 本身，只記錄例外訊息），`code=INVALID_ID_TOKEN` 維持不變，前端本來就該依賴 `code`、不是解析 `message` 文字。
+
+**修正 5：登出前要確認 refresh token 屬於呼叫者本人。**
+原本 `LogoutView` 只要求呼叫者帶合法 access token，之後直接撤銷 request body 裡指定的 refresh token，沒比對這個 refresh token 到底是不是呼叫者自己的——持有任意合法 access token的人可以撤銷別人的 refresh token（前提是要先拿到那個 token，不是帳號接管，但仍是不該允許的跨使用者操作，也不符合 spec「撤銷『其』刷新憑證」的用詞）。修正：`LogoutView` 在真的呼叫 `.blacklist()` 之前，先解析這個 refresh token 拿出它的 `user_id`（`SIMPLE_JWT["USER_ID_CLAIM"]` 設的是 `"user_id"`），跟 `request.user.id` 比對，不符就拋 `ApiError(message, code="REFRESH_TOKEN_NOT_YOURS", status_code=403)`，不執行撤銷。
+
 ## Risks / Trade-offs
 
 - **[Google 前端函式庫或流程改版]** → 後端只信任拿到的 `id_token`，前端的 OAuth 流程怎麼變都好，後端這個「傳 id_token 換 JWT」的介面不用跟著變，影響範圍有限。

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -49,6 +50,8 @@ def test_valid_id_token_returns_200_with_tokens_and_creates_user(mock_verify):
     assert body["user"]["name"] == "Host Name"
     assert "id" in body["user"]
     assert User.objects.count() == 1
+    created_user = User.objects.get(google_sub="1234567890")
+    assert created_user.has_usable_password() is False
 
 
 @patch("apps.accounts.views.verify_google_id_token")
@@ -81,6 +84,8 @@ def test_invalid_id_token_returns_401_and_creates_no_user(mock_verify):
     assert "message" in body
     assert body["code"] == "INVALID_ID_TOKEN"
     assert User.objects.count() == 0
+    assert body["message"] != "Token expired"
+    assert body["message"] == "Google 登入驗證失敗，請重新登入"
 
 
 @patch("apps.accounts.views.verify_google_id_token")
@@ -105,15 +110,26 @@ def test_returning_user_with_changed_claims_updates_local_record(mock_verify):
     assert user.avatar_url == "https://example.com/new-avatar.png"
 
 
-@patch("apps.accounts.views.User.objects.create")
 @patch("apps.accounts.views.verify_google_id_token")
-def test_concurrent_create_integrity_error_falls_back_to_get(mock_verify, mock_create):
-    """⑤ 併發：User.objects.create 拋 IntegrityError →
+def test_concurrent_create_integrity_error_falls_back_to_get(mock_verify):
+    """⑤ 併發：User.objects.create_user 拋 IntegrityError（google_sub 撞到）→
     view 改走 get(google_sub=...)，仍 200 並核發 token。
+
+    真實併發情境下，psycopg 會在 `exc.__cause__.diag.constraint_name` 附上實際撞到
+    的 constraint 名稱，這裡用一個假的 diag 物件模擬，確保測的是「google_sub 撞到」
+    這個併發情境，而不是被誤判成 email 衝突。
+
+    `User.objects.create_user` 的 patch 只包住 `client.post(...)` 那一段（而非整個測試
+    函式），因為測試本身也要用同一個 `create_user` 來模擬「另一個並發請求」已經
+    先建立好的既有使用者，若用函式層級的 @patch 裝飾器會連這段既有使用者的
+    建立都攔截掉。
     """
     claims = _base_claims()
     mock_verify.return_value = claims
-    mock_create.side_effect = IntegrityError("duplicate key value violates unique constraint")
+    fake_cause = Exception("duplicate key value violates unique constraint")
+    fake_cause.diag = SimpleNamespace(constraint_name="accounts_user_google_sub_key")
+    fake_integrity_error = IntegrityError("duplicate key value violates unique constraint")
+    fake_integrity_error.__cause__ = fake_cause
 
     # 模擬「另一個並發請求」已經先建立好這筆 User。
     existing_user = User.objects.create_user(
@@ -124,7 +140,11 @@ def test_concurrent_create_integrity_error_falls_back_to_get(mock_verify, mock_c
     )
 
     client = APIClient()
-    response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
+    with patch(
+        "apps.accounts.views.User.objects.create_user",
+        side_effect=fake_integrity_error,
+    ):
+        response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
 
     assert response.status_code == status.HTTP_200_OK
     body = response.json()
@@ -132,6 +152,39 @@ def test_concurrent_create_integrity_error_falls_back_to_get(mock_verify, mock_c
     assert "refresh" in body
     assert body["user"]["id"] == str(existing_user.id)
     assert User.objects.count() == 1
+
+
+@patch("apps.accounts.views.verify_google_id_token")
+def test_email_conflict_with_different_google_sub_returns_409(mock_verify):
+    """不同 Google 帳號的 email 撞到既有紀錄 → 409 EMAIL_ALREADY_IN_USE，
+    不建立新 User，也不覆寫既有紀錄。
+    """
+    existing_user = User.objects.create_user(
+        email="shared@example.com",
+        google_sub="existing-sub",
+        display_name="Existing Host",
+        avatar_url="https://example.com/existing.png",
+    )
+    mock_verify.return_value = _base_claims(
+        sub="new-sub",
+        email="shared@example.com",
+        name="New Host",
+        picture="https://example.com/new.png",
+    )
+    client = APIClient()
+
+    assert User.objects.count() == 1
+
+    response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    body = response.json()
+    assert body["code"] == "EMAIL_ALREADY_IN_USE"
+    assert User.objects.count() == 1
+    existing_user.refresh_from_db()
+    assert existing_user.google_sub == "existing-sub"
+    assert existing_user.display_name == "Existing Host"
+    assert existing_user.avatar_url == "https://example.com/existing.png"
 
 
 def test_me_with_valid_access_token_returns_200_with_profile_fields():
@@ -238,6 +291,41 @@ def test_refresh_then_logout_then_refresh_again_is_rejected(mock_verify):
     client.credentials()  # 清掉 Authorization，refresh 端點本來就不需要
     rejected_response = client.post(REFRESH_URL, {"refresh": rotated_refresh}, format="json")
     assert rejected_response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_logout_with_another_users_refresh_token_returns_403_and_does_not_revoke_it():
+    """用 A 的 access token 打 /api/auth/logout/，帶 B 的 refresh token
+    → 403 REFRESH_TOKEN_NOT_YOURS，且 B 的 refresh token 事後仍然有效。
+    """
+    user_a = User.objects.create_user(
+        email="host-a@example.com",
+        google_sub="sub-a",
+        display_name="Host A",
+        avatar_url="",
+    )
+    user_b = User.objects.create_user(
+        email="host-b@example.com",
+        google_sub="sub-b",
+        display_name="Host B",
+        avatar_url="",
+    )
+    access_token_a = str(RefreshToken.for_user(user_a).access_token)
+    refresh_b = RefreshToken.for_user(user_b)
+    refresh_token_b = str(refresh_b)
+
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token_a}")
+
+    response = client.post(LOGOUT_URL, {"refresh": refresh_token_b}, format="json")
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    body = response.json()
+    assert body["code"] == "REFRESH_TOKEN_NOT_YOURS"
+
+    client.credentials()
+    refresh_response = client.post(REFRESH_URL, {"refresh": refresh_token_b}, format="json")
+    assert refresh_response.status_code == status.HTTP_200_OK
+    assert refresh_response.json()["access"]
 
 
 def test_logout_with_invalid_refresh_token_returns_400():
