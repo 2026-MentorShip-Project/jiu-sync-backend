@@ -39,6 +39,20 @@ DRF 內建例外沒有 410，這裡補一個最小的子類別，用法跟 `ApiE
    - 其他情況（例如 `ValidationError` 的巢狀欄位字典）→ 取第一個欄位的第一條錯誤訊息，格式化成 `"<field>: <error>"` 這樣一句話（對應 Non-Goals 提到的取捨：不保留完整結構，只保證有一句可讀訊息）
 5. 把 `response.data` 整個換成 `{"message": message, "code": code}`，其餘（`status_code` 等）維持 DRF 預設 handler 已經算好的值。
 
+## Post-review 補充決策（2026-09-13）
+
+實作完成後的 code review 發現：`custom_exception_handler` 只在請求真的進到某個 DRF view 才會被呼叫；一個完全不匹配任何 URL 的請求（例如打錯路徑），Django 的 URL resolver 在進到任何 view 之前就直接回它自己的 HTML 404 頁——這是 spec 寫的「所有非 2xx」跟實作之間一個真實的落差，不是誤報。已跟使用者確認：補 Django 層級的 `handler404`／`handler500`，而不是把 spec 收窄成「只保證 DRF view 內」。
+
+**`handler404`／`handler500` 是 Django 的機制，不是 DRF 的。**
+在 `config/urls.py` 模組層級指定 `handler404 = "config.exceptions.handler404"`、`handler500 = "config.exceptions.handler500"`（Django 官方指定方式，必須是 URLconf 模組層級的名稱，不能塞進 `REST_FRAMEWORK` settings）。這兩個 view function 回傳跟 `custom_exception_handler` 一致的 `{"message": ..., "code": null}` 形狀（`handler404` 用固定訊息如「找不到這個路徑」；`handler500` 用固定的通用訊息，不能包含任何例外細節——見下方澄清）。
+
+**這不違反原本的 Non-Goal（不吞真正的伺服器錯誤）。**
+`handler500` 只改變「回給使用者的 body 長什麼樣子」，Django 自己的錯誤紀錄機制（`django.request` logger、`DEBUG=False` 時的錯誤通知）完全不受影響、照常運作——伺服器端看得到的資訊沒有變少，只是使用者不再看到一頁 HTML debug 頁或通用錯誤頁，而是跟其他 API 錯誤一致的 JSON。這跟 `custom_exception_handler` 本身「不吞不認得的 DRF 例外」的原則是兩件獨立的事：DRF 層級的例外處理邏輯完全沒變，這裡只是在 Django 最外層再加一層安全網。
+
+## Post-review 補充決策：巢狀驗證錯誤攤平（低優先度，一併處理）
+
+`_flatten_message` 原本只處理第一層 `list`，遇到巢狀 serializer 錯誤（例如 `{"child": ["bad"]}`）會產生 `field: {'child': ['bad']}` 這種還算是字串、但不算「一句可讀訊息」的結果。改成遞迴找第一個字串 leaf：如果值是 `dict` 或 `list`，繼續往下一層找，直到找到字串為止。
+
 ## Risks / Trade-offs
 
 - **[ValidationError 攤平成單一訊息，遺失欄位層級細節]** → 已知取捨（見 Non-Goals）。真的需要精確錯誤碼的情境，Swagger 文件顯示都是 view 自己手動拋 `ApiError` 指定 `code`（例如 `EVENT_CANCELLED`），不依賴這裡的自動攤平邏輯；如果之後發現前端真的需要逐欄位的驗證錯誤，屬於新的需求，屆時再開一次 change 處理，不在這次範圍內預先設計。
