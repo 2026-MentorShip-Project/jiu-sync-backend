@@ -155,6 +155,9 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # 全站一致的非 2xx 錯誤回應格式 {"message": ..., "code": ...}. See
+    # openspec/changes/api-error-format/design.md.
+    "EXCEPTION_HANDLER": "config.exceptions.custom_exception_handler",
 }
 
 SIMPLE_JWT = {
