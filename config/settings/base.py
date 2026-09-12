@@ -83,12 +83,13 @@ ASGI_APPLICATION = "config.asgi.application"
 
 # Database
 # PostgreSQL only — set DATABASE_URL, e.g.
-# postgres://user:password@localhost:5432/jiu_sync
+# postgres://user:password@localhost:5455/jiu_sync
+# (host port 5455, not Postgres's default 5432 — see docker-compose.yml)
 
 DATABASES = {
     "default": env.db_url(
         "DATABASE_URL",
-        default="postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync",
+        default="postgres://jiu_sync:jiu_sync@localhost:5455/jiu_sync",
     ),
 }
 
@@ -176,7 +177,7 @@ CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
 # notifications (finalized / deadline / board update). Fire-and-forget: no
 # result backend, nothing queries task results.
 
-CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
