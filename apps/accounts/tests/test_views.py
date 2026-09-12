@@ -5,6 +5,8 @@ from django.db import IntegrityError
 from rest_framework import status
 from rest_framework.reverse import reverse
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
@@ -14,6 +16,7 @@ pytestmark = pytest.mark.django_db
 
 GOOGLE_LOGIN_URL = reverse("accounts:google-login")
 ME_URL = "/api/me/"
+LOGOUT_URL = reverse("accounts:logout")
 
 
 def _base_claims(**overrides):
@@ -160,3 +163,49 @@ def test_me_without_token_returns_401():
     response = client.get(ME_URL)
 
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_logout_with_valid_refresh_token_returns_205_and_blacklists_it():
+    """① 帶合法 refresh token → 205，且該 token 被加入 blacklist。"""
+    user = User.objects.create_user(
+        email="host@example.com",
+        google_sub="1234567890",
+        display_name="Host Name",
+        avatar_url="https://example.com/avatar.png",
+    )
+    refresh = RefreshToken.for_user(user)
+    access_token = str(refresh.access_token)
+    refresh_token = str(refresh)
+
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+    response = client.post(LOGOUT_URL, {"refresh": refresh_token}, format="json")
+
+    assert response.status_code == status.HTTP_205_RESET_CONTENT
+    outstanding = OutstandingToken.objects.get(jti=refresh["jti"])
+    assert BlacklistedToken.objects.filter(token=outstanding).exists()
+
+    with pytest.raises(TokenError):
+        RefreshToken(refresh_token).blacklist()
+
+
+def test_logout_with_invalid_refresh_token_returns_400():
+    """② 帶格式錯誤／無效的 refresh → 400，body 符合 {message, code} 形狀。"""
+    user = User.objects.create_user(
+        email="host2@example.com",
+        google_sub="0987654321",
+        display_name="Host Name 2",
+        avatar_url="https://example.com/avatar2.png",
+    )
+    access_token = str(RefreshToken.for_user(user).access_token)
+
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+    response = client.post(LOGOUT_URL, {"refresh": "not-a-real-token"}, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    assert "message" in body
+    assert body["code"] == "INVALID_REFRESH_TOKEN"

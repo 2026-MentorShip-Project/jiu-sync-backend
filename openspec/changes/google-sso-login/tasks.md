@@ -34,8 +34,8 @@
 
 ## 5. Seam: `POST /api/auth/logout/`（對應 spec 需求：登出撤銷 Session）
 
-- [ ] 5.1 [RED] 寫 API 測試：① 帶合法 refresh token → 205，且該 token 被加入 blacklist（之後這個 refresh 對 `/api/auth/refresh/` 會被拒絕，可在此測試內直接驗證，或留給 6.1 整合驗證覆蓋）；② 帶無效/格式錯的 refresh → 400。確認現在是 FAIL — (auto) `pytest` 顯示 FAIL
-- [ ] 5.2 [GREEN] 實作 `LogoutView`（`IsAuthenticated`，`RefreshToken(token).blacklist()`），掛到 `urls.py` 的 `logout/`，讓 5.1 轉綠——滿足需求「登出撤銷 Session」 — (auto) `pytest` 該檔全綠
+- [x] 5.1 [RED] 寫 API 測試：① 帶合法 refresh token → 205，且該 token 被加入 blacklist（之後這個 refresh 對 `/api/auth/refresh/` 會被拒絕，可在此測試內直接驗證，或留給 6.1 整合驗證覆蓋）；② 帶無效/格式錯的 refresh → 400。確認現在是 FAIL — (auto) `pytest` 顯示 FAIL
+- [x] 5.2 [GREEN] 實作 `LogoutView`（`IsAuthenticated`，`RefreshToken(token).blacklist()`），掛到 `urls.py` 的 `logout/`，讓 5.1 轉綠——滿足需求「登出撤銷 Session」 — (auto) `pytest` 該檔全綠
 
 ## 6. `/api/auth/refresh/` 整合驗證（不開獨立 TDD cycle，對應 spec 需求：Session 刷新）
 

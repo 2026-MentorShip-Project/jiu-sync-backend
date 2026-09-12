@@ -3,6 +3,7 @@ from rest_framework import generics
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from config.exceptions import ApiError
@@ -63,6 +64,26 @@ class GoogleLoginView(APIView):
                 },
             }
         )
+
+
+class LogoutView(APIView):
+    """``POST /api/auth/logout/`` — 撤銷（blacklist）主揪的 refresh token，結束 session。
+
+    見 design.md「端點形狀」與
+    openspec/changes/google-sso-login/specs/user-auth/spec.md「登出撤銷 Session」。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        refresh_token = request.data.get("refresh")
+
+        try:
+            RefreshToken(refresh_token).blacklist()
+        except TokenError as exc:
+            raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
+
+        return Response(status=205)
 
 
 class MeView(generics.RetrieveAPIView):
