@@ -39,9 +39,9 @@
 
 ## 6. `/api/auth/refresh/` 整合驗證（不開獨立 TDD cycle，對應 spec 需求：Session 刷新）
 
-- [ ] 6.1 掛上 simplejwt 內建 `TokenRefreshView` 到 `urls.py` 的 `refresh/`；整合驗證：核發的 refresh token 換到新 access token；已被 5.1/5.2 撤銷（blacklist）的 refresh token 再打 `/refresh/` 會被拒絕——滿足需求「Session 刷新」 — (auto) `pytest` 整合測試全綠
+- [x] 6.1 掛上 simplejwt 內建 `TokenRefreshView` 到 `urls.py` 的 `refresh/`；整合驗證：核發的 refresh token 換到新 access token；已被 5.1/5.2 撤銷（blacklist）的 refresh token 再打 `/refresh/` 會被拒絕——滿足需求「Session 刷新」 — (auto) `pytest` 整合測試全綠
 
 ## 7. 收尾
 
-- [ ] 7.1 跑 `uv run ruff check .` 跟 `uv run python manage.py check`，確認兩者都乾淨無誤；跑全部測試（`uv run pytest`）確認整組綠燈 — (auto) 三個指令 exit code 皆 0
-- [ ] 7.2 驗證邊界需求「Google SSO 是主揪唯一登入方式」與「主揪身份驗證不影響參與者存取」：檢視這次 change 的異動檔案清單，確認沒有新增任何非 Google 的登入端點，也沒有修改 `apps/events` 或任何參與者相關路由 — (auto) `git diff --stat develop...HEAD` 只顯示 `apps/accounts/`、`config/settings/base.py`、`openspec/` 底下的檔案
+- [x] 7.1 跑 `uv run ruff check .` 跟 `uv run python manage.py check`，確認兩者都乾淨無誤；跑全部測試（`uv run pytest`）確認整組綠燈 — (auto) 三個指令 exit code 皆 0
+- [x] 7.2 驗證邊界需求「Google SSO 是主揪唯一登入方式」與「主揪身份驗證不影響參與者存取」：檢視這次 change 的異動檔案清單，確認沒有新增任何非 Google 的登入端點，也沒有修改 `apps/events` 或任何參與者相關路由 — (auto) `git diff --stat develop...HEAD` 只顯示 `apps/accounts/`、`config/settings/base.py`、`openspec/` 底下的檔案
