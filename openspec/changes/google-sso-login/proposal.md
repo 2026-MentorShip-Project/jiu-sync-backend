@@ -6,7 +6,7 @@ PRD（登入權限與路由控制 & AI 聚餐選餐廳 產品修改規格書 §2
 
 - 新增 `accounts.User` model：以 email 為 `USERNAME_FIELD`，`google_sub`（Google 帳號 subject id）唯一值，無可用密碼（Google SSO only，`set_unusable_password()`）
 - 後端驗證前端傳來的 Google `id_token`：用 `google-auth` 套件驗證 audience（比對 `GOOGLE_OAUTH_CLIENT_ID`）與 issuer，驗證失敗回 401
-- 登入 API：`POST /api/auth/google/`，帶 `id_token`，驗證通過後 get-or-create User，換發本站 JWT（access/refresh，simplejwt）
+- 登入 API：`POST /api/auth/google/`，帶 `idToken`（跟前端既有的 Swagger 文件命名對齊），驗證通過後 get-or-create User，換發本站 JWT（access/refresh，simplejwt）
 - Refresh API：`POST /api/auth/refresh/`（simplejwt 內建 `TokenRefreshView`）
 - 登出 API：`POST /api/auth/logout/`，撤銷 refresh token（用已裝好的 `rest_framework_simplejwt.token_blacklist`）
 - 個人資料 API：`GET /api/auth/me/`，回傳目前登入主揪的 email/display_name/avatar_url，需帶 access token

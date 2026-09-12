@@ -34,7 +34,7 @@
 **JWT 效期與 rotation** 已經在 `config/settings/base.py` 定案（`SIMPLE_JWT`：access 2 小時／refresh 14 天，refresh 時 rotate、rotate 後舊 token 進 blacklist）——這次 change 是照這個設定實作，不是重新決定數值。
 
 **端點形狀**，都掛在 `/api/auth/` 下（`config/urls.py` → `apps/accounts/urls.py` 已經接好）：
-- `POST /api/auth/google/` — body `{id_token}`，回傳 `{access, refresh}`（或 401）
+- `POST /api/auth/google/` — body `{idToken}`（欄位命名跟前端既有 Swagger 文件對齊，非 Python 慣用的 snake_case），回傳 `{access, refresh, user}`（或 401）
 - `POST /api/auth/refresh/` — 用 simplejwt 內建的 `TokenRefreshView`，不用自己寫
 - `POST /api/auth/logout/` — body `{refresh}`，把它加進 blacklist
 - `GET /api/auth/me/` — `IsAuthenticated`，回傳目前主揪的個人資料

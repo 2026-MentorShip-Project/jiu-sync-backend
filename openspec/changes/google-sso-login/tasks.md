@@ -19,11 +19,11 @@
 ## 3. Seam: `POST /api/auth/google/`（對應 spec 需求：主揪 Session 核發、回訪主揪的個人資料隨 Google 端更新同步）
 
 - [ ] 3.1 [RED] 在 `apps/accounts/tests/test_views.py` 寫 API 測試（走 DRF test client 打 HTTP，`verify_google_id_token` 用 mock 替換掉，不真的呼叫 Google）：
-  ① 合法 id_token → 200/201，回傳 body 含 `access`/`refresh`，且資料庫多一筆 `User`
-  ② 同一個 `google_sub` 的合法 id_token 再打一次 → 不新增第二筆 `User`（get-or-create）
+  ① 合法 `idToken` → 200（跟前端 Swagger 契約對齊，固定 200，不分新建/既有使用者），回傳 body 含 `access`/`refresh`/`user`，且資料庫多一筆 `User`
+  ② 同一個 `google_sub` 的合法 `idToken` 再打一次 → 不新增第二筆 `User`（get-or-create）
   ③ `verify_google_id_token` 拋 `GoogleTokenError` → 回 401，不建立任何 `User`
   ④ 已存在的 `google_sub`，claims 的 email／display_name／avatar_url 跟本地紀錄不同時再登入 → 該筆 `User` 對應欄位被更新為本次 claims 的值（design.md「每次登入都同步更新」）
-  ⑤ 併發：mock `User.objects.create` 讓第一次呼叫拋 `IntegrityError`（模擬另一個並發請求搶先 insert 成功），驗證 view 改走 `get(google_sub=...)` 拿到既有那筆、正常回應 200/201 並核發 token，而不是讓請求整個失敗（design.md「並發登入保護」）
+  ⑤ 併發：mock `User.objects.create` 讓第一次呼叫拋 `IntegrityError`（模擬另一個並發請求搶先 insert 成功），驗證 view 改走 `get(google_sub=...)` 拿到既有那筆、正常回應 200 並核發 token，而不是讓請求整個失敗（design.md「並發登入保護」）
   確認這組測試現在是 FAIL（view 還沒接上）— (auto) `pytest` 顯示這幾條 FAIL
 - [ ] 3.2 [GREEN] 實作 `GoogleLoginSerializer`（`apps/accounts/serializers.py`）、`GoogleLoginView`（`apps/accounts/views.py`，`AllowAny`）：呼叫 `verify_google_id_token` → 在 `transaction.atomic()` 內先嘗試 `User.objects.create(google_sub=..., email=..., display_name=..., avatar_url=...)`，捕捉 `IntegrityError` 則改 `User.objects.get(google_sub=...)` 並用當次 claims 更新 `email`/`display_name`/`avatar_url` 後 `save()`（既有使用者的一般路徑也走這個更新，不只並發衝突時才做）→ `RefreshToken.for_user(user)`，掛到 `apps/accounts/urls.py` 的 `google/`，讓 3.1 全部轉綠——滿足需求「主揪 Session 核發」與「回訪主揪的個人資料隨 Google 端更新同步」 — (auto) `pytest` 該檔全綠
 
