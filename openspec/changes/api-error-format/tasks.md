@@ -20,3 +20,18 @@
 
 - [x] 3.1 在 `config/settings/base.py` 的 `REST_FRAMEWORK` 加上 `"EXCEPTION_HANDLER": "config.exceptions.custom_exception_handler"` — (auto) `python manage.py check` 無錯
 - [x] 3.2 跑 `uv run pytest`（全專案）、`uv run ruff check .`、`uv run python manage.py check`，三者皆需乾淨 — (auto) 三個指令 exit code 皆 0
+
+## 4. Post-review 修正：`handler404`／`handler500`（對應需求「未匹配任何路由的請求也符合統一格式」）
+
+- [x] 4.1 [RED] 在 `config/tests/test_exceptions.py` 寫測試：用 Django test `Client()`（不是 DRF 的 `APIClient`，因為要測的是 URL resolver 層級，不透過任何 DRF view）打一個不存在的路徑 → ① 狀態碼 404 ② `response.json() == {"message": ..., "code": None}`（`message` 只要是非空字串即可，不檢查精確文字）。確認先是 FAIL（`handler404` 還不存在，此刻應該還是拿到 HTML）——滿足需求「未匹配任何路由的請求也符合統一格式」 — (auto) `pytest` 顯示 FAIL
+- [x] 4.2 [GREEN] 在 `config/exceptions.py` 實作 `handler404(request, exception)`、`handler500(request)`（Django 的 handler 簽名規定如此，`handler500` 沒有 `exception` 參數），各自回傳 `JsonResponse({"message": ..., "code": None}, status=404/500)`；在 `config/urls.py` 模組層級加上 `handler404 = "config.exceptions.handler404"`、`handler500 = "config.exceptions.handler500"`。只寫到讓 4.1 轉綠 — (auto) `pytest` 該檔全綠
+- [x] 4.3 手動確認 `handler500` 沒有把例外細節洩漏進回應（`message` 是寫死的固定字串，不是 `str(exc)`），也沒有影響 Django 自己的錯誤紀錄機制（不用寫測試驗證日誌，只要程式碼本身沒有攔截/覆蓋 `django.request` logger 或任何錯誤通知機制即可，用 code review 確認） — (auto) 檢視 `config/exceptions.py` 的 diff，確認沒有動到任何 logging 相關設定
+
+## 5. Post-review 修正：巢狀驗證錯誤攤平
+
+- [x] 5.1 [RED] 在 `config/tests/test_exceptions.py` 寫測試：拋 `rest_framework.exceptions.ValidationError({"parent": {"child": ["bad"]}})`（巢狀兩層），驗證 `custom_exception_handler` 轉出來的 `message` 是一句純字串（不含 `{`/`}` 這種 dict repr 痕跡），且包含 `"bad"` 這個實際的 leaf 錯誤內容。確認先是 FAIL（目前的 `_flatten_message` 只攤平第一層，會產生 `parent: {'child': ['bad']}` 這種還帶 dict repr 的字串）— (auto) `pytest` 顯示 FAIL
+- [x] 5.2 [GREEN] 把 `config/exceptions.py` 的 `_flatten_message` 改成遞迴：值是 `dict`/`list` 就繼續往下一層找，直到找到字串 leaf 為止，才組成 `"<field>: <leaf>"`。只寫到讓 5.1 轉綠 — (auto) `pytest` 該檔全綠
+
+## 6. 收尾
+
+- [x] 6.1 跑 `uv run pytest`（全專案）、`uv run ruff check .`、`uv run python manage.py check`，三者皆需乾淨 — (auto) 三個指令 exit code 皆 0

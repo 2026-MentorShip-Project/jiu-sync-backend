@@ -1,3 +1,4 @@
+from django.test import Client, override_settings
 from rest_framework.exceptions import NotAuthenticated, ValidationError
 
 from config.exceptions import ApiError, Gone, custom_exception_handler
@@ -78,3 +79,32 @@ def test_handler_returns_none_for_unrecognized_exception():
     response = custom_exception_handler(exc, {})
 
     assert response is None
+
+
+@override_settings(DEBUG=False)
+def test_unmatched_url_returns_unified_json_404():
+    """完全不匹配任何 URL 的請求，走不到任何 DRF view，也要符合統一格式（handler404）。"""
+    client = Client()
+
+    response = client.get("/api/this-does-not-exist/")
+
+    assert response.status_code == 404
+    data = response.json()
+    assert set(data.keys()) == {"message", "code"}
+    assert isinstance(data["message"], str)
+    assert data["message"]
+    assert data["code"] is None
+
+
+def test_handler_flattens_two_level_nested_validation_error():
+    """兩層巢狀的 ValidationError（dict 裡面又是 dict）也要攤平成純字串，不留 dict repr 痕跡。"""
+    exc = ValidationError({"parent": {"child": ["bad"]}})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["code"] is None
+    message = response.data["message"]
+    assert isinstance(message, str)
+    assert "{" not in message
+    assert "}" not in message
+    assert "bad" in message

@@ -27,3 +27,6 @@ urlpatterns = [
     path('api/recommendations/', include('apps.recommendations.urls')),
     path('api/notifications/', include('apps.notifications.urls')),
 ]
+
+handler404 = "config.exceptions.handler404"
+handler500 = "config.exceptions.handler500"

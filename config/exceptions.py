@@ -4,6 +4,7 @@
 見 openspec/changes/api-error-format/design.md。
 """
 
+from django.http import JsonResponse
 from rest_framework.exceptions import APIException
 from rest_framework.views import exception_handler as drf_exception_handler
 
@@ -31,20 +32,34 @@ class Gone(ApiError):
         super().__init__(message, code=code, status_code=410)
 
 
+def _find_leaf(value):
+    """遞迴往下找到第一個字串 leaf，直到不再是 dict/list 為止。
+
+    - dict → 取第一個 key 對應的值，繼續往下找
+    - list → 取第一個元素，繼續往下找
+    - 其他 → 已經是 leaf，轉成字串回傳
+    """
+    if isinstance(value, dict):
+        return _find_leaf(next(iter(value.values())))
+    if isinstance(value, list):
+        return _find_leaf(value[0])
+    return str(value)
+
+
 def _flatten_message(data):
     """從 DRF 預設 handler 算好的 `response.data` 裡抽出一句可讀訊息。
 
     - dict 且有 "detail" 鍵 → 用它
     - 字串 → 直接用
-    - 其他（例如 ValidationError 的巢狀欄位字典）→ 取第一個欄位的第一條錯誤，
-      格式化成 "<field>: <error>"。不保留完整結構，見 design.md Non-Goals。
+    - 其他（例如 ValidationError 的巢狀欄位字典，可能巢狀多層）→ 取第一個欄位，
+      遞迴往下找到第一個字串 leaf，格式化成 "<field>: <leaf>"。不保留完整結構，
+      見 design.md Non-Goals。
     """
     if isinstance(data, dict):
         if "detail" in data:
             return str(data["detail"])
         field, errors = next(iter(data.items()))
-        first_error = errors[0] if isinstance(errors, list) else errors
-        return f"{field}: {first_error}"
+        return f"{field}: {_find_leaf(errors)}"
     return str(data)
 
 
@@ -68,3 +83,23 @@ def custom_exception_handler(exc, context):
 
     response.data = {"message": message, "code": code}
     return response
+
+
+def handler404(request, exception):
+    """Django URL resolver 層級的 404（走不到任何 view）——見 design.md Post-review 補充決策。
+
+    只在 `config.urls` 模組層級透過 `handler404 = "config.exceptions.handler404"`
+    被 Django 引用，簽名是 Django 規定的 `(request, exception)`。
+    """
+    return JsonResponse({"message": "找不到這個路徑", "code": None}, status=404)
+
+
+def handler500(request):
+    """Django 層級的 500（連 DRF 例外處理都攔不到）——見 design.md Post-review 補充決策。
+
+    `message` 是寫死的固定字串，不能包含 `exception` 細節，避免洩漏內部資訊。
+    Django 自己的錯誤紀錄機制（`django.request` logger、錯誤通知）完全不受影響，
+    這裡只改變回給使用者的 body 形狀。簽名是 Django 規定的 `(request)`，沒有
+    `exception` 參數。
+    """
+    return JsonResponse({"message": "伺服器發生未預期的錯誤", "code": None}, status=500)
