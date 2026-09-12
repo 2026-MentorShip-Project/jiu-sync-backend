@@ -37,7 +37,7 @@
 - `POST /api/auth/google/` — body `{idToken}`（欄位命名跟前端既有 Swagger 文件對齊，非 Python 慣用的 snake_case），回傳 `{access, refresh, user}`（或 401）
 - `POST /api/auth/refresh/` — 用 simplejwt 內建的 `TokenRefreshView`，不用自己寫
 - `POST /api/auth/logout/` — body `{refresh}`，把它加進 blacklist
-- `GET /api/auth/me/` — `IsAuthenticated`，回傳目前主揪的個人資料
+- `GET /api/me/` — `IsAuthenticated`，回傳目前主揪的個人資料
 
 ## Risks / Trade-offs
 

@@ -9,7 +9,7 @@ PRD（登入權限與路由控制 & AI 聚餐選餐廳 產品修改規格書 §2
 - 登入 API：`POST /api/auth/google/`，帶 `idToken`（跟前端既有的 Swagger 文件命名對齊），驗證通過後 get-or-create User，換發本站 JWT（access/refresh，simplejwt）
 - Refresh API：`POST /api/auth/refresh/`（simplejwt 內建 `TokenRefreshView`）
 - 登出 API：`POST /api/auth/logout/`，撤銷 refresh token（用已裝好的 `rest_framework_simplejwt.token_blacklist`）
-- 個人資料 API：`GET /api/auth/me/`，回傳目前登入主揪的 email/display_name/avatar_url，需帶 access token
+- 個人資料 API：`GET /api/me/`，回傳目前登入主揪的 email/display_name/avatar_url，需帶 access token
 - 不包含：django-allauth 整合、Google 以外的登入方式、任何參與者（被揪者）相關端點——PRD §2.2 參與者頁維持完全免登入，此次變更不觸碰
 
 ## Capabilities

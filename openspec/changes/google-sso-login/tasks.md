@@ -1,4 +1,4 @@
-> TDD 排法：每個 seam 都是「先寫會失敗的測試（RED）→ 只寫剛好讓它通過的最小實作（GREEN）」一組，垂直切，不要把所有測試一次寫完才開始實作。Seam 範圍已與使用者確認：`verify_google_id_token` 單獨測；`/api/auth/google/`、`/api/auth/logout/`、`/api/auth/me/` 三個走 HTTP 層測；`/api/auth/refresh/` 是 simplejwt 內建 view，不開獨立 cycle，只做整合驗證。
+> TDD 排法：每個 seam 都是「先寫會失敗的測試（RED）→ 只寫剛好讓它通過的最小實作（GREEN）」一組，垂直切，不要把所有測試一次寫完才開始實作。Seam 範圍已與使用者確認：`verify_google_id_token` 單獨測；`/api/auth/google/`、`/api/auth/logout/`、`/api/me/` 三個走 HTTP 層測；`/api/auth/refresh/` 是 simplejwt 內建 view，不開獨立 cycle，只做整合驗證。
 >
 > 這個 change 不引入新工具鏈／新依賴（`google-auth`、`djangorestframework-simplejwt`、`token_blacklist` 骨架階段已裝好），依規則不需要獨立的環境健檢 task。
 >
@@ -27,10 +27,10 @@
   確認這組測試現在是 FAIL（view 還沒接上）— (auto) `pytest` 顯示這幾條 FAIL
 - [x] 3.2 [GREEN] 實作 `GoogleLoginSerializer`（`apps/accounts/serializers.py`）、`GoogleLoginView`（`apps/accounts/views.py`，`AllowAny`）：呼叫 `verify_google_id_token`，捕捉 `GoogleTokenError` 時改拋 `config.exceptions.ApiError(message, code="INVALID_ID_TOKEN", status_code=401)`（`api-error-format` change 已完成，直接用，不要自己手刻 401 回應）→ 在 `transaction.atomic()` 內先嘗試 `User.objects.create(google_sub=..., email=..., display_name=..., avatar_url=...)`，捕捉 `IntegrityError` 則改 `User.objects.get(google_sub=...)` 並用當次 claims 更新 `email`/`display_name`/`avatar_url` 後 `save()`（既有使用者的一般路徑也走這個更新，不只並發衝突時才做）→ `RefreshToken.for_user(user)`，掛到 `apps/accounts/urls.py` 的 `google/`，讓 3.1 全部轉綠——滿足需求「主揪 Session 核發」與「回訪主揪的個人資料隨 Google 端更新同步」 — (auto) `pytest` 該檔全綠
 
-## 4. Seam: `GET /api/auth/me/`（對應 spec 需求：已登入主揪的身份查詢）
+## 4. Seam: `GET /api/me/`（對應 spec 需求：已登入主揪的身份查詢）
 
-- [ ] 4.1 [RED] 寫 API 測試：① 帶合法 access token → 200，回傳正確的 `id`/`email`/`display_name`/`avatar_url`/`date_joined`；② 不帶 token → 401。確認現在是 FAIL — (auto) `pytest` 顯示 FAIL
-- [ ] 4.2 [GREEN] 實作 `UserSerializer`（唯讀）、`MeView`（`IsAuthenticated`），掛到 `urls.py` 的 `me/`，讓 4.1 轉綠——滿足需求「已登入主揪的身份查詢」 — (auto) `pytest` 該檔全綠
+- [x] 4.1 [RED] 寫 API 測試：① 帶合法 access token → 200，回傳正確的 `id`/`email`/`display_name`/`avatar_url`/`date_joined`；② 不帶 token → 401。確認現在是 FAIL — (auto) `pytest` 顯示 FAIL
+- [x] 4.2 [GREEN] 實作 `UserSerializer`（唯讀）、`MeView`（`IsAuthenticated`），掛到 `urls.py` 的 `me/`，讓 4.1 轉綠——滿足需求「已登入主揪的身份查詢」 — (auto) `pytest` 該檔全綠
 
 ## 5. Seam: `POST /api/auth/logout/`（對應 spec 需求：登出撤銷 Session）
 

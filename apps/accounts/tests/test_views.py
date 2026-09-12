@@ -5,6 +5,7 @@ from django.db import IntegrityError
 from rest_framework import status
 from rest_framework.reverse import reverse
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
 from apps.accounts.services import GoogleTokenError
@@ -12,6 +13,7 @@ from apps.accounts.services import GoogleTokenError
 pytestmark = pytest.mark.django_db
 
 GOOGLE_LOGIN_URL = reverse("accounts:google-login")
+ME_URL = "/api/me/"
 
 
 def _base_claims(**overrides):
@@ -126,3 +128,35 @@ def test_concurrent_create_integrity_error_falls_back_to_get(mock_verify, mock_c
     assert "refresh" in body
     assert body["user"]["id"] == str(existing_user.id)
     assert User.objects.count() == 1
+
+
+def test_me_with_valid_access_token_returns_200_with_profile_fields():
+    """① 帶合法 access token → 200，回傳正確的 id/email/display_name/avatar_url/date_joined。"""
+    user = User.objects.create_user(
+        email="host@example.com",
+        google_sub="1234567890",
+        display_name="Host Name",
+        avatar_url="https://example.com/avatar.png",
+    )
+    access_token = str(RefreshToken.for_user(user).access_token)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["id"] == str(user.id)
+    assert body["email"] == "host@example.com"
+    assert body["display_name"] == "Host Name"
+    assert body["avatar_url"] == "https://example.com/avatar.png"
+    assert "date_joined" in body
+
+
+def test_me_without_token_returns_401():
+    """② 不帶任何 Authorization header 打 GET /api/me/ → 401。"""
+    client = APIClient()
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED

@@ -1,5 +1,6 @@
 from django.db import IntegrityError, transaction
-from rest_framework.permissions import AllowAny
+from rest_framework import generics
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -7,7 +8,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from config.exceptions import ApiError
 
 from .models import User
-from .serializers import GoogleLoginSerializer
+from .serializers import GoogleLoginSerializer, UserSerializer
 from .services import GoogleTokenError, verify_google_id_token
 
 
@@ -62,3 +63,18 @@ class GoogleLoginView(APIView):
                 },
             }
         )
+
+
+class MeView(generics.RetrieveAPIView):
+    """``GET /api/me/`` — 已登入主揪查詢自己的身份資料。
+
+    掛在 config/urls.py 的根路徑（非 apps/accounts/urls.py 的 `/api/auth/` 前綴），
+    對齊前端既有 Swagger 契約。見 design.md「端點形狀」與
+    openspec/changes/google-sso-login/specs/user-auth/spec.md「已登入主揪的身份查詢」。
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = UserSerializer
+
+    def get_object(self):
+        return self.request.user
