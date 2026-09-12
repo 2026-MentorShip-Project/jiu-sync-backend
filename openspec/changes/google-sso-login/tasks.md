@@ -6,26 +6,26 @@
 
 ## 1. 前置：Settings 與 User Model（非 seam，不走 TDD cycle）
 
-- [ ] 1.1 在 `config/settings/base.py` 設定 `AUTH_USER_MODEL = "accounts.User"` — (auto) `python manage.py check`（此刻預期報錯，因為 model 還沒建，1.1/1.2 同一個 commit 完成才會轉正常）
-- [ ] 1.2 實作 `apps/accounts/models.py`：`User(AbstractBaseUser, PermissionsMixin)`，含 UUID `id`、唯一 `email`（`USERNAME_FIELD`）、唯一 `google_sub`、`display_name`、`avatar_url`、`is_active`、`is_staff`、`date_joined`；自訂 `UserManager`，含 `create_user(email, google_sub, **extra)`（無可用密碼）與 `create_superuser(email, password, google_sub="", **extra)` — (auto) `python manage.py check` 轉為無錯
-- [ ] 1.3 產生並套用初始 migration（`makemigrations accounts && migrate`），對本機 Postgres（docker compose）跑過 — (auto) migration 指令本身 exit code 0、無錯誤輸出
-- [ ] 1.4 確認 `python manage.py createsuperuser --noinput`（搭配 `DJANGO_SUPERUSER_EMAIL`/`DJANGO_SUPERUSER_PASSWORD`/`DJANGO_SUPERUSER_GOOGLE_SUB=""` 環境變數）可正常建立一個可用密碼登入 `/admin/` 的帳號（design.md 的 superuser 例外）— (auto) 指令 exit code 0 且資料庫多一筆 `is_superuser=True` 的 `User`
+- [x] 1.1 在 `config/settings/base.py` 設定 `AUTH_USER_MODEL = "accounts.User"` — (auto) `python manage.py check`（此刻預期報錯，因為 model 還沒建，1.1/1.2 同一個 commit 完成才會轉正常）
+- [x] 1.2 實作 `apps/accounts/models.py`：`User(AbstractBaseUser, PermissionsMixin)`，含 UUID `id`、唯一 `email`（`USERNAME_FIELD`）、唯一 `google_sub`、`display_name`、`avatar_url`、`is_active`、`is_staff`、`date_joined`；自訂 `UserManager`，含 `create_user(email, google_sub, **extra)`（無可用密碼）與 `create_superuser(email, password, google_sub="", **extra)` — (auto) `python manage.py check` 轉為無錯
+- [x] 1.3 產生並套用初始 migration（`makemigrations accounts && migrate`），對本機 Postgres（docker compose）跑過 — (auto) migration 指令本身 exit code 0、無錯誤輸出
+- [x] 1.4 確認 `python manage.py createsuperuser --noinput`（搭配 `DJANGO_SUPERUSER_EMAIL`/`DJANGO_SUPERUSER_PASSWORD`/`DJANGO_SUPERUSER_GOOGLE_SUB=""` 環境變數）可正常建立一個可用密碼登入 `/admin/` 的帳號（design.md 的 superuser 例外）— (auto) 指令 exit code 0 且資料庫多一筆 `is_superuser=True` 的 `User`
 
 ## 2. Seam: `verify_google_id_token`（對應 spec 需求：Google 身份驗證）
 
-- [ ] 2.1 [RED] 在 `apps/accounts/tests/test_services.py` 寫測試（mock `google.oauth2.id_token.verify_oauth2_token`）：① 合法 claims（audience 對、issuer 對、未過期）回傳 claims；② audience 不符 → 拋 `GoogleTokenError`；③ issuer 不是 `accounts.google.com`/`https://accounts.google.com` → 拋 `GoogleTokenError`；④ 底層函式庫拋 `ValueError`（過期/格式錯）→ 拋 `GoogleTokenError`。確認這組測試現在跑起來是 FAIL（`verify_google_id_token`／`GoogleTokenError` 還不存在）— (auto) `pytest` 顯示這幾條 FAIL
-- [ ] 2.2 [GREEN] 在 `apps/accounts/services.py` 實作 `GoogleTokenError` 與 `verify_google_id_token(token) -> dict`，只寫到讓 2.1 全部轉綠為止，不多加東西——滿足需求「Google 身份驗證」 — (auto) `pytest` 該檔全綠
+- [x] 2.1 [RED] 在 `apps/accounts/tests/test_services.py` 寫測試（mock `google.oauth2.id_token.verify_oauth2_token`）：① 合法 claims（audience 對、issuer 對、未過期）回傳 claims；② audience 不符 → 拋 `GoogleTokenError`；③ issuer 不是 `accounts.google.com`/`https://accounts.google.com` → 拋 `GoogleTokenError`；④ 底層函式庫拋 `ValueError`（過期/格式錯）→ 拋 `GoogleTokenError`。確認這組測試現在跑起來是 FAIL（`verify_google_id_token`／`GoogleTokenError` 還不存在）— (auto) `pytest` 顯示這幾條 FAIL
+- [x] 2.2 [GREEN] 在 `apps/accounts/services.py` 實作 `GoogleTokenError` 與 `verify_google_id_token(token) -> dict`，只寫到讓 2.1 全部轉綠為止，不多加東西——滿足需求「Google 身份驗證」 — (auto) `pytest` 該檔全綠
 
 ## 3. Seam: `POST /api/auth/google/`（對應 spec 需求：主揪 Session 核發、回訪主揪的個人資料隨 Google 端更新同步）
 
-- [ ] 3.1 [RED] 在 `apps/accounts/tests/test_views.py` 寫 API 測試（走 DRF test client 打 HTTP，`verify_google_id_token` 用 mock 替換掉，不真的呼叫 Google）：
+- [x] 3.1 [RED] 在 `apps/accounts/tests/test_views.py` 寫 API 測試（走 DRF test client 打 HTTP，`verify_google_id_token` 用 mock 替換掉，不真的呼叫 Google）：
   ① 合法 `idToken` → 200（跟前端 Swagger 契約對齊，固定 200，不分新建/既有使用者），回傳 body 含 `access`/`refresh`/`user`，且資料庫多一筆 `User`
   ② 同一個 `google_sub` 的合法 `idToken` 再打一次 → 不新增第二筆 `User`（get-or-create）
-  ③ `verify_google_id_token` 拋 `GoogleTokenError` → 回 401，不建立任何 `User`
+  ③ `verify_google_id_token` 拋 `GoogleTokenError` → 回 401（body 符合 `api-error-format` change 定義的 `{message, code}` 形狀），不建立任何 `User`
   ④ 已存在的 `google_sub`，claims 的 email／display_name／avatar_url 跟本地紀錄不同時再登入 → 該筆 `User` 對應欄位被更新為本次 claims 的值（design.md「每次登入都同步更新」）
   ⑤ 併發：mock `User.objects.create` 讓第一次呼叫拋 `IntegrityError`（模擬另一個並發請求搶先 insert 成功），驗證 view 改走 `get(google_sub=...)` 拿到既有那筆、正常回應 200 並核發 token，而不是讓請求整個失敗（design.md「並發登入保護」）
   確認這組測試現在是 FAIL（view 還沒接上）— (auto) `pytest` 顯示這幾條 FAIL
-- [ ] 3.2 [GREEN] 實作 `GoogleLoginSerializer`（`apps/accounts/serializers.py`）、`GoogleLoginView`（`apps/accounts/views.py`，`AllowAny`）：呼叫 `verify_google_id_token` → 在 `transaction.atomic()` 內先嘗試 `User.objects.create(google_sub=..., email=..., display_name=..., avatar_url=...)`，捕捉 `IntegrityError` 則改 `User.objects.get(google_sub=...)` 並用當次 claims 更新 `email`/`display_name`/`avatar_url` 後 `save()`（既有使用者的一般路徑也走這個更新，不只並發衝突時才做）→ `RefreshToken.for_user(user)`，掛到 `apps/accounts/urls.py` 的 `google/`，讓 3.1 全部轉綠——滿足需求「主揪 Session 核發」與「回訪主揪的個人資料隨 Google 端更新同步」 — (auto) `pytest` 該檔全綠
+- [x] 3.2 [GREEN] 實作 `GoogleLoginSerializer`（`apps/accounts/serializers.py`）、`GoogleLoginView`（`apps/accounts/views.py`，`AllowAny`）：呼叫 `verify_google_id_token`，捕捉 `GoogleTokenError` 時改拋 `config.exceptions.ApiError(message, code="INVALID_ID_TOKEN", status_code=401)`（`api-error-format` change 已完成，直接用，不要自己手刻 401 回應）→ 在 `transaction.atomic()` 內先嘗試 `User.objects.create(google_sub=..., email=..., display_name=..., avatar_url=...)`，捕捉 `IntegrityError` 則改 `User.objects.get(google_sub=...)` 並用當次 claims 更新 `email`/`display_name`/`avatar_url` 後 `save()`（既有使用者的一般路徑也走這個更新，不只並發衝突時才做）→ `RefreshToken.for_user(user)`，掛到 `apps/accounts/urls.py` 的 `google/`，讓 3.1 全部轉綠——滿足需求「主揪 Session 核發」與「回訪主揪的個人資料隨 Google 端更新同步」 — (auto) `pytest` 該檔全綠
 
 ## 4. Seam: `GET /api/auth/me/`（對應 spec 需求：已登入主揪的身份查詢）
 
