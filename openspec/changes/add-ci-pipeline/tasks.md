@@ -11,7 +11,7 @@
 
 ## 3. `spec-sync` 結構檢查
 
-- [ ] 3.1 新增 `spec-sync` job:比對 PR base 跟 `HEAD` 的 diff,若命中 `apps/**`/`config/**` 路徑,要求同一份 diff 裡至少也命中一個 `openspec/specs/**` 或 `openspec/changes/**` 路徑,否則失敗。本機先用 `git diff --name-only origin/main...HEAD` 驗證兩種情境:這個分支本身(只動到 `openspec/changes/add-ci-pipeline/**`,沒動 `apps/**`,因為沒有 `apps/**` diff 需要被擋,job 應該過)、以及一個只改 `apps/**` 檔案、不動 spec/change 的 scratch commit(job 邏輯應該擋下它)。(auto —— script exit code,先在本機驗證過邏輯,再信任 Actions run)
+- [x] 3.1 新增 `spec-sync` job:比對 PR base 跟 `HEAD` 的 diff,若命中 `apps/**`/`config/**` 路徑,要求同一份 diff 裡至少也命中一個 `openspec/specs/**` 或 `openspec/changes/**` 路徑,否則失敗。本機先用 `git diff --name-only origin/main...HEAD` 驗證兩種情境:這個分支本身(只動到 `openspec/changes/add-ci-pipeline/**`,沒動 `apps/**`,因為沒有 `apps/**` diff 需要被擋,job 應該過)、以及一個只改 `apps/**` 檔案、不動 spec/change 的 scratch commit(job 邏輯應該擋下它)。(auto —— script exit code,先在本機驗證過邏輯,再信任 Actions run)
 
 ## 4. `/healthz` endpoint
 

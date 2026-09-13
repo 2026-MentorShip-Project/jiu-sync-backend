@@ -85,3 +85,62 @@ jobs:
             exit 0
           fi
           exit "$status"
+
+  spec-sync:
+    name: spec-sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check spec/impl sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "非 pull_request 觸發(例如 workflow_dispatch),沒有 PR base 可比對,略過 spec-sync 檢查。"
+            exit 0
+          fi
+
+          changed_files=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
+
+          if [ -z "$changed_files" ]; then
+            echo "PR diff 為空,略過 spec-sync 檢查。"
+            exit 0
+          fi
+
+          echo "PR 變動的檔案:"
+          echo "$changed_files"
+          echo ""
+
+          impl_touched=false
+          spec_touched=false
+
+          while IFS= read -r file; do
+            case "$file" in
+              apps/*|config/*)
+                impl_touched=true
+                ;;
+            esac
+            case "$file" in
+              openspec/specs/*|openspec/changes/*)
+                spec_touched=true
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          if [ "$impl_touched" = true ] && [ "$spec_touched" = false ]; then
+            echo "❌ spec-sync 檢查失敗:"
+            echo "本次 PR 動到 apps/** 或 config/** 實作,但沒有同步動到 openspec/specs/** 或 openspec/changes/**。"
+            echo "請補上對應的 spec 文件更新,或在 openspec/changes/<change-name>/ 底下補上對應的 change 文件,再重新提交。"
+            exit 1
+          fi
+
+          echo "spec-sync 檢查通過。"
