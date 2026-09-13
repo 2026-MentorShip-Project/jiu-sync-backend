@@ -84,3 +84,27 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email
+
+
+class RefreshTokenRecord(models.Model):
+    """撤銷紀錄：只存 refresh token 的 ``jti`` 與 SHA-256 雜湊，不存明文。
+
+    取代 ``rest_framework_simplejwt.token_blacklist`` 的
+    ``OutstandingToken``/``BlacklistedToken``——那組明文存完整 refresh JWT
+    字串，是不必要的安全風險（撤銷檢查只靠 ``jti`` 查表）。見
+    openspec/changes/hashed-refresh-token-storage/design.md。
+
+    ``on_delete=CASCADE``（非 simplejwt 原本用的 ``SET_NULL``）：這個專案
+    目前沒有刪除使用者的功能，使用者一旦被刪除，他名下的 refresh 紀錄沒有
+    再保留的意義。
+    """
+
+    jti = models.CharField(max_length=64, unique=True, db_index=True)
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="refresh_tokens")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.jti

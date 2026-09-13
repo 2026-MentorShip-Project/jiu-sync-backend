@@ -13,7 +13,13 @@ from config.exceptions import ApiError
 
 from .models import User
 from .serializers import GoogleLoginSerializer, UserSerializer
-from .services import GoogleTokenError, verify_google_id_token
+from .services import (
+    GoogleTokenError,
+    get_valid_refresh_token_record,
+    record_refresh_token,
+    revoke_refresh_token_record,
+    verify_google_id_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +108,7 @@ class GoogleLoginView(APIView):
         user.save()
 
         refresh = RefreshToken.for_user(user)
+        record_refresh_token(user, refresh)
 
         response = Response(
             {
@@ -122,11 +129,14 @@ class RefreshView(APIView):
 
     取代 simplejwt 內建的 ``TokenRefreshView``（只認 body），改讀
     ``request.COOKIES["refresh_token"]``。因為 ``ROTATE_REFRESH_TOKENS=True``，換發時
-    同步 rotate refresh 本身並重新 ``Set-Cookie``——rotate 的具體作法（``blacklist()`` +
-    ``set_jti()`` + ``set_exp()`` + ``set_iat()`` + ``outstand()``）比照
-    ``rest_framework_simplejwt.serializers.TokenRefreshSerializer.validate`` 在
-    djangorestframework-simplejwt 5.5.1 的實作，見
-    openspec/changes/refresh-token-httponly-cookie/design.md。
+    同步 rotate refresh 本身並重新 ``Set-Cookie``。
+
+    撤銷追蹤走自己的 ``RefreshTokenRecord`` 表（見
+    openspec/changes/hashed-refresh-token-storage/design.md「驗證流程順序」），不再用
+    simplejwt 的 ``token_blacklist`` app：先查表（查無／已撤銷／已過期都視為無效，
+    統一回 401），查表通過後才做 ``RefreshToken(value)`` 的 JWT 簽章/格式驗證——查表
+    是便宜的 DB 查詢，先擋掉明顯無效的請求，較貴的簽章驗證留給通過第一關的請求才做。
+    rotate 時把舊紀錄標記撤銷、為新 token 登記一筆新紀錄。
     """
 
     permission_classes = [AllowAny]
@@ -138,6 +148,12 @@ class RefreshView(APIView):
                 "缺少刷新憑證，請重新登入", code="INVALID_REFRESH_TOKEN", status_code=401
             )
 
+        record = get_valid_refresh_token_record(refresh_token_value)
+        if record is None:
+            raise ApiError(
+                "刷新憑證已失效，請重新登入", code="INVALID_REFRESH_TOKEN", status_code=401
+            )
+
         try:
             token = RefreshToken(refresh_token_value)
         except TokenError as exc:
@@ -145,16 +161,12 @@ class RefreshView(APIView):
 
         access = str(token.access_token)
 
-        if settings.SIMPLE_JWT["BLACKLIST_AFTER_ROTATION"]:
-            try:
-                token.blacklist()
-            except AttributeError:
-                pass
-
         token.set_jti()
         token.set_exp()
         token.set_iat()
-        token.outstand()
+
+        revoke_refresh_token_record(record)
+        record_refresh_token(record.user, token)
 
         response = Response({"access": access})
         _set_refresh_token_cookie(response, str(token))
@@ -162,38 +174,39 @@ class RefreshView(APIView):
 
 
 class LogoutView(APIView):
-    """``POST /api/auth/logout/`` — 撤銷（blacklist）主揪的 refresh token，結束 session。
+    """``POST /api/auth/logout/`` — 撤銷主揪的 refresh token，結束 session。
 
-    見 design.md「端點形狀」與
+    撤銷追蹤走自己的 ``RefreshTokenRecord`` 表：查表拿到紀錄後直接用
+    ``record.user_id`` 比對 ``request.user.id`` 判斷歸屬（不用再解 JWT payload
+    拿 ``user_id``，查表就順便拿到了），比對通過才撤銷。見
+    openspec/changes/hashed-refresh-token-storage/design.md、
     openspec/changes/google-sso-login/specs/user-auth/spec.md「登出撤銷 Session」。
     """
 
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        refresh_token = request.COOKIES.get(REFRESH_TOKEN_COOKIE_NAME)
+        refresh_token_value = request.COOKIES.get(REFRESH_TOKEN_COOKIE_NAME)
 
-        if not refresh_token:
+        if not refresh_token_value:
             raise ApiError(
                 "缺少刷新憑證", code="INVALID_REFRESH_TOKEN", status_code=400
             )
 
-        try:
-            token = RefreshToken(refresh_token)
-        except TokenError as exc:
-            raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
+        record = get_valid_refresh_token_record(refresh_token_value)
+        if record is None:
+            raise ApiError(
+                "刷新憑證無效", code="INVALID_REFRESH_TOKEN", status_code=400
+            )
 
-        if str(token["user_id"]) != str(request.user.id):
+        if str(record.user_id) != str(request.user.id):
             raise ApiError(
                 "只能撤銷自己的刷新憑證",
                 code="REFRESH_TOKEN_NOT_YOURS",
                 status_code=403,
             )
 
-        try:
-            token.blacklist()
-        except TokenError as exc:
-            raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
+        revoke_refresh_token_record(record)
 
         response = Response(status=205)
         response.delete_cookie(REFRESH_TOKEN_COOKIE_NAME, path=REFRESH_TOKEN_COOKIE_PATH)

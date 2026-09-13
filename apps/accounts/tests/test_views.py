@@ -6,12 +6,10 @@ from django.db import IntegrityError
 from rest_framework import status
 from rest_framework.reverse import reverse
 from rest_framework.test import APIClient
-from rest_framework_simplejwt.exceptions import TokenError
-from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.accounts.models import User
-from apps.accounts.services import GoogleTokenError
+from apps.accounts.models import RefreshTokenRecord, User
+from apps.accounts.services import GoogleTokenError, record_refresh_token
 
 pytestmark = pytest.mark.django_db
 
@@ -79,15 +77,42 @@ def test_valid_id_token_sets_httponly_refresh_token_cookie(mock_verify):
 
 
 @patch("apps.accounts.views.verify_google_id_token")
+def test_valid_login_records_hashed_refresh_token_not_plaintext(mock_verify):
+    """3.1① 登入成功後，資料庫的 RefreshTokenRecord 多一筆，且這筆的
+    token_hash 不等於 response cookie 裡的明文 refresh token 字串——直接反查
+    DB 斷言看不到明文。
+    """
+    mock_verify.return_value = _base_claims()
+    client = APIClient()
+
+    assert RefreshTokenRecord.objects.count() == 0
+
+    response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    cookie_value = response.cookies["refresh_token"].value
+    assert RefreshTokenRecord.objects.count() == 1
+    record = RefreshTokenRecord.objects.get()
+    assert record.token_hash != cookie_value
+    assert cookie_value not in record.token_hash
+    assert record.jti == RefreshToken(cookie_value)["jti"]
+    assert record.revoked_at is None
+
+
+@patch("apps.accounts.views.verify_google_id_token")
 def test_refresh_with_cookie_returns_new_access_and_rotated_cookie(mock_verify):
     """同一個 APIClient 登入後（cookie 已自動記住），不帶任何 body 打
     POST /api/auth/refresh/ → 200，body 有新的 access，response 也帶一個新的
     （rotate 後的）refresh_token cookie，httponly 為真。
+
+    3.1② 換發成功後，舊的 RefreshTokenRecord 被標記 revoked_at，且資料庫
+    新增一筆新的紀錄（對應新 cookie 值）。
     """
     mock_verify.return_value = _base_claims()
     client = APIClient()
     login_response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
     original_refresh_cookie_value = login_response.cookies["refresh_token"].value
+    original_jti = RefreshToken(original_refresh_cookie_value)["jti"]
 
     response = client.post(REFRESH_URL, {}, format="json")
 
@@ -100,6 +125,13 @@ def test_refresh_with_cookie_returns_new_access_and_rotated_cookie(mock_verify):
     assert new_cookie["httponly"] is True
     assert new_cookie.value != original_refresh_cookie_value
 
+    assert RefreshTokenRecord.objects.count() == 2
+    old_record = RefreshTokenRecord.objects.get(jti=original_jti)
+    assert old_record.revoked_at is not None
+    new_record = RefreshTokenRecord.objects.get(jti=RefreshToken(new_cookie.value)["jti"])
+    assert new_record.revoked_at is None
+    assert new_record.token_hash != new_cookie.value
+
 
 def test_refresh_without_cookie_returns_401():
     """全新、乾淨的 APIClient（沒登入過，沒有 refresh_token cookie）打
@@ -110,6 +142,76 @@ def test_refresh_without_cookie_returns_401():
     response = client.post(REFRESH_URL, {}, format="json")
 
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+@patch("apps.accounts.views.verify_google_id_token")
+def test_refresh_with_rotated_out_cookie_returns_401(mock_verify):
+    """3.1③ rotate 後舊的 refresh_token（已被標記 revoked_at）拿去打
+    /api/auth/refresh/ → 401。
+    """
+    mock_verify.return_value = _base_claims()
+    client = APIClient()
+    login_response = client.post(GOOGLE_LOGIN_URL, {"idToken": "valid-token"}, format="json")
+    original_refresh_cookie_value = login_response.cookies["refresh_token"].value
+
+    # rotate 一次，讓原本的 cookie 值變成「舊的」，已被撤銷。
+    client.post(REFRESH_URL, {}, format="json")
+
+    client.cookies["refresh_token"] = original_refresh_cookie_value
+    response = client.post(REFRESH_URL, {}, format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    body = response.json()
+    assert body["code"] == "INVALID_REFRESH_TOKEN"
+
+
+def test_refresh_with_logout_revoked_cookie_returns_401():
+    """3.1③ 已經被登出撤銷的 refresh_token 拿去打 /api/auth/refresh/ → 401。"""
+    user = User.objects.create_user(
+        email="host@example.com",
+        google_sub="1234567890",
+        display_name="Host Name",
+        avatar_url="",
+    )
+    refresh = RefreshToken.for_user(user)
+    record_refresh_token(user, refresh)
+    access_token = str(refresh.access_token)
+    refresh_token_value = str(refresh)
+
+    client = APIClient()
+    client.cookies["refresh_token"] = refresh_token_value
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+    logout_response = client.post(LOGOUT_URL, {}, format="json")
+    assert logout_response.status_code == status.HTTP_205_RESET_CONTENT
+
+    client.cookies["refresh_token"] = refresh_token_value
+    response = client.post(REFRESH_URL, {}, format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    body = response.json()
+    assert body["code"] == "INVALID_REFRESH_TOKEN"
+
+
+def test_refresh_with_unregistered_but_structurally_valid_token_returns_401():
+    """3.1④ 結構正確、簽章合法，但從沒登記過的 refresh JWT（查無 RefreshTokenRecord）
+    打 /api/auth/refresh/ → 401。
+    """
+    user = User.objects.create_user(
+        email="host@example.com",
+        google_sub="1234567890",
+        display_name="Host Name",
+        avatar_url="",
+    )
+    # 刻意不呼叫 record_refresh_token，模擬「結構正確但沒登記過」。
+    never_registered_refresh = str(RefreshToken.for_user(user))
+
+    client = APIClient()
+    client.cookies["refresh_token"] = never_registered_refresh
+    response = client.post(REFRESH_URL, {}, format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    body = response.json()
+    assert body["code"] == "INVALID_REFRESH_TOKEN"
 
 
 @patch("apps.accounts.views.verify_google_id_token")
@@ -279,7 +381,8 @@ def test_me_without_token_returns_401():
 
 def test_logout_with_valid_refresh_cookie_returns_205_blacklists_it_and_clears_cookie():
     """① 用同一個 client 的 refresh_token cookie（不帶 body）打 logout → 205，
-    該 token 被加入 blacklist ② response 對 refresh_token cookie 下發刪除指令（Max-Age=0）。
+    該 token 對應的 RefreshTokenRecord 被標記 revoked_at
+    ② response 對 refresh_token cookie 下發刪除指令（Max-Age=0）。
     """
     user = User.objects.create_user(
         email="host@example.com",
@@ -288,6 +391,7 @@ def test_logout_with_valid_refresh_cookie_returns_205_blacklists_it_and_clears_c
         avatar_url="https://example.com/avatar.png",
     )
     refresh = RefreshToken.for_user(user)
+    record_refresh_token(user, refresh)
     access_token = str(refresh.access_token)
     refresh_token = str(refresh)
 
@@ -298,11 +402,8 @@ def test_logout_with_valid_refresh_cookie_returns_205_blacklists_it_and_clears_c
     response = client.post(LOGOUT_URL, {}, format="json")
 
     assert response.status_code == status.HTTP_205_RESET_CONTENT
-    outstanding = OutstandingToken.objects.get(jti=refresh["jti"])
-    assert BlacklistedToken.objects.filter(token=outstanding).exists()
-
-    with pytest.raises(TokenError):
-        RefreshToken(refresh_token).blacklist()
+    record = RefreshTokenRecord.objects.get(jti=refresh["jti"])
+    assert record.revoked_at is not None
 
     deleted_cookie = response.cookies["refresh_token"]
     assert deleted_cookie.value == ""
@@ -357,6 +458,11 @@ def test_logout_with_another_users_refresh_cookie_returns_403_and_does_not_revok
     把 B client 的 refresh_token cookie 值讀出來，手動設進 A client 的 cookie jar，
     再用 A 的 access token 打登出 → 403 REFRESH_TOKEN_NOT_YOURS，
     且 B 的 refresh token 事後仍然有效（B 自己的 client 打 refresh 仍是 200）。
+
+    3.1⑤ B 的 refresh token 要先經過 record_refresh_token 登記（模擬真實登入），
+    這樣 LogoutView 判斷歸屬時走的才是新表查詢（record.user_id），不是舊的
+    JWT payload 解析——B 沒登記過的話查表會直接視為無效，測不到「歸屬判斷」
+    這件事本身。
     """
     user_a = User.objects.create_user(
         email="host-a@example.com",
@@ -372,6 +478,7 @@ def test_logout_with_another_users_refresh_cookie_returns_403_and_does_not_revok
     )
     access_token_a = str(RefreshToken.for_user(user_a).access_token)
     refresh_b = RefreshToken.for_user(user_b)
+    record_refresh_token(user_b, refresh_b)
     refresh_token_b = str(refresh_b)
 
     client_a = APIClient()
