@@ -144,3 +144,88 @@ jobs:
           fi
 
           echo "spec-sync 檢查通過。"
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: jiu_sync
+          POSTGRES_USER: jiu_sync
+          POSTGRES_PASSWORD: jiu_sync
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jiu_sync"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Apply migrations
+        run: uv run python manage.py migrate
+
+      - name: Prepare artifacts directory
+        run: mkdir -p artifacts
+
+      - name: Start server
+        run: |
+          uv run python manage.py runserver 0.0.0.0:8000 > artifacts/server.log 2>&1 &
+          echo $! > artifacts/server.pid
+
+      - name: Wait for server to become healthy
+        run: |
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$(cat artifacts/server.pid)" 2>/dev/null; then
+              echo "Server process died before becoming healthy (attempt ${attempt})."
+              cat artifacts/server.log
+              exit 1
+            fi
+            if curl --fail --silent --output /dev/null "http://127.0.0.1:8000/healthz/"; then
+              echo "Server is healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become healthy within timeout."
+          cat artifacts/server.log
+          exit 1
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: "1.6.1"
+
+      - name: Run k6 smoke test
+        run: k6 run tests/k6/healthz-smoke.js | tee artifacts/k6.log
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f artifacts/server.pid ]; then
+            kill "$(cat artifacts/server.pid)" || true
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: artifacts/*.log
+          retention-days: 7

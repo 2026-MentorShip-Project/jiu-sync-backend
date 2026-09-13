@@ -19,10 +19,14 @@
 
 ## 5. `integration` job(server 起得來 + k6 smoke test)
 
-- [ ] 5.1 在 `ci.yml` 新增 `integration` job:沿用 `test` job 的 Postgres service + `uv sync --locked` + `migrate`,接著背景執行 `uv run python manage.py runserver 0.0.0.0:8000`(對應 design.md Decision 8),把 server log 導到檔案。(auto —— job yaml 語法正確、本機可用同組指令手動跑一次確認 server 能背景啟動)
-- [ ] 5.2 加上輪詢 `/healthz` 的迴圈(仿 Go 範例:重試數十次、每次間隔數秒,逾時失敗),失敗時 `cat` server log 再 `exit 1`。(auto —— 本機故意讓 server 啟動失敗一次,確認迴圈會逾時且印出 log)
-- [ ] 5.3 用 `grafana/setup-k6-action` 裝 k6,寫一個最小 k6 腳本打 `/healthz` 斷言 200(對應 design.md Decision 9),當作 E2E smoke test 步驟。(manual —— 需要一次真實 Actions run 確認 k6 腳本語法與 action 版本正確)
-- [ ] 5.4 加上 `Stop server`(`if: always()`,依 pid 關閉背景 process)與 `Upload test results`(`actions/upload-artifact@v4`,`retention-days: 7`,上傳 server/k6 log)兩個步驟,對應 design.md Decision 12。(auto —— 本機模擬跑完整個腳本流程,確認 pid 檔案存在、kill 成功不報錯)
+- [x] 5.1 在 `ci.yml` 新增 `integration` job:沿用 `test` job 的 Postgres service + `uv sync --locked` + `migrate`,接著背景執行 `uv run python manage.py runserver 0.0.0.0:8000`(對應 design.md Decision 8),把 server log 導到檔案。(auto —— job yaml 語法正確、本機可用同組指令手動跑一次確認 server 能背景啟動)
+  - 本機驗證:用 docker-compose 的 Postgres(host port 5455)開一個 throwaway DB `jiu_sync_ci_verify`,`migrate` 乾淨通過;背景啟動 `runserver`(本機用 8001 避開一個已存在、與本次改動無關的 8000 背景 process)、PID 存檔、`ps -p` 確認存活。
+- [x] 5.2 加上輪詢 `/healthz` 的迴圈(仿 Go 範例:重試數十次、每次間隔數秒,逾時失敗),失敗時 `cat` server log 再 `exit 1`。(auto —— 本機故意讓 server 啟動失敗一次,確認迴圈會逾時且印出 log)
+  - 本機驗證:正常情境下第 1 次嘗試即 200、exit 0。故意把 `DATABASE_URL` 指向不存在的 port(59999)模擬啟動失敗,`runserver` 的 autoreloader thread 因連不上 DB 丟例外,但外層 process 不會馬上死、`/healthz` 也一直連不上 —— 完整跑滿 30 次迴圈後印出含 traceback 的 server log、exit code 1,驗證通過後即刻清掉背景 process。
+- [x] 5.3 用 `grafana/setup-k6-action` 裝 k6,寫一個最小 k6 腳本打 `/healthz` 斷言 200(對應 design.md Decision 9),當作 E2E smoke test 步驟。(manual —— 需要一次真實 Actions run 確認 k6 腳本語法與 action 版本正確)
+  - 本機用 `brew install k6`(裝到 v2.2.0)針對本機起的 server 實跑 `tests/k6/healthz-smoke.js`,`check` 100% 通過。`grafana/setup-k6-action@v1` 這個 GitHub Action 本身、以及 pin 的 `k6-version: "1.6.1"` 是否真的能在 Actions runner 上正確安裝,仍待一次真實 Actions run 驗證,所以 manual 標記保留。
+- [x] 5.4 加上 `Stop server`(`if: always()`,依 pid 關閉背景 process)與 `Upload test results`(`actions/upload-artifact@v4`,`retention-days: 7`,上傳 server/k6 log)兩個步驟,對應 design.md Decision 12。(auto —— 本機模擬跑完整個腳本流程,確認 pid 檔案存在、kill 成功不報錯)
+  - 本機驗證:`kill "$(cat server.pid)"` 兩種情境(server 正常/被我故意弄壞)都能成功關閉,關閉後 `lsof -i :<port>` 確認 port 已釋放、`ps` 確認找不到殘留的 python/uv runserver process(僅剩一個與本次驗證無關、驗證前就已存在的 8000 背景 process)。
 - [ ] 5.5 端到端驗證:push 分支或 `workflow_dispatch` 觸發,確認 `integration` job 綠燈,且失敗案例(故意讓 healthz 逾時)會在 job log 看到完整 server log、且 artifact 頁籤有上傳檔案。(manual —— 需要兩次真實 Actions run:一次正常過、一次故意失敗)
 
 ## 6. Rollout 備註(人工,不屬於這次程式碼範圍)
