@@ -174,7 +174,11 @@ SIMPLE_JWT = {
 # CORS — frontend SPA origin(s), comma-separated in env.
 
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
-# Auth is a JWT Authorization header, not a cookie — no cross-site credentials needed.
+# refresh token 走 httpOnly cookie（見
+# openspec/changes/refresh-token-httponly-cookie/design.md），瀏覽器要願意收送這個
+# cookie 需要 credentialed CORS。CORS_ALLOWED_ORIGINS 維持明確列出網域，不可為 "*"
+# ——django-cors-headers 本身就禁止 "*" 搭配 CORS_ALLOW_CREDENTIALS=True。
+CORS_ALLOW_CREDENTIALS = True
 
 # Celery — background tasks: 7-day soft-delete expiry sweep, Email
 # notifications (finalized / deadline / board update). Fire-and-forget: no

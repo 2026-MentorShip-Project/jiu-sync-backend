@@ -1,5 +1,6 @@
 import logging
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from rest_framework import generics
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -15,6 +16,28 @@ from .serializers import GoogleLoginSerializer, UserSerializer
 from .services import GoogleTokenError, verify_google_id_token
 
 logger = logging.getLogger(__name__)
+
+REFRESH_TOKEN_COOKIE_NAME = "refresh_token"
+REFRESH_TOKEN_COOKIE_PATH = "/api/auth/"
+
+
+def _set_refresh_token_cookie(response, refresh_token_value):
+    """在 response 上核發（或重新核發）refresh_token cookie。
+
+    屬性依 openspec/changes/refresh-token-httponly-cookie/design.md「Cookie 屬性」：
+    HttpOnly、Secure、SameSite=None、Path=/api/auth/，Max-Age 對齊
+    SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"]。登入核發、refresh rotate 後重新核發都呼叫這個。
+    """
+    max_age = int(settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+    response.set_cookie(
+        REFRESH_TOKEN_COOKIE_NAME,
+        refresh_token_value,
+        max_age=max_age,
+        httponly=True,
+        secure=True,
+        samesite="None",
+        path=REFRESH_TOKEN_COOKIE_PATH,
+    )
 
 
 class GoogleLoginView(APIView):
@@ -80,10 +103,9 @@ class GoogleLoginView(APIView):
 
         refresh = RefreshToken.for_user(user)
 
-        return Response(
+        response = Response(
             {
                 "access": str(refresh.access_token),
-                "refresh": str(refresh),
                 "user": {
                     "id": str(user.id),
                     "name": user.display_name,
@@ -91,6 +113,52 @@ class GoogleLoginView(APIView):
                 },
             }
         )
+        _set_refresh_token_cookie(response, str(refresh))
+        return response
+
+
+class RefreshView(APIView):
+    """``POST /api/auth/refresh/`` — 用 cookie 帶的 refresh token 換發新的 access token。
+
+    取代 simplejwt 內建的 ``TokenRefreshView``（只認 body），改讀
+    ``request.COOKIES["refresh_token"]``。因為 ``ROTATE_REFRESH_TOKENS=True``，換發時
+    同步 rotate refresh 本身並重新 ``Set-Cookie``——rotate 的具體作法（``blacklist()`` +
+    ``set_jti()`` + ``set_exp()`` + ``set_iat()`` + ``outstand()``）比照
+    ``rest_framework_simplejwt.serializers.TokenRefreshSerializer.validate`` 在
+    djangorestframework-simplejwt 5.5.1 的實作，見
+    openspec/changes/refresh-token-httponly-cookie/design.md。
+    """
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        refresh_token_value = request.COOKIES.get(REFRESH_TOKEN_COOKIE_NAME)
+        if not refresh_token_value:
+            raise ApiError(
+                "缺少刷新憑證，請重新登入", code="INVALID_REFRESH_TOKEN", status_code=401
+            )
+
+        try:
+            token = RefreshToken(refresh_token_value)
+        except TokenError as exc:
+            raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=401) from exc
+
+        access = str(token.access_token)
+
+        if settings.SIMPLE_JWT["BLACKLIST_AFTER_ROTATION"]:
+            try:
+                token.blacklist()
+            except AttributeError:
+                pass
+
+        token.set_jti()
+        token.set_exp()
+        token.set_iat()
+        token.outstand()
+
+        response = Response({"access": access})
+        _set_refresh_token_cookie(response, str(token))
+        return response
 
 
 class LogoutView(APIView):
@@ -103,7 +171,12 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        refresh_token = request.data.get("refresh")
+        refresh_token = request.COOKIES.get(REFRESH_TOKEN_COOKIE_NAME)
+
+        if not refresh_token:
+            raise ApiError(
+                "缺少刷新憑證", code="INVALID_REFRESH_TOKEN", status_code=400
+            )
 
         try:
             token = RefreshToken(refresh_token)
@@ -122,7 +195,9 @@ class LogoutView(APIView):
         except TokenError as exc:
             raise ApiError(str(exc), code="INVALID_REFRESH_TOKEN", status_code=400) from exc
 
-        return Response(status=205)
+        response = Response(status=205)
+        response.delete_cookie(REFRESH_TOKEN_COOKIE_NAME, path=REFRESH_TOKEN_COOKIE_PATH)
+        return response
 
 
 class MeView(generics.RetrieveAPIView):
