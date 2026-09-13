@@ -6,8 +6,8 @@
 
 ## 2. `lint` + `test` job
 
-- [ ] 2.1 建立 `.github/workflows/ci.yml`,包含 `lint` job(`ruff check .`)與 `test` job(Postgres 16 service、`uv sync --locked`、migration 檢查、migrate、pytest+cov,pytest 那步要把 exit code 5「no tests collected」視為通過、其他非 0 才算失敗,見 task 1.1 發現2),外加 top-level 的 `concurrency`/`cancel-in-progress`、`permissions: contents: read`、`pull_request` 觸發條件(對 `main`+`develop`),對應 design.md 決策 1、2、6、7。驗證方式:push 這個分支,確認 GitHub Actions 上兩個 job 都出現且通過(或用 `workflow_dispatch` 手動觸發)。(manual —— 需要真的看一次 Actions run)
-- [ ] 2.2 驗證 `test` job 真的會在壞輸入上失敗:本機模擬「改一個 model 欄位但不跑 makemigrations」,確認 `makemigrations --check --dry-run` 回傳非 0,驗證完再還原。(auto —— 看指令 exit code)
+- [x] 2.1 建立 `.github/workflows/ci.yml`,包含 `lint` job(`ruff check .`)與 `test` job(Postgres 16 service、`uv sync --locked`、migration 檢查、migrate、pytest+cov,pytest 那步要把 exit code 5「no tests collected」視為通過、其他非 0 才算失敗,見 task 1.1 發現2),外加 top-level 的 `concurrency`/`cancel-in-progress`、`permissions: contents: read`、`pull_request` 觸發條件(對 `main`+`develop`),對應 design.md 決策 1、2、6、7。驗證方式:push 這個分支,確認 GitHub Actions 上兩個 job 都出現且通過(或用 `workflow_dispatch` 手動觸發)。(manual —— 需要真的看一次 Actions run)
+- [x] 2.2 驗證 `test` job 真的會在壞輸入上失敗:本機模擬「改一個 model 欄位但不跑 makemigrations」,確認 `makemigrations --check --dry-run` 回傳非 0,驗證完再還原。(auto —— 看指令 exit code)
 
 ## 3. `spec-sync` 結構檢查
 
