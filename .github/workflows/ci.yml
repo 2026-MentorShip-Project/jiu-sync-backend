@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
-      postgres:
+      postgres: &postgres-service
         image: postgres:16
         env:
           POSTGRES_DB: jiu_sync
@@ -150,19 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: jiu_sync
-          POSTGRES_USER: jiu_sync
-          POSTGRES_PASSWORD: jiu_sync
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U jiu_sync"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+      postgres: *postgres-service
     env:
       DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync
     steps:
