@@ -1,0 +1,52 @@
+# Production compose file — run from the EC2 host at /opt/jiu-sync-backend
+# via `docker compose -f infra/docker/docker-compose.prod.yml ...`.
+#
+# .env lives alongside the repo clone (/opt/jiu-sync-backend/.env), i.e. two
+# directories up from this file (infra/docker/ -> infra/ -> repo root), hence
+# the "../../.env" path below.
+#
+# IMPORTANT — hostnames baked into .env:
+# Django resolves DB/broker connections from full URLs, not separate
+# host/port vars, so the production .env MUST point at the compose service
+# names (Docker's internal DNS), not localhost:
+#   DATABASE_URL=postgres://<user>:<password>@db:5432/<dbname>
+#   CELERY_BROKER_URL=redis://redis:6379/0
+# The POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB values below must match the
+# credentials embedded in that DATABASE_URL.
+#
+# Unlike local dev's docker-compose.yml, nothing here binds to 0.0.0.0 or a
+# host port for db/redis — only `app` is reachable from the host, and only
+# via loopback (127.0.0.1:8000), per the "應用程式 port 不直接對外暴露"
+# requirement. nginx (host-native, see design.md Decision 3) is the only
+# thing that should ever reach app, over 127.0.0.1:8000.
+
+services:
+  app:
+    image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
+    env_file:
+      - ../../.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    env_file:
+      - ../../.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
