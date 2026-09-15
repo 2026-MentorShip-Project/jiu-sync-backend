@@ -8,3 +8,8 @@ staticfiles/
 .idea/
 .ruff_cache/
 .pytest_cache/
+
+# Terraform
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*

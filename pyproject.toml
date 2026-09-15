@@ -11,6 +11,7 @@ dependencies = [
     "djangorestframework>=3.18.0",
     "djangorestframework-simplejwt>=5.5.1",
     "google-auth>=2.57.1",
+    "gunicorn>=23.0.0",
     "psycopg[binary]>=3.3.5",
     "redis>=8.1.0",
 ]
