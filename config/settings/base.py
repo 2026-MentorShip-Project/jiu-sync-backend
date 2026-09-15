@@ -203,3 +203,9 @@ RECOMMENDATION_ENGINE = env("RECOMMENDATION_ENGINE", default="google_places_gemi
 GOOGLE_PLACES_API_KEY = env("GOOGLE_PLACES_API_KEY", default="")
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
+
+# Public origin of the frontend SPA — used to build shareable event links
+# (e.g. f"{FRONTEND_BASE_URL}/events/{event.id}"). dev.py overrides the
+# default; prod.py requires it to be set (fail-fast). See
+# openspec/changes/add-events-api/design.md D5.
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default=None)
