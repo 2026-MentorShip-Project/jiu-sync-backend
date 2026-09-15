@@ -11,22 +11,39 @@
 # terminal status, printing the remote stdout/stderr and mirroring the
 # remote outcome in this script's own exit code.
 #
-# Remote-side logic (executed ON the EC2 instance by SSM):
+# Remote-side logic (executed ON the EC2 instance by SSM) — rewritten per
+# design.md decision 5/7 (task 10.2): EC2 no longer needs git, a repo
+# checkout, or any GitHub credentials. It only pulls a pre-built image from
+# GHCR (built+pushed by GitHub Actions, see .github/workflows/build-push.yml
+# / task 9.1) and runs it.
 #   1. Fail fast if /opt/jiu-sync-backend/.env does not exist. Secrets are
-#      created manually by a human via a one-off SSM session (see task 6.1)
-#      — this script only checks for the file, it never creates it or
-#      fills in defaults (design.md decision 6).
-#   2. git clone (first run) or git pull (subsequent runs) the repo into
-#      /opt/jiu-sync-backend. Git credentials (e.g. a PAT in
-#      ~/.git-credentials) are assumed to already be set up manually on the
-#      instance (design.md decision 5) — this script never touches them;
-#      if auth is missing, `git clone`/`git pull` fails loudly and that
-#      failure surfaces as a non-Success SSM command status.
-#   3. docker compose build / up -d / migrate / collectstatic. Re-running
-#      this is safe: `git pull` is a no-op with no new commits, and Docker's
-#      layer cache makes an unchanged `build` near-instant (design.md
-#      decision 8 — idempotency is achieved for free, no extra
-#      changed-or-not bookkeeping).
+#      created manually by a human via a one-off SSM session (design.md
+#      decision 6) — this script only checks for the file, it never creates
+#      it or fills in defaults. (Unchanged from the original git-based
+#      version, previously verified live in task 5.1.)
+#   2. Write infra/docker/docker-compose.prod.yml's *current local* content
+#      to /opt/jiu-sync-backend/docker-compose.prod.yml on the instance, via
+#      base64 embedded in the SSM command (design.md decision 5, same
+#      technique used for .env in an earlier manual step) — no git involved.
+#      NOTE: the source file's `env_file: [../../.env]` entries assume the
+#      compose file sits two directories below the repo root (as it does
+#      locally, at infra/docker/). Since it is shipped here flat, directly
+#      into /opt/jiu-sync-backend/ alongside .env, that relative path is
+#      rewritten to `.env` in transit (local sed, below) — the file on disk
+#      in this repo is never modified. Verified locally with `docker compose
+#      config`: the unmodified `../../.env` path resolves relative to the
+#      flat remote location and fails with "env file ... not found"; the
+#      rewritten `.env` path resolves correctly.
+#   3. `docker login ghcr.io` using GHCR_USERNAME/GHCR_TOKEN, read from the
+#      two new lines a human adds to the EC2-side .env (design.md decision
+#      6/task 10.3 — not created by this script). Extracted with grep/cut
+#      rather than `source`-ing the whole .env, so values elsewhere in the
+#      file containing shell-special characters ($, quotes, backticks — e.g.
+#      DATABASE_URL) are never evaluated as shell syntax.
+#   4. docker compose pull / up -d / migrate / collectstatic. Re-running
+#      this is safe: `docker pull` is a no-op when the digest is unchanged,
+#      and `up -d` doesn't restart services with no image/config change
+#      (design.md decision 8 — idempotency for free).
 #
 # Usage: ./infra/scripts/deploy.sh
 
@@ -35,23 +52,35 @@ set -euo pipefail
 # --- Local configuration -----------------------------------------------
 INSTANCE_ID="i-0f6d5dc974e91bbf6"
 REGION="ap-northeast-3"
-REPO_DIR="/opt/jiu-sync-backend"
-REPO_URL="https://github.com/2026-MentorShip-Project/jiu-sync-backend.git"
-COMPOSE_FILE="infra/docker/docker-compose.prod.yml"
+REPO_DIR="/opt/jiu-sync-backend"          # target dir on the EC2 instance
+COMPOSE_FILE_LOCAL="infra/docker/docker-compose.prod.yml"
 ENV_FILE="${REPO_DIR}/.env"
-SSM_TIMEOUT_SECONDS=1800   # generous ceiling for `docker compose build` on a t2.micro
+SSM_TIMEOUT_SECONDS=900    # no more `docker compose build` on the instance
+                           # (moved to GitHub Actions, design.md decision 5)
+                           # — pull + up + migrate + collectstatic is far
+                           # lighter, but kept generous for a t2.micro.
 POLL_INTERVAL_SECONDS=5
-POLL_MAX_ATTEMPTS=400      # ~33 min at 5s/poll, comfortably above SSM_TIMEOUT_SECONDS
+POLL_MAX_ATTEMPTS=200      # ~16.5 min at 5s/poll, comfortably above SSM_TIMEOUT_SECONDS
 
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not found in PATH." >&2; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not found in PATH." >&2; exit 1; }
 
+if [ ! -f "$COMPOSE_FILE_LOCAL" ]; then
+  echo "ERROR: ${COMPOSE_FILE_LOCAL} not found. Run this script from the repo root." >&2
+  exit 1
+fi
+
+# Rewrite the compose file's env_file entries for the flat remote layout
+# (see NOTE in the header comment above). Only touches the two YAML list
+# items themselves (`      - ../../.env`), not the prose in the file's
+# header comments that also happens to mention that path.
+COMPOSE_B64=$(sed -E 's#^([[:space:]]*-[[:space:]]+)\.\./\.\./\.env[[:space:]]*$#\1.env#' "$COMPOSE_FILE_LOCAL" | base64 | tr -d '\n')
+
 # --- Build the remote shell script --------------------------------------
 # Everything inside this heredoc runs ON THE EC2 INSTANCE, not locally.
-# Local vars are interpolated here (unquoted heredoc) so the two path/URL
-# constants above stay the single source of truth; `\$` escapes protect
-# the parts that must be evaluated remotely instead (the ENV_FILE re-use
-# below, and any future remote-side expansion).
+# Local vars are interpolated here (unquoted heredoc) so the constants above
+# stay the single source of truth; `\$` escapes protect the parts that must
+# be evaluated remotely instead.
 REMOTE_SCRIPT=$(cat <<EOF
 #!/bin/bash
 # SSM's AWS-RunShellScript document runs commands through /bin/sh (dash) by
@@ -60,65 +89,82 @@ REMOTE_SCRIPT=$(cat <<EOF
 set -euo pipefail
 
 # SSM's AWS-RunShellScript document executes commands without a login shell,
-# so \$HOME is unset here even though the instance is running as root — this
-# breaks \`git\` when it needs to read the root-owned ~/.gitconfig /
-# ~/.git-credentials that were set up manually per design.md decision 5 (git
-# reports "fatal: \$HOME not set" and can't find the credential.helper store).
-# Set it explicitly from the current user's passwd entry before anything
-# that touches git or other tools relying on \$HOME.
+# so \$HOME is unset here even though the instance is running as root. Git no
+# longer runs on this instance, but \`docker login\` still needs \$HOME to
+# find/write its credential store (~/.docker/config.json by default) — set
+# it explicitly from the current user's passwd entry before anything that
+# relies on it.
 export HOME="\$(getent passwd "\$(whoami)" | cut -d: -f6)"
 
 ENV_FILE="${ENV_FILE}"
 REPO_DIR="${REPO_DIR}"
-REPO_URL="${REPO_URL}"
-COMPOSE_FILE="${COMPOSE_FILE}"
+COMPOSE_FILE="\${REPO_DIR}/docker-compose.prod.yml"
+COMPOSE_B64="${COMPOSE_B64}"
 
-echo "=== [1/6] Checking for required .env at \${ENV_FILE} ==="
+echo "=== [1/7] Checking for required .env at \${ENV_FILE} ==="
 if [ ! -f "\${ENV_FILE}" ]; then
   echo "ERROR: \${ENV_FILE} does not exist on this instance." >&2
   echo "The production .env must be created manually via a one-off SSM session" >&2
-  echo "before deploying (see openspec/changes/deploy-django-app task 6.1)." >&2
-  echo "Aborting — not attempting any git/docker steps." >&2
+  echo "before deploying (see openspec/changes/deploy-django-app design.md decision 6)." >&2
+  echo "Aborting — not attempting any docker steps." >&2
   exit 1
 fi
 echo "OK: .env found."
 
-echo "=== [2/6] Syncing repo at \${REPO_DIR} ==="
-if [ -d "\${REPO_DIR}/.git" ]; then
-  echo "Repo already present, running git pull..."
-  git -C "\${REPO_DIR}" pull
-else
-  # REPO_DIR may already exist and be non-empty here (e.g. it only contains
-  # the manually-created .env from task 6.1's prerequisite step), so a plain
-  # \`git clone\` into it would fail with "destination path ... already exists
-  # and is not an empty directory". Initialize git in place instead: this
-  # only ever writes files that are tracked in the remote repo, so untracked
-  # local files like .env (which is git-ignored) are left untouched.
-  echo "Repo not present, initializing git in place at \${REPO_DIR}..."
-  mkdir -p "\${REPO_DIR}"
-  git -C "\${REPO_DIR}" init
-  git -C "\${REPO_DIR}" remote add origin "\${REPO_URL}"
-  git -C "\${REPO_DIR}" fetch origin
-  DEFAULT_BRANCH=\$(git -C "\${REPO_DIR}" remote show origin | sed -n 's/.*HEAD branch: //p')
-  if [ -z "\${DEFAULT_BRANCH}" ]; then
-    echo "ERROR: could not determine origin's default branch." >&2
-    exit 1
+echo "=== [2/7] Writing docker-compose.prod.yml to \${COMPOSE_FILE} ==="
+echo "\${COMPOSE_B64}" | base64 -d > "\${COMPOSE_FILE}"
+echo "OK: compose file written."
+
+echo "=== [3/7] Extracting GHCR_USERNAME/GHCR_TOKEN from \${ENV_FILE} ==="
+# Extracted with grep/cut rather than \`source\`-ing the whole .env: other
+# values in that file (e.g. DATABASE_URL) may contain characters (\$, quotes,
+# backticks) that bash would try to evaluate if the file were sourced
+# directly. This only reads the two lines we need, literally.
+extract_env_var() {
+  local key="\$1" file="\$2" line value len first last
+  line=\$(grep -m1 "^\${key}=" "\${file}" || true)
+  if [ -z "\${line}" ]; then
+    echo ""
+    return 0
   fi
-  git -C "\${REPO_DIR}" checkout -f -B "\${DEFAULT_BRANCH}" "origin/\${DEFAULT_BRANCH}"
+  value="\${line#*=}"
+  # Strip one layer of matching surrounding quotes, if present (avoids
+  # bracket-glob quote escaping, which is fragile once this whole function
+  # is itself embedded inside a local heredoc).
+  len="\${#value}"
+  if [ "\${len}" -ge 2 ]; then
+    first="\${value:0:1}"
+    last="\${value:\$((len - 1)):1}"
+    if { [ "\${first}" = '"' ] && [ "\${last}" = '"' ]; } || { [ "\${first}" = "'" ] && [ "\${last}" = "'" ]; }; then
+      value="\${value:1:\$((len - 2))}"
+    fi
+  fi
+  echo "\${value}"
+}
+
+GHCR_USERNAME="\$(extract_env_var GHCR_USERNAME "\${ENV_FILE}")"
+GHCR_TOKEN="\$(extract_env_var GHCR_TOKEN "\${ENV_FILE}")"
+
+if [ -z "\${GHCR_USERNAME}" ] || [ -z "\${GHCR_TOKEN}" ]; then
+  echo "ERROR: GHCR_USERNAME and/or GHCR_TOKEN not set in \${ENV_FILE}." >&2
+  echo "These must be added manually before deploy.sh can log in to GHCR" >&2
+  echo "(see openspec/changes/deploy-django-app tasks.md task 10.3)." >&2
+  echo "Aborting — not attempting docker login/pull/up." >&2
+  exit 1
 fi
+echo "OK: GHCR_USERNAME/GHCR_TOKEN present."
 
-cd "\${REPO_DIR}"
+echo "=== [4/7] docker login ghcr.io ==="
+docker login ghcr.io -u "\${GHCR_USERNAME}" -p "\${GHCR_TOKEN}"
 
-echo "=== [3/6] docker compose build ==="
-docker compose -f "\${COMPOSE_FILE}" build
+echo "=== [5/7] docker compose pull ==="
+docker compose -f "\${COMPOSE_FILE}" pull
 
-echo "=== [4/6] docker compose up -d ==="
+echo "=== [6/7] docker compose up -d ==="
 docker compose -f "\${COMPOSE_FILE}" up -d
 
-echo "=== [5/6] Running migrations ==="
+echo "=== [7/7] Running migrations and collecting static files ==="
 docker compose -f "\${COMPOSE_FILE}" exec -T app python manage.py migrate
-
-echo "=== [6/6] Collecting static files ==="
 docker compose -f "\${COMPOSE_FILE}" exec -T app python manage.py collectstatic --noinput
 
 echo "=== Deploy finished successfully ==="
