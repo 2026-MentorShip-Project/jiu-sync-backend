@@ -8,6 +8,8 @@ staticfiles/
 .idea/
 .ruff_cache/
 .pytest_cache/
+.spectra/
+openspec/.vector-search.db*
 
 # Terraform
 infra/terraform/.terraform/
