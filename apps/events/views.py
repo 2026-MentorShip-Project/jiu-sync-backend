@@ -5,6 +5,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .authentication import OptionalJWTAuthentication
 from .models import Event
 from .serializers import EventCreateSerializer, EventDetailSerializer, EventSummarySerializer
 
@@ -35,7 +36,9 @@ class EventListView(APIView):
             raise serializers.ValidationError(
                 {"owner": "缺少必要查詢參數 owner=me"}
             )
-        events = Event.objects.filter(owner=request.user)
+        events = Event.objects.filter(owner=request.user).select_related(
+            "owner", "final_slot"
+        )
         serializer = EventSummarySerializer(
             events, many=True, context={"request": request}
         )
@@ -59,10 +62,14 @@ class EventCreateView(EventListView):
         serializer.is_valid(raise_exception=True)
         event = serializer.save(owner=request.user)
 
+        # rstrip 避免 FRONTEND_BASE_URL 若被設成帶結尾斜線(例如
+        # "https://example.com/")時組出雙斜線的 shareUrl。見 Codex review 修正
+        # 項目 D。
+        frontend_base_url = settings.FRONTEND_BASE_URL.rstrip("/")
         return Response(
             {
                 "id": str(event.id),
-                "shareUrl": f"{settings.FRONTEND_BASE_URL}/events/{event.id}",
+                "shareUrl": f"{frontend_base_url}/events/{event.id}",
             },
             status=status.HTTP_201_CREATED,
         )
@@ -77,11 +84,19 @@ class EventDetailView(APIView):
     形狀——不需要額外接線,也不是走 Django URL resolver 層級的 ``handler404``
     (那個只在路由本身比對不到時觸發,這裡路由是比對得到的)。見
     openspec/changes/add-events-api/design.md D8。
+
+    ``authentication_classes`` 覆寫成 ``OptionalJWTAuthentication``(見該類別
+    docstring)——``AllowAny`` 只跳過權限檢查,壞掉/過期的 Bearer token 若用全域
+    嚴格版 ``JWTAuthentication``,仍會在認證階段就讓整支 request 401,跟這支端點
+    「任何人皆可查詢」的公開性矛盾。見 Codex review 修正項目 A。
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = [OptionalJWTAuthentication]
 
     def get(self, request, id):
-        event = get_object_or_404(Event, pk=id)
+        event = get_object_or_404(
+            Event.objects.select_related("owner", "final_slot"), pk=id
+        )
         serializer = EventDetailSerializer(event, context={"request": request})
         return Response(serializer.data)

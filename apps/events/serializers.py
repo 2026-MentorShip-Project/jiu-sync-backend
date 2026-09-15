@@ -30,7 +30,13 @@ class SlotCreateSerializer(serializers.Serializer):
 
     date = serializers.DateField()
     time = serializers.TimeField(required=False, allow_null=True)
-    label = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    # max_length 對齊 Slot.label 的 varchar(100)——這是 plain Serializer,不會像
+    # ModelSerializer 一樣自動從 model 繼承欄位限制,若不宣告,超長 label 會通過
+    # 驗證、直到 INSERT 才被 DB 拋 DataError(500),而不是乾淨的 400。見 Codex
+    # review 修正項目 B。
+    label = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True, max_length=100
+    )
 
 
 class EventCreateSerializer(serializers.ModelSerializer):

@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import pytest
 from django.conf import settings
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -174,6 +175,49 @@ def test_host_email_in_request_body_is_not_persisted():
     assert event.host_email is None
 
 
+def test_slot_label_exactly_100_chars_is_allowed():
+    """⑨ 邊界:slot label 剛好 100 字元(DB 欄位 varchar(100)上限)→ 201 成功。"""
+    user = _create_user()
+    client = _auth_client(user)
+    label = "a" * 100
+    payload = _valid_payload(slots=[{"date": "2026-10-01", "label": label}])
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    event = Event.objects.get()
+    assert event.slots.get().label == label
+
+
+def test_slot_label_over_100_chars_returns_400():
+    """⑨ slot label 超過 100 字元 → 400 驗證錯誤(不是 DB DataError 500),不建立任何資料。
+    修正 Codex review 項目 B:SlotCreateSerializer 是 plain Serializer,不會自動繼承
+    Slot model 的 max_length=100。"""
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(slots=[{"date": "2026-10-01", "label": "a" * 101}])
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert Event.objects.count() == 0
+
+
+@override_settings(FRONTEND_BASE_URL="https://example.com/")
+def test_share_url_has_no_double_slash_when_frontend_base_url_has_trailing_slash():
+    """⑩ FRONTEND_BASE_URL 帶結尾斜線(例如 "https://example.com/")→ 組出的
+    shareUrl 不應出現雙斜線。修正 Codex review 項目 D。"""
+    user = _create_user()
+    client = _auth_client(user)
+
+    response = client.post(EVENTS_URL, _valid_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert "//events/" not in body["shareUrl"].removeprefix("https://")
+    assert body["shareUrl"] == f"https://example.com/events/{body['id']}"
+
+
 def _create_event(owner, **overrides):
     now = timezone.now()
     defaults = {
@@ -269,6 +313,43 @@ def test_event_detail_display_status_reflects_expired_deadline():
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json()["displayStatus"] == "voting_closed_pending"
+
+
+def test_invalid_bearer_token_can_still_view_event_detail_anonymously():
+    """⑦ 帶了格式不正確/無法驗證的 Bearer token → 仍視為匿名請求,200(不是 401),
+    isOwner=false,hostEmail=null。修正 Codex review 項目 A:AllowAny 只跳過權限
+    檢查,不跳過認證本身——壞 token 不該比完全不帶 token 更嚴格。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="host@example.com")
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION="Bearer garbage-invalid-token")
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["isOwner"] is False
+    assert body["hostEmail"] is None
+
+
+def test_expired_bearer_token_can_still_view_event_detail_anonymously():
+    """⑧ 帶了語法合法但已過期的 Bearer token → 仍視為匿名請求,200(不是 401),
+    isOwner=false。同項目 A。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="host@example.com")
+    client = APIClient()
+    expired_token = RefreshToken.for_user(owner).access_token
+    expired_token.set_exp(
+        from_time=timezone.now() - timedelta(days=1), lifetime=timedelta(seconds=1)
+    )
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {expired_token}")
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["isOwner"] is False
+    assert body["hostEmail"] is None
 
 
 def test_event_detail_responses_field_is_always_empty_list():

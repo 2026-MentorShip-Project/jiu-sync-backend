@@ -46,6 +46,14 @@
 - **[風險] `displayStatus` 六態中有四態這次無法被任何 API 路徑觸發,測試只能走純函式單元測試,無法用整合測試涵蓋** → 緩解:D3 已將計算邏輯抽成獨立純函式,tasks.md 會針對這個函式寫涵蓋六個分支的單元測試,不依賴 API 整合測試。
 - **[風險] `EventSummarySerializer.responseCount` 固定回傳 0,語意上「看起來像」有實際計數邏輯** → 緩解:D6 已記錄這是刻意的暫時行為,待 `ParticipantResponse` model 出現的 change 再改為真實 annotate 計數,不在本次強行做假查詢。
 
+## Open Questions
+
+實際路由(`apps/events/urls.py`)採 Django 標準的結尾斜線慣例(`POST /api/events/`、
+`GET /api/events/{id}/`),與既有 `apps.accounts` 端點行為一致。proposal.md 內文範例
+(`POST /api/events`、`GET /api/events/{id}`)省略結尾斜線,是文件慣用的簡寫,不是實際
+契約。這是 Codex review 提出的疑問,已確認是全專案既有慣例(`apps.accounts` 同樣如此),
+非本次 change 範圍內需修正的問題,依使用者明確決定維持現狀。
+
 ## Migration Plan
 
 新增 `Event`、`Slot` 兩張表的 migration,屬於全新表,無既有資料遷移風險,可直接 `python manage.py makemigrations events && python manage.py migrate`。若需回滾,`migrate events <前一版 migration 編號>` 即可,兩張表尚無外部資料依賴。
