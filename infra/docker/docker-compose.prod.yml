@@ -22,11 +22,7 @@
 
 services:
   app:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      args:
-        ENV: prod
+    image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
     env_file:
       - ../../.env
     ports:
