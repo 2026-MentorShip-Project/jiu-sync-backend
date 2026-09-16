@@ -162,9 +162,10 @@ def test_slot_id_in_request_is_ignored_and_system_generates_uuid():
     uuid.UUID(str(slot.id))
 
 
-def test_host_email_in_request_body_is_not_persisted():
-    """⑧ 請求 body 帶入 hostEmail → 建立後 Event.host_email 仍為 None,不採信該欄位。"""
-    user = _create_user()
+def test_host_email_in_request_body_is_ignored_and_set_from_authenticated_user():
+    """⑧ 請求 body 帶入 hostEmail → 不採信該欄位,建立後 Event.host_email 一律為
+    已登入使用者自己的帳號 email(建立當下即自動代入,不必等待未來的 PATCH)。"""
+    user = _create_user(email="real-owner@example.com")
     client = _auth_client(user)
     payload = _valid_payload(hostEmail="ignored@example.com")
 
@@ -172,7 +173,23 @@ def test_host_email_in_request_body_is_not_persisted():
 
     assert response.status_code == status.HTTP_201_CREATED
     event = Event.objects.get()
-    assert event.host_email is None
+    assert event.host_email == "real-owner@example.com"
+    assert event.host_email != "ignored@example.com"
+
+
+def test_host_email_is_set_from_authenticated_user_even_without_request_body_field():
+    """⑧-2 請求 body 完全不帶 hostEmail → Event.host_email 仍自動代入已登入使用者的
+    帳號 email,不維持 None。"""
+    user = _create_user(email="another-owner@example.com")
+    client = _auth_client(user)
+    payload = _valid_payload()
+    assert "hostEmail" not in payload
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    event = Event.objects.get()
+    assert event.host_email == "another-owner@example.com"
 
 
 def test_slot_label_exactly_100_chars_is_allowed():

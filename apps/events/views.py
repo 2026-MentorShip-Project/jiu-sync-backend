@@ -60,7 +60,12 @@ class EventCreateView(EventListView):
     def post(self, request):
         serializer = EventCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        event = serializer.save(owner=request.user)
+        # host_email 一律取自 request.user.email(帳號建立時就必填、唯一的欄位),
+        # 不採信請求 body 中任何 hostEmail 欄位——EventCreateSerializer 根本不宣告
+        # 該欄位,即使帶了也不會出現在 validated_data 裡。見 spec「主揪建立活動」與
+        # design.md D6(2026-09-16 修正:改為建立當下即自動代入,不再等待未來的
+        # PATCH 端點)。
+        event = serializer.save(owner=request.user, host_email=request.user.email)
 
         # rstrip 避免 FRONTEND_BASE_URL 若被設成帶結尾斜線(例如
         # "https://example.com/")時組出雙斜線的 shareUrl。見 Codex review 修正

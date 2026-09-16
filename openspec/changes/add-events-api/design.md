@@ -28,6 +28,10 @@
 ### D4. 主揪 Email 遮罩邏輯放在 serializer,不放 view
 `isOwner`(比對 `request.user == event.owner`)與 `hostEmail` 的遮罩規則(非擁有者一律回傳 `null`)都需要拿到目前請求者身分,透過 serializer 的 `context={"request": request}` 傳入,在 `SerializerMethodField` 內判斷。不在 view 層手動組字典回應,維持與既有 `apps/accounts` 的 DRF serializer 慣例一致。
 
+`POST /api/events` 的 `host_email` 建立時 SHALL 自動代入 `request.user.email`(`apps.accounts.User` 的必填、唯一欄位,Google 登入時即設定),由 `EventCreateView.post` 呼叫 `serializer.save()` 時額外帶入;請求 body 中的 `hostEmail` 欄位一律不採信(`EventCreateSerializer` 本就不宣告該欄位)。
+
+> **修訂記錄(2026-09-16)**:此欄位原本鎖定的設計是「建立當下維持 `null`,待未來 `PATCH /api/events/{id}` 端點才可設定」(見本檔案先前版本、`specs/events/spec.md` 原始措辭)。專案負責人事後明確要求反轉此決定——既然建立當下 view 已經拿得到 `request.user`、且該帳號的 `email` 必填又唯一,沒有理由讓欄位空著等未來端點,因此改為建立當下即自動代入登入帳號的 email。`host_email` 的 model 定義(`null=True, blank=True`)保留不變,不需要 migration。
+
 ### D5. `POST /api/events` 回應只回 `{id, shareUrl}`,`shareUrl` 由後端組
 新增 `settings.FRONTEND_BASE_URL`(透過 `django-environ` 讀取):`dev.py` 預設 `http://localhost:5173`,`prod.py` 要求必填(比照現有 `DJANGO_SECRET_KEY`/`ALLOWED_HOSTS` 的 fail-fast 慣例,未設定時啟動即報錯,不給預設值)。`shareUrl = f"{settings.FRONTEND_BASE_URL}/events/{event.id}"`。由後端組的理由:分享連結代表「別人看到的網址」,前端若用 `window.location.origin` 自己組,本機開發環境分享出去的連結會是 `localhost`,沒有意義;後端已知道正式對外網域,單一處維護即可。
 

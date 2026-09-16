@@ -43,8 +43,10 @@ class EventCreateSerializer(serializers.ModelSerializer):
     """``POST /api/events`` 請求 body。
 
     ``hostEmail`` 刻意不宣告成欄位——即使請求 body 帶了這個 key,DRF 只讀取已宣告
-    欄位,不會被採信、也不會寫進 ``Event.host_email``。見 spec「主揪建立活動」與
-    design.md D7(camelCase 用 ``source=`` 手動映射)。
+    欄位,不會被採信。``Event.host_email`` 改由 view(``EventCreateView.post``)在呼叫
+    ``serializer.save()`` 時額外帶入 ``request.user.email``——一律取自已登入使用者
+    自己的帳號 email,建立當下即自動代入,不再等待未來的 PATCH 端點。見 spec
+    「主揪建立活動」與 design.md D6、D7(camelCase 用 ``source=`` 手動映射)。
     """
 
     hostNickname = serializers.CharField(source="host_nickname")
