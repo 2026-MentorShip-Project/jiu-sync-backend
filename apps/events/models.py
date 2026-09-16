@@ -3,6 +3,8 @@ import uuid
 from django.conf import settings
 from django.db import models
 
+from .ids import generate_short_id
+
 
 class Slot(models.Model):
     """A candidate date/time option for an :class:`Event`.
@@ -25,10 +27,15 @@ class Slot(models.Model):
 class Event(models.Model):
     """A gathering (揪團) created by a host (主揪) for participants to vote on.
 
-    UUID primary key so event identifiers are safe to expose in shareable
-    URLs without leaking a sequential, enumerable count of events — same
-    rationale as ``apps.accounts.User``. See
-    openspec/changes/add-events-api/design.md D1.
+    8-char base62 short id primary key (``ids.generate_short_id``) so event
+    identifiers are safe to expose in shareable URLs without leaking a
+    sequential, enumerable count of events — same non-enumerability
+    rationale as the UUID used by ``apps.accounts.User`` and by ``Slot``
+    below, just shorter so it reads cleanly in a shared URL. See
+    openspec/changes/add-events-api/design.md D1 (amended 2026-09-16):
+    originally a UUID like ``Slot``, changed to this short id per explicit
+    owner decision — ``Slot`` stays UUID since its id is never surfaced in a
+    URL.
 
     ``finalized_at``/``cancelled_at``/``final_slot``/``final_note`` have no
     write path yet in this change — they're a deliberate schema-ahead
@@ -45,7 +52,9 @@ class Event(models.Model):
         FINALIZED = "finalized", "Finalized"
         CANCELLED = "cancelled", "Cancelled"
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.CharField(
+        primary_key=True, max_length=8, default=generate_short_id, editable=False
+    )
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     title = models.CharField(max_length=30)
     host_nickname = models.CharField(max_length=40)

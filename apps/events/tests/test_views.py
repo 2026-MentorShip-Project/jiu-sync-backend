@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import timedelta
 
@@ -10,11 +11,16 @@ from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
+from apps.events.ids import generate_short_id
 from apps.events.models import Event, Slot
 
 pytestmark = pytest.mark.django_db
 
 EVENTS_URL = "/api/events/"
+
+# Event.id 改成 8 碼 base62 短 id 之後(design.md D1 amended),用來斷言回應
+# 裡的 id 符合這個形狀,而不是 UUID 形狀。
+SHORT_ID_RE = re.compile(r"^[0-9A-Za-z]{8}$")
 
 
 def _detail_url(event_id):
@@ -61,6 +67,8 @@ def test_authenticated_user_can_create_event_and_receives_id_and_share_url():
     assert response.status_code == status.HTTP_201_CREATED
     body = response.json()
     assert set(body.keys()) == {"id", "shareUrl"}
+    # Event.id 是 8 碼 base62 短 id,不是 UUID——design.md D1 amended。
+    assert SHORT_ID_RE.match(body["id"])
     assert body["shareUrl"].startswith(settings.FRONTEND_BASE_URL)
     assert body["shareUrl"] == f"{settings.FRONTEND_BASE_URL}/events/{body['id']}"
 
@@ -310,10 +318,17 @@ def test_non_owner_authenticated_user_cannot_see_host_email():
 
 
 def test_nonexistent_event_id_returns_404_with_api_error_shape():
-    """④ 請求不存在的 id → 404,body 符合 api-error-format 的 {message, code} 形狀。"""
+    """④ 請求不存在的 id → 404,body 符合 api-error-format 的 {message, code} 形狀。
+
+    刻意用「形狀合法、但沒有對應資料」的短 id(而非隨機格式錯誤的字串)——這
+    樣不管 URL 路由層用的是 `<str:id>` 還是自訂的 8 碼 base62 converter,都能
+    確保請求真的會走到 view 層的 `get_object_or_404`,測的是 API 層級的 404
+    (`custom_exception_handler` 包裝的 {message, code} 形狀),而不是路由層級
+    比對不到路徑的 404(那個不會經過同一個 exception handler)。
+    """
     client = APIClient()
 
-    response = client.get(_detail_url(uuid.uuid4()))
+    response = client.get(_detail_url(generate_short_id()))
 
     assert response.status_code == status.HTTP_404_NOT_FOUND
     body = response.json()

@@ -17,6 +17,8 @@
 ### D1. `Event`/`Slot` 使用 UUID 主鍵
 比照既有 `User` model 的設計(不暴露可枚舉的循序 id)。不採用文件範例裡 `evt_xxx`/`slot_xxx` 這種自訂前綴字串 id——那只是文件示意寫法,契約本身只要求 `type: string`,DRF 序列化 UUID 欄位輸出的就是字串,符合契約且不需額外實作 id 產生器。
 
+> **修訂記錄(2026-09-16)**:專案負責人事後明確要求將 `Event.id` 改成 8 碼 base62(`0-9A-Za-z`)短 id(`apps/events/ids.py` 的 `generate_short_id`,手寫、用 `secrets.choice`,不引入 `nanoid` 這類新套件),理由是裸 UUID 在可分享的活動網址裡不好看。`Slot` 保持 UUID 不變——`Slot.id` 從未出現在任何 URL 裡,沒有這個美觀考量,也維持較低的變更範圍。62^8 ≈ 2.18e14,碰撞機率在此規模下可忽略;`generate_short_id` 本身不做碰撞重試,交由資料庫主鍵唯一性約束在極端罕見情況下拋出 `IntegrityError`(見該函式 docstring)。這是本次(add-events-api)唯一一份 migration 尚未合併到 `develop`、也還沒有部署到開發者本機 Docker Postgres 以外的任何地方時做的變更,因此直接編輯 `0001_initial.py` 反映新欄位定義,不另外新增第二份 migration。
+
 ### D2. `Slot` 獨立成 model,不用 Event 上的 JSONField
 未來 `ParticipantResponse` 需要用 through-model 記錄「每個參與者對每個候選時段的回覆狀態」(多對多+額外資料),`Slot` 必須有自己的 pk 才能被那張中介表 FK 參照。若這次用 JSONField 存時段,未來要遷移成正規化 model 是破壞性 migration;現在直接做成獨立 model,成本差異不大,但省掉未來一次資料遷移。
 
