@@ -21,6 +21,23 @@ def _weighted_length(value):
     return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value)
 
 
+def _validate_host_nickname_weighted_length(value):
+    """`hostNickname` 加權長度驗證,`EventCreateSerializer`/`EventPatchSerializer` 共用。"""
+    if _weighted_length(value) > HOST_NICKNAME_MAX_WEIGHTED_LENGTH:
+        raise serializers.ValidationError(
+            f"主揪暱稱加權長度(CJK 字元計 2、其餘計 1)不得超過"
+            f" {HOST_NICKNAME_MAX_WEIGHTED_LENGTH}"
+        )
+    return value
+
+
+def _validate_response_deadline_in_future(value):
+    """`responseDeadline` 須晚於當下驗證,`EventCreateSerializer`/`EventPatchSerializer` 共用。"""
+    if value <= timezone.now():
+        raise serializers.ValidationError("投票截止時間必須晚於目前時間")
+    return value
+
+
 class SlotCreateSerializer(serializers.Serializer):
     """``POST /api/events`` 請求 body 裡單筆候選時段。
 
@@ -64,17 +81,10 @@ class EventCreateSerializer(serializers.ModelSerializer):
         ]
 
     def validate_hostNickname(self, value):
-        if _weighted_length(value) > HOST_NICKNAME_MAX_WEIGHTED_LENGTH:
-            raise serializers.ValidationError(
-                f"主揪暱稱加權長度(CJK 字元計 2、其餘計 1)不得超過"
-                f" {HOST_NICKNAME_MAX_WEIGHTED_LENGTH}"
-            )
-        return value
+        return _validate_host_nickname_weighted_length(value)
 
     def validate_responseDeadline(self, value):
-        if value <= timezone.now():
-            raise serializers.ValidationError("投票截止時間必須晚於目前時間")
-        return value
+        return _validate_response_deadline_in_future(value)
 
     def validate_slots(self, value):
         if not (MIN_SLOTS <= len(value) <= MAX_SLOTS):
@@ -101,6 +111,45 @@ class EventCreateSerializer(serializers.ModelSerializer):
             except IntegrityError:
                 if attempt == EVENT_ID_COLLISION_MAX_ATTEMPTS - 1:
                     raise
+
+
+class EventPatchSerializer(serializers.ModelSerializer):
+    """``PATCH /api/events/{id}`` 請求 body — 已登入擁有者的 partial update。
+
+    六個可改欄位皆 ``required=False``(搭配 view 端傳入 ``partial=True``),請求中
+    未包含的欄位保持原值不變。刻意不宣告 ``mode``/``slots``——DRF 只讀取已宣告
+    欄位,未宣告的輸入自動被忽略,不需要額外手動剔除。
+
+    ``hostEmail`` 與 ``EventCreateSerializer`` 不同,這裡**必須**宣告成一般可寫
+    欄位——PATCH 情境下允許改成與登入帳號 email 不同的任意合法信箱,不再綁定
+    ``request.user.email``。
+    """
+
+    hostNickname = serializers.CharField(source="host_nickname", required=False)
+    hostEmail = serializers.EmailField(source="host_email", required=False)
+    responseDeadline = serializers.DateTimeField(source="response_deadline", required=False)
+
+    class Meta:
+        model = Event
+        fields = [
+            "title",
+            "description",
+            "location",
+            "hostNickname",
+            "hostEmail",
+            "responseDeadline",
+        ]
+        extra_kwargs = {
+            "title": {"required": False},
+            "description": {"required": False},
+            "location": {"required": False},
+        }
+
+    def validate_hostNickname(self, value):
+        return _validate_host_nickname_weighted_length(value)
+
+    def validate_responseDeadline(self, value):
+        return _validate_response_deadline_in_future(value)
 
 
 class SlotSerializer(serializers.ModelSerializer):

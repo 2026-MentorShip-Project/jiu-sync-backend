@@ -1,13 +1,20 @@
 from django.conf import settings
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from .authentication import OptionalJWTAuthentication
 from .models import Event
-from .serializers import EventCreateSerializer, EventDetailSerializer, EventSummarySerializer
+from .serializers import (
+    EventCreateSerializer,
+    EventDetailSerializer,
+    EventPatchSerializer,
+    EventSummarySerializer,
+)
 
 
 class EventListView(APIView):
@@ -67,20 +74,29 @@ class EventCreateView(EventListView):
 
 class EventDetailView(APIView):
     """``GET /api/events/{id}`` — 任何人(含未登入)可查詢活動完整資料。
+    ``PATCH /api/events/{id}`` — 已登入擁有者編輯活動六個基本欄位。
 
     查無資料時 ``get_object_or_404`` 拋出的 ``Http404``,會被 DRF 預設的
     ``exception_handler`` 攔截轉成 ``NotFound``,再經
     ``config.exceptions.custom_exception_handler`` 統一包成 ``{message, code}``
     形狀,不需要額外接線。
 
-    ``authentication_classes`` 覆寫成 ``OptionalJWTAuthentication``(見該類別
-    docstring)——``AllowAny`` 只跳過權限檢查,壞掉/過期的 Bearer token 若用全域
-    嚴格版 ``JWTAuthentication``,仍會在認證階段就讓整支 request 401,跟這支端點
-    「任何人皆可查詢」的公開性矛盾。
+    ``get_permissions()``/``get_authenticators()`` 依 ``self.request.method``
+    分派——``GET`` 沿用 ``AllowAny`` + ``OptionalJWTAuthentication``(見該類別
+    docstring)。``PATCH`` 改用 ``IsAuthenticated`` + 全域預設的嚴格
+    ``JWTAuthentication``——壞 token 在 PATCH 語境下就該真的 401,不該像 GET
+    一樣被吞成匿名。
     """
 
-    permission_classes = [AllowAny]
-    authentication_classes = [OptionalJWTAuthentication]
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [IsAuthenticated()]
+        return [AllowAny()]
+
+    def get_authenticators(self):
+        if self.request.method == "PATCH":
+            return [JWTAuthentication()]
+        return [OptionalJWTAuthentication()]
 
     def get(self, request, id):
         event = get_object_or_404(
@@ -88,3 +104,19 @@ class EventDetailView(APIView):
         )
         serializer = EventDetailSerializer(event, context={"request": request})
         return Response(serializer.data)
+
+    def patch(self, request, id):
+        event = get_object_or_404(
+            Event.objects.select_related("owner", "final_slot"), pk=id
+        )
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可編輯此活動")
+        if event.status != Event.Status.ACTIVE:
+            raise serializers.ValidationError("僅進行中的活動可編輯")
+
+        serializer = EventPatchSerializer(event, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data)
