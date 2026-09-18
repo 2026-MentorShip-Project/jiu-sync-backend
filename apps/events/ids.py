@@ -16,14 +16,9 @@ def generate_short_id() -> str:
     though it isn't a security credential itself.
 
     62**8 ≈ 2.18e14 possible values — collision probability at this app's
-    scale is negligible. This function does NOT retry on collision: Django
-    ``default=`` callables run once per unsaved instance with no visibility
-    into whether the value collides, so retrying here would require callers
-    to loop around ``save()`` themselves. Instead we deliberately rely on
+    scale is negligible. Deliberately does NOT retry on collision: relies on
     the database's own primary-key uniqueness constraint to raise a loud
-    ``IntegrityError`` on the astronomically-rare collision, rather than
-    silently swallowing it or building a retry loop for a probability this
-    low. See openspec/changes/add-events-api/design.md D1 (amended) and
-    CLAUDE.md 資料操作穩健性規範 rule 5(錯誤不可被吞掉).
+    ``IntegrityError`` on the astronomically-rare case, rather than building
+    a retry loop for a probability this low.
     """
     return "".join(secrets.choice(_ALPHABET) for _ in range(_ID_LENGTH))

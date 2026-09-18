@@ -9,9 +9,8 @@ def compute_display_status(
     """Derive an event's display status without touching the database.
 
     Pure function: takes plain values (no Django model access) so it can be
-    unit tested directly and reused by future finalize/cancel views and the
-    `/live` polling endpoint without duplicating this logic. See
-    openspec/changes/add-events-api/design.md D3.
+    unit tested directly and reused by future finalize/cancel/live-polling
+    code without duplicating this logic.
     """
     if status == "active":
         if now < response_deadline:

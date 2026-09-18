@@ -16,7 +16,6 @@ def _weighted_length(value):
     """中日韓(CJK)字元計 2、其餘字元計 1 的加權長度。
 
     以 ``unicodedata.east_asian_width`` 判斷:Wide/Fullwidth 視為 CJK 字元。
-    見 openspec/changes/add-events-api/specs/events/spec.md「主揪建立活動」。
     """
     return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value)
 
@@ -25,15 +24,14 @@ class SlotCreateSerializer(serializers.Serializer):
     """``POST /api/events`` 請求 body 裡單筆候選時段。
 
     刻意不宣告 ``id`` 欄位——請求若帶了 ``slots[].id``,DRF 只讀取已宣告欄位,
-    這個值會被自動忽略,建立時一律由 ``Slot`` model 的 UUID 預設值產生。見 design.md D1。
+    這個值會被自動忽略,建立時一律由 ``Slot`` model 的 UUID 預設值產生。
     """
 
     date = serializers.DateField()
     time = serializers.TimeField(required=False, allow_null=True)
-    # max_length 對齊 Slot.label 的 varchar(100)——這是 plain Serializer,不會像
-    # ModelSerializer 一樣自動從 model 繼承欄位限制,若不宣告,超長 label 會通過
-    # 驗證、直到 INSERT 才被 DB 拋 DataError(500),而不是乾淨的 400。見 Codex
-    # review 修正項目 B。
+    # max_length 對齊 Slot.label 的 varchar(100)——plain Serializer 不會像
+    # ModelSerializer 一樣自動從 model 繼承欄位限制,若不宣告,超長 label 要到
+    # DB INSERT 才會炸,而不是乾淨的 400。
     label = serializers.CharField(
         required=False, allow_null=True, allow_blank=True, max_length=100
     )
@@ -44,9 +42,8 @@ class EventCreateSerializer(serializers.ModelSerializer):
 
     ``hostEmail`` 刻意不宣告成欄位——即使請求 body 帶了這個 key,DRF 只讀取已宣告
     欄位,不會被採信。``Event.host_email`` 改由 view(``EventCreateView.post``)在呼叫
-    ``serializer.save()`` 時額外帶入 ``request.user.email``——一律取自已登入使用者
-    自己的帳號 email,建立當下即自動代入,不再等待未來的 PATCH 端點。見 spec
-    「主揪建立活動」與 design.md D6、D7(camelCase 用 ``source=`` 手動映射)。
+    ``serializer.save()`` 時額外帶入 ``request.user.email``,一律取自已登入使用者
+    自己的帳號 email。
     """
 
     hostNickname = serializers.CharField(source="host_nickname")
@@ -107,11 +104,8 @@ class SlotSerializer(serializers.ModelSerializer):
 class _OwnerAndDisplayStatusMixin:
     """``isOwner``/``displayStatus`` 的共用計算邏輯。
 
-    ``EventDetailSerializer``(``GET /api/events/{id}``)與 ``EventSummarySerializer``
-    (``GET /api/events?owner=me``)都需要這兩個 ``SerializerMethodField``,計算方式
-    完全相同(比對 ``request.user`` 與 ``event.owner``、呼叫
-    ``lifecycle.compute_display_status``),抽出來避免兩份序列化器各寫一次。見
-    design.md D3(displayStatus 用純函式)、D4(owner 比對放在 serializer)。
+    ``EventDetailSerializer``/``EventSummarySerializer`` 都需要這兩個
+    ``SerializerMethodField``,計算方式完全相同,抽出來避免兩份序列化器各寫一次。
     """
 
     def _is_owner(self, event):
@@ -138,9 +132,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
 
     ``isOwner``/``hostEmail``/``displayStatus``/``responses`` 都需要拿到目前
     請求者身分或即時計算,透過 view 傳入 ``context={"request": request}`` 讓這幾個
-    ``SerializerMethodField`` 使用。見 design.md D3(displayStatus 用
-    ``lifecycle.compute_display_status``)、D4(email 遮罩邏輯放在 serializer)、
-    D6(``responses`` 這次固定回傳 ``[]``)。
+    ``SerializerMethodField`` 使用。
     """
 
     hostNickname = serializers.CharField(source="host_nickname")
@@ -175,7 +167,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         return event.host_email
 
     def get_responses(self, event):
-        # ParticipantResponse 本次不建立(scope 排除項目)——見 design.md D6。
+        # ParticipantResponse model 尚未建立,固定回傳空陣列。
         return []
 
 
@@ -183,10 +175,7 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
     """``GET /api/events?owner=me`` 回應裡的精簡格式活動清單項目。
 
     刻意不宣告 ``responses``/``hostEmail`` 欄位——清單頁不含個別參與者投票明細與
-    主揪 Email,見 spec「主揪查詢自己擁有的活動清單」。``responseCount`` 固定回傳
-    ``0``(``ParticipantResponse`` 本次未建立,見 design.md D6)。``isOwner``/
-    ``displayStatus`` 沿用 ``EventDetailSerializer`` 的計算方式(見
-    ``_OwnerAndDisplayStatusMixin``)。
+    主揪 Email。
     """
 
     hostNickname = serializers.CharField(source="host_nickname")
@@ -212,5 +201,5 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
         ]
 
     def get_responseCount(self, event):
-        # ParticipantResponse 本次不建立(scope 排除項目)——見 design.md D6。
+        # ParticipantResponse model 尚未建立,固定回傳 0。
         return 0
