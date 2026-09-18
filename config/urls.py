@@ -17,9 +17,8 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 
-from config.health import healthz
-
 from apps.accounts.views import MeView
+from config.health import healthz
 
 admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
 
