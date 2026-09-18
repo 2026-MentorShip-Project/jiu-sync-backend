@@ -13,3 +13,10 @@ staticfiles/
 infra/terraform/.terraform/
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
+.spectra/
+openspec/.vector-search.db*
+
+# Terraform
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*

@@ -19,11 +19,19 @@ from django.urls import include, path
 
 from config.health import healthz
 
+from apps.accounts.views import MeView
+
+admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/me/', MeView.as_view(), name='me'),
     path('healthz/', healthz, name='healthz'),
     path('api/auth/', include('apps.accounts.urls')),
     path('api/events/', include('apps.events.urls')),
     path('api/recommendations/', include('apps.recommendations.urls')),
     path('api/notifications/', include('apps.notifications.urls')),
 ]
+
+handler404 = "config.exceptions.handler404"
+handler500 = "config.exceptions.handler500"

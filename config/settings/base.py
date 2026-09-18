@@ -36,7 +36,6 @@ DJANGO_APPS = [
 THIRD_PARTY_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
-    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
 ]
 
@@ -83,16 +82,21 @@ ASGI_APPLICATION = "config.asgi.application"
 
 # Database
 # PostgreSQL only — set DATABASE_URL, e.g.
-# postgres://user:password@localhost:5432/jiu_sync
+# postgres://user:password@localhost:5455/jiu_sync
+# (host port 5455, not Postgres's default 5432 — see docker-compose.yml)
 
 DATABASES = {
     "default": env.db_url(
         "DATABASE_URL",
-        default="postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync",
+        default="postgres://jiu_sync:jiu_sync@localhost:5455/jiu_sync",
     ),
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Custom User model — Google SSO only, no username/password auth. See
+# apps.accounts.models.User and openspec/changes/google-sso-login/design.md.
+AUTH_USER_MODEL = "accounts.User"
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -150,13 +154,15 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # 全站一致的非 2xx 錯誤回應格式 {"message": ..., "code": ...}. See
+    # openspec/changes/api-error-format/design.md.
+    "EXCEPTION_HANDLER": "config.exceptions.custom_exception_handler",
 }
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(hours=2),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=14),
     "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
@@ -166,13 +172,17 @@ SIMPLE_JWT = {
 # CORS — frontend SPA origin(s), comma-separated in env.
 
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
-# Auth is a JWT Authorization header, not a cookie — no cross-site credentials needed.
+# refresh token 走 httpOnly cookie（見
+# openspec/changes/refresh-token-httponly-cookie/design.md），瀏覽器要願意收送這個
+# cookie 需要 credentialed CORS。CORS_ALLOWED_ORIGINS 維持明確列出網域，不可為 "*"
+# ——django-cors-headers 本身就禁止 "*" 搭配 CORS_ALLOW_CREDENTIALS=True。
+CORS_ALLOW_CREDENTIALS = True
 
 # Celery — background tasks: 7-day soft-delete expiry sweep, Email
 # notifications (finalized / deadline / board update). Fire-and-forget: no
 # result backend, nothing queries task results.
 
-CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
