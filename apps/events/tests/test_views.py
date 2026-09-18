@@ -67,7 +67,6 @@ def test_authenticated_user_can_create_event_and_receives_id_and_share_url():
     assert response.status_code == status.HTTP_201_CREATED
     body = response.json()
     assert set(body.keys()) == {"id", "shareUrl"}
-    # Event.id 是 8 碼 base62 短 id,不是 UUID——design.md D1 amended。
     assert SHORT_ID_RE.match(body["id"])
     assert body["shareUrl"].startswith(settings.FRONTEND_BASE_URL)
     assert body["shareUrl"] == f"{settings.FRONTEND_BASE_URL}/events/{body['id']}"
