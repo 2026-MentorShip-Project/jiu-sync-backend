@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 from django.conf import settings
+from django.db import IntegrityError
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -18,8 +19,7 @@ pytestmark = pytest.mark.django_db
 
 EVENTS_URL = "/api/events/"
 
-# Event.id 改成 8 碼 base62 短 id 之後(design.md D1 amended),用來斷言回應
-# 裡的 id 符合這個形狀,而不是 UUID 形狀。
+# Event.id 是 8 碼 base62 短 id,不是 UUID 形狀。
 SHORT_ID_RE = re.compile(r"^[0-9A-Za-z]{8}$")
 
 
@@ -256,6 +256,53 @@ def _create_event(owner, **overrides):
     event = Event.objects.create(**defaults)
     Slot.objects.create(event=event, date="2026-10-01")
     return event
+
+
+def _patch_event_id_default(monkeypatch, fake):
+    """設定 ``Event.id`` 欄位的 ``default``。
+
+    Django 把解析後的 default getter 快取在 ``Field._get_default``
+    (``cached_property``)——一旦任何一筆 ``Event`` 被建立過,這個快取就定型了,
+    之後單改 ``field.default`` 不會生效,必須連快取一起清掉才能讓新的
+    default 真正生效。
+    """
+    field = Event._meta.get_field("id")
+    monkeypatch.setattr(field, "default", fake)
+    monkeypatch.delitem(field.__dict__, "_get_default", raising=False)
+
+
+def test_event_id_collision_retries_and_still_succeeds(monkeypatch):
+    """⑪ Event.id 產生器撞到既有 id 時重試,換到不重複的 id 後仍建立成功。"""
+    user = _create_user()
+    client = _auth_client(user)
+    existing = _create_event(user)
+    real_generate = generate_short_id
+    calls = {"n": 0}
+
+    def colliding_once_then_real():
+        calls["n"] += 1
+        return existing.id if calls["n"] == 1 else real_generate()
+
+    _patch_event_id_default(monkeypatch, colliding_once_then_real)
+
+    response = client.post(EVENTS_URL, _valid_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert calls["n"] >= 2
+    assert Event.objects.count() == 2
+
+
+def test_event_id_collision_exhausts_retries_and_raises(monkeypatch):
+    """⑫ 每次產生的 id 都撞號 → 重試用盡後仍然失敗(不是無限重試),不留下新資料。"""
+    user = _create_user()
+    client = _auth_client(user)
+    existing = _create_event(user)
+    _patch_event_id_default(monkeypatch, lambda: existing.id)
+
+    with pytest.raises(IntegrityError):
+        client.post(EVENTS_URL, _valid_payload(), format="json")
+
+    assert Event.objects.count() == 1
 
 
 def test_unauthenticated_user_can_view_event_detail_without_owner_info():

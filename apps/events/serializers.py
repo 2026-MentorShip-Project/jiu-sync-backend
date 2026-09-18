@@ -1,6 +1,6 @@
 import unicodedata
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -10,6 +10,7 @@ from .models import Event, Slot
 HOST_NICKNAME_MAX_WEIGHTED_LENGTH = 40
 MIN_SLOTS = 1
 MAX_SLOTS = 20
+EVENT_ID_COLLISION_MAX_ATTEMPTS = 3
 
 
 def _weighted_length(value):
@@ -85,12 +86,21 @@ class EventCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         slots_data = validated_data.pop("slots")
         owner = validated_data.pop("owner")
-        with transaction.atomic():
-            event = Event.objects.create(owner=owner, **validated_data)
-            Slot.objects.bulk_create(
-                [Slot(event=event, **slot_data) for slot_data in slots_data]
-            )
-        return event
+        # Event.id 用 secrets 隨機產生,理論上可能撞號(機率極低,見
+        # ids.generate_short_id 的說明)。每次呼叫 Event.objects.create() 都會
+        # 重新產生一個新 id,撞到就重試;重試次數用完仍撞號就讓 IntegrityError
+        # 往上炸,不吞掉。
+        for attempt in range(EVENT_ID_COLLISION_MAX_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    event = Event.objects.create(owner=owner, **validated_data)
+                    Slot.objects.bulk_create(
+                        [Slot(event=event, **slot_data) for slot_data in slots_data]
+                    )
+                return event
+            except IntegrityError:
+                if attempt == EVENT_ID_COLLISION_MAX_ATTEMPTS - 1:
+                    raise
 
 
 class SlotSerializer(serializers.ModelSerializer):

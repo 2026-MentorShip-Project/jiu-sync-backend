@@ -35,14 +35,17 @@ class Event(models.Model):
     finalize/cancel feature doesn't need its own migration.
     """
 
+    # 沒明確給 label——這個 app 全程走 JWT API,沒有用到 Django admin 或
+    # get_FOO_display(),不需要額外維護一份沒人讀的顯示字串;Django 會自動從
+    # 成員名生成 label。
     class Mode(models.TextChoices):
-        DATE_ONLY = "date_only", "Date only"
-        TIME_SLOTS = "time_slots", "Time slots"
+        DATE_ONLY = "date_only"
+        TIME_SLOTS = "time_slots"
 
     class Status(models.TextChoices):
-        ACTIVE = "active", "Active"
-        FINALIZED = "finalized", "Finalized"
-        CANCELLED = "cancelled", "Cancelled"
+        ACTIVE = "active"
+        FINALIZED = "finalized"
+        CANCELLED = "cancelled"
 
     id = models.CharField(
         primary_key=True, max_length=8, default=generate_short_id, editable=False

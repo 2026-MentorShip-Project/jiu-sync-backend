@@ -16,9 +16,8 @@ def generate_short_id() -> str:
     though it isn't a security credential itself.
 
     62**8 ≈ 2.18e14 possible values — collision probability at this app's
-    scale is negligible. Deliberately does NOT retry on collision: relies on
-    the database's own primary-key uniqueness constraint to raise a loud
-    ``IntegrityError`` on the astronomically-rare case, rather than building
-    a retry loop for a probability this low.
+    scale is negligible. This function itself has no DB access and doesn't
+    retry; the caller (``EventCreateSerializer.create``) retries a few times
+    on the database's ``IntegrityError`` for the rare case this collides.
     """
     return "".join(secrets.choice(_ALPHABET) for _ in range(_ID_LENGTH))
