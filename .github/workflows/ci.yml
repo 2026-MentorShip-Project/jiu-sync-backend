@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run ruff
+        run: uv run ruff check .
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres: &postgres-service
+        image: postgres:16
+        env:
+          POSTGRES_DB: jiu_sync
+          POSTGRES_USER: jiu_sync
+          POSTGRES_PASSWORD: jiu_sync
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jiu_sync"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check for missing migrations
+        run: uv run python manage.py makemigrations --check --dry-run
+
+      - name: Apply migrations
+        run: uv run python manage.py migrate
+
+      - name: Run tests
+        run: |
+          set +e
+          uv run pytest --cov --cov-report=term-missing
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "No tests collected yet — treating as success."
+            exit 0
+          fi
+          exit "$status"
+
+  spec-sync:
+    name: spec-sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check spec/impl sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "非 pull_request 觸發(例如 workflow_dispatch),沒有 PR base 可比對,略過 spec-sync 檢查。"
+            exit 0
+          fi
+
+          changed_files=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
+
+          if [ -z "$changed_files" ]; then
+            echo "PR diff 為空,略過 spec-sync 檢查。"
+            exit 0
+          fi
+
+          echo "PR 變動的檔案:"
+          echo "$changed_files"
+          echo ""
+
+          impl_touched=false
+          spec_touched=false
+
+          while IFS= read -r file; do
+            case "$file" in
+              apps/*|config/*)
+                impl_touched=true
+                ;;
+            esac
+            case "$file" in
+              openspec/specs/*|openspec/changes/*)
+                spec_touched=true
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          if [ "$impl_touched" = true ] && [ "$spec_touched" = false ]; then
+            echo "❌ spec-sync 檢查失敗:"
+            echo "本次 PR 動到 apps/** 或 config/** 實作,但沒有同步動到 openspec/specs/** 或 openspec/changes/**。"
+            echo "請補上對應的 spec 文件更新,或在 openspec/changes/<change-name>/ 底下補上對應的 change 文件,再重新提交。"
+            exit 1
+          fi
+
+          echo "spec-sync 檢查通過。"
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres: *postgres-service
+    env:
+      DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Apply migrations
+        run: uv run python manage.py migrate
+
+      - name: Prepare artifacts directory
+        run: mkdir -p artifacts
+
+      - name: Start server
+        run: |
+          uv run python manage.py runserver 0.0.0.0:8000 > artifacts/server.log 2>&1 &
+          echo $! > artifacts/server.pid
+
+      - name: Wait for server to become healthy
+        run: |
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$(cat artifacts/server.pid)" 2>/dev/null; then
+              echo "Server process died before becoming healthy (attempt ${attempt})."
+              cat artifacts/server.log
+              exit 1
+            fi
+            if curl --fail --silent --output /dev/null "http://127.0.0.1:8000/healthz/"; then
+              echo "Server is healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become healthy within timeout."
+          cat artifacts/server.log
+          exit 1
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: "1.6.1"
+
+      - name: Run k6 smoke test
+        run: k6 run tests/k6/healthz-smoke.js | tee artifacts/k6.log
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f artifacts/server.pid ]; then
+            kill "$(cat artifacts/server.pid)" || true
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: artifacts/*.log
+          retention-days: 7

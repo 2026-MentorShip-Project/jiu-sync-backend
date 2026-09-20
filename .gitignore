@@ -8,6 +8,7 @@ staticfiles/
 .idea/
 .ruff_cache/
 .pytest_cache/
+.coverage
 .spectra/
 openspec/.vector-search.db*
 
