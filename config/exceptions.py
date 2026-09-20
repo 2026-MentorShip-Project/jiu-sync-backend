@@ -43,6 +43,19 @@ STATUS_CODE_DEFAULT_CODES = {
     500: "SERVER_ERROR",
 }
 
+# 同一批「無既有業務 ApiError」的例外（DRF/simplejwt 內建的 NotAuthenticated、
+# PermissionDenied、NotFound 等），預設 .detail 都是英文，且從未被我們自己的
+# 程式碼改寫過。只在 `custom_exception_handler` 的 "detail" 形狀分支套用——
+# ValidationError 的欄位訊息（errors 陣列）已經是我們自己的中文文案，不受影響。
+# 400 不在表裡：這個分支理論上可能出現的 400（例如非 dict 形狀的 ValidationError）
+# 極罕見，沿用既有的 `_flatten_message` 行為即可，不強行塞中文。
+STATUS_CODE_DEFAULT_MESSAGES = {
+    401: "驗證失敗，請重新登入",
+    403: "沒有權限執行此操作",
+    404: "找不到這筆資料",
+    500: "伺服器發生未預期的錯誤",
+}
+
 
 def _find_leaf(value):
     """遞迴往下找到第一個字串 leaf，直到不再是 dict/list 為止。
@@ -103,7 +116,9 @@ def custom_exception_handler(exc, context):
 
     ValidationError 的 dict 形狀（沒有 "detail" 鍵）額外帶上 `errors` 陣列，
     見 design.md「Decisions」D1/D2。401/403/404/500 在沒有既有業務 `ApiError` code
-    時，依狀態碼補上固定預設值，見 D3。
+    時，依狀態碼補上固定預設值，見 D3。同一批「detail」形狀的例外（DRF/simplejwt
+    內建、預設訊息是英文的）也一併換成固定中文 message，前端可以直接顯示，不會
+    混到框架自帶的英文字串。
     """
     response = drf_exception_handler(exc, context)
     if response is None:
@@ -127,7 +142,9 @@ def custom_exception_handler(exc, context):
             message = errors[0]["message"] if errors else ""
         else:
             errors = None
-            message = _flatten_message(data)
+            message = STATUS_CODE_DEFAULT_MESSAGES.get(
+                response.status_code, _flatten_message(data)
+            )
 
     body = {"message": message, "code": code}
     if errors is not None:

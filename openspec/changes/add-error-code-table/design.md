@@ -31,6 +31,11 @@ DRF 對巢狀 `many=True` serializer(例如 `slots`)驗證失敗時,`response.da
 ### D5. `apps.accounts`/`apps.events` 的 view、serializer 完全不動
 這次改動 100% 集中在 `config/exceptions.py`。`apps.accounts` 既有的 `ApiError` 呼叫點不用改(D3 的查表邏輯只在 code 是 `None` 時才介入,不影響已指定 code 的路徑)。`apps.events` 的驗證規則(長度、必填、時間比較等)也不用改——它們拋的還是原本的 `serializers.ValidationError`,只是 `custom_exception_handler` 這一層處理方式變了。
 
+### D6. `STATUS_CODE_DEFAULT_MESSAGES`:「detail」形狀分支的 message 也換成固定中文
+D3 的狀態碼查表只補了 `code`,「detail」形狀分支(DRF/simplejwt 內建、無 `ApiError` 包裝的例外,例如 `NotAuthenticated`、`PermissionDenied`、`NotFound`、simplejwt 的 `AuthenticationFailed`)的 `message` 這次之前還是直接沿用原始 `.detail`,而這些例外的預設文字都是英文(例如 `"Given token not valid for any token type"`)。前端擔心會直接拿 `message` 渲染給使用者看,英文字串穿透出去體驗不一致。
+
+新增一份平行的對照表 `STATUS_CODE_DEFAULT_MESSAGES`(`{401: "驗證失敗，請重新登入", 403: "沒有權限執行此操作", 404: "找不到這筆資料", 500: "伺服器發生未預期的錯誤"}`),只套用在「detail」形狀分支(`custom_exception_handler` 裡 `isinstance(data, dict) and "detail" not in data` 為否的那一支)。400 刻意不在表裡——這個分支理論上可能出現的 400(例如非 dict 形狀的 `ValidationError`)極罕見,沿用既有 `_flatten_message` 行為即可。ValidationError 的欄位訊息(`errors` 陣列、頂層 `message`)完全不受影響——那些本來就是我們自己 serializer 寫的中文文案,不會被這份表覆蓋(這份表只在 else 分支查,ValidationError 走的是另一支 `if` 分支)。
+
 ## Risks / Trade-offs
 
 - **[風險] `errors` 陣列只取每個欄位的「第一則」訊息,DRF 有時對同一欄位會有多條錯誤訊息(例如同時觸發 `required` 跟自訂 validator)** → 緩解:這是既有 `_find_leaf` 就有的行為(只取第一個),這次沒有改變這個既有慣例,不是新引入的限制。

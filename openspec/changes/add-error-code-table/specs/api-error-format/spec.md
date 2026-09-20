@@ -52,3 +52,14 @@
 #### Scenario: 既有業務 code 不受影響
 - **WHEN** view 透過 `ApiError` 明確指定了 `code`(例如 `INVALID_REFRESH_TOKEN`)
 - **THEN** 回應的 `code` 欄位維持該指定值,不被狀態碼預設值覆蓋
+
+### Requirement: 框架內建例外的 message 不得夾雜非中文原文
+系統 SHALL 讓沒有透過 `ApiError`/驗證錯誤機制自訂訊息的例外(例如 DRF 內建的 `NotAuthenticated`、`PermissionDenied`、`NotFound`,或 JWT 驗證函式庫拋出的例外)回應固定的繁體中文 `message`,不得讓函式庫預設的英文原文(例如 `"Given token not valid for any token type"`)穿透到回應內容。401/403/404/500 分別對應固定文案。驗證錯誤的 `errors` 陣列與其訊息內容不受此規則影響,維持既有(已是中文的)欄位文案。
+
+#### Scenario: 過期或格式錯誤的存取權杖回傳中文訊息
+- **WHEN** 請求帶著過期或格式不正確的存取權杖,觸發 JWT 驗證函式庫的例外,且沒有透過 `ApiError` 自訂訊息
+- **THEN** 回應的 `message` 是固定的中文文案,不包含函式庫原始的英文錯誤內容
+
+#### Scenario: 未帶身分憑證回傳中文訊息
+- **WHEN** 請求完全沒有帶身分憑證,觸發 DRF 內建的 `NotAuthenticated`
+- **THEN** 回應的 `message` 是固定的中文文案,不是 DRF 預設的英文字串

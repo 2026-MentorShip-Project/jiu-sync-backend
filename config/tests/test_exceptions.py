@@ -1,5 +1,6 @@
 from django.test import Client, override_settings
 from rest_framework.exceptions import (
+    AuthenticationFailed,
     NotAuthenticated,
     NotFound,
     PermissionDenied,
@@ -72,7 +73,10 @@ def test_handler_converts_drf_built_in_not_authenticated():
 
     code 斷言從原本的 `is None` 改成 `== "UNAUTHORIZED"`：這是 design.md D3 的
     刻意行為變更（401 在沒有既有業務 ApiError code 時，依狀態碼補上固定值），
-    不是遷就實作結果而放寬測試。
+    不是遷就實作結果而放寬測試。message 斷言改成固定中文字串（而不只是「非空字串
+    就好」）：DRF 內建例外的預設 .detail 是英文（例如
+    "Authentication credentials were not provided."），前端可能直接拿 message
+    渲染，不該讓框架的英文字串穿透出去，這是同一輪的刻意行為變更。
     """
     exc = NotAuthenticated()
 
@@ -80,12 +84,13 @@ def test_handler_converts_drf_built_in_not_authenticated():
 
     assert response.data["code"] == "UNAUTHORIZED"
     assert "detail" not in response.data
-    assert isinstance(response.data["message"], str)
-    assert response.data["message"]
+    assert response.data["message"] == "驗證失敗，請重新登入"
 
 
 def test_handler_converts_drf_built_in_permission_denied():
-    """⑥ DRF 內建 PermissionDenied（403，無 ApiError code)→ code 依狀態碼預設為 "FORBIDDEN"。"""
+    """⑥ DRF 內建 PermissionDenied（403，無 ApiError code)→ code 依狀態碼預設為
+    "FORBIDDEN"，message 換成固定中文（見 test_handler_converts_drf_built_in_not_authenticated
+    的說明，同一輪刻意行為變更）。"""
     exc = PermissionDenied()
 
     response = custom_exception_handler(exc, {})
@@ -93,12 +98,12 @@ def test_handler_converts_drf_built_in_permission_denied():
     assert response.status_code == 403
     assert response.data["code"] == "FORBIDDEN"
     assert "detail" not in response.data
-    assert isinstance(response.data["message"], str)
-    assert response.data["message"]
+    assert response.data["message"] == "沒有權限執行此操作"
 
 
 def test_handler_converts_drf_built_in_not_found():
-    """⑦ DRF 內建 NotFound（404，無 ApiError code)→ code 依狀態碼預設為 "NOT_FOUND"。"""
+    """⑦ DRF 內建 NotFound（404，無 ApiError code)→ code 依狀態碼預設為 "NOT_FOUND"，
+    message 換成固定中文（同上）。"""
     exc = NotFound()
 
     response = custom_exception_handler(exc, {})
@@ -106,8 +111,21 @@ def test_handler_converts_drf_built_in_not_found():
     assert response.status_code == 404
     assert response.data["code"] == "NOT_FOUND"
     assert "detail" not in response.data
-    assert isinstance(response.data["message"], str)
-    assert response.data["message"]
+    assert response.data["message"] == "找不到這筆資料"
+
+
+def test_handler_converts_drf_built_in_authentication_failed_with_english_detail():
+    """新增:模擬 simplejwt 拋出的 AuthenticationFailed(預設 .detail 是英文，例如
+    "Given token not valid for any token type")→ message 換成固定中文，不穿透英文
+    原文,code 依狀態碼預設為 "UNAUTHORIZED"。"""
+    exc = AuthenticationFailed("Given token not valid for any token type")
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.status_code == 401
+    assert response.data["code"] == "UNAUTHORIZED"
+    assert response.data["message"] == "驗證失敗，請重新登入"
+    assert "Given token" not in response.data["message"]
 
 
 def test_handler_builds_errors_array_for_single_field_validation_error():

@@ -27,7 +27,12 @@
   - `handler404`/`handler500` 分別把 `"code": None` 改成 `"code": "NOT_FOUND"`/`"code": "SERVER_ERROR"`
   - 讓 1.1 全部轉綠為止,不多加東西——滿足需求「統一錯誤回應形狀」「沒有業務代碼時,code 依狀態碼決定預設值」「未匹配任何路由的請求也符合統一格式」— (auto) `pytest config/tests/test_exceptions.py` 該檔全綠
 
-## 2. 收尾
+## 2. Seam: 框架內建例外的 message 中文化(對應 spec 需求:框架內建例外的 message 不得夾雜非中文原文,design.md D6)
 
-- [x] 2.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run pytest`(全套,含 `apps/accounts`/`apps/events` 既有測試,確認這次改動沒有連帶弄壞既有的 `ApiError`/`Gone`/401/403/404 相關斷言)— (auto) 三個指令 exit code 皆 0
-- [x] 2.2 驗證邊界需求「不改變驗證規則本身、不改變 `apps.accounts` 既有業務 code」:`git diff --stat develop...HEAD` 確認只有 `config/exceptions.py`、`config/tests/test_exceptions.py`、`openspec/changes/add-error-code-table/` 被異動,沒有動到 `apps/accounts/`、`apps/events/` 任何 view 或 serializer 檔案 — (auto) `git diff --stat` 顯示的檔案清單與異動內容不含上述項目
+- [x] 2.1 [RED] 在 `config/tests/test_exceptions.py` 補測試與修改既有測試,涵蓋:`NotAuthenticated`/`PermissionDenied`/`NotFound` 三個既有測試的 `message` 斷言從「非空字串即可」改成精確比對固定中文字串;新增一則模擬 simplejwt `AuthenticationFailed`(帶英文 `.detail`,例如 `"Given token not valid for any token type"`)的測試,確認 `message` 換成固定中文、不含原始英文字串。修改後這幾條應該 FAIL(`message` 還是英文原文)— (auto) `pytest config/tests/test_exceptions.py` 顯示這幾條 FAIL
+- [x] 2.2 [GREEN] 在 `config/exceptions.py` 新增 `STATUS_CODE_DEFAULT_MESSAGES` 對照表(401/403/404/500 對應固定中文文案,400 不在表裡),只在 `custom_exception_handler` 的「detail」形狀分支套用(`ValidationError` 的 `errors` 陣列/頂層 `message` 不受影響),讓 2.1 全部轉綠 — (auto) `pytest config/tests/test_exceptions.py` 該檔全綠
+
+## 3. 收尾
+
+- [x] 3.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run pytest`(全套,含 `apps/accounts`/`apps/events` 既有測試,確認這次改動沒有連帶弄壞既有的 `ApiError`/`Gone`/401/403/404 相關斷言)— (auto) 三個指令 exit code 皆 0
+- [x] 3.2 驗證邊界需求「不改變驗證規則本身、不改變 `apps.accounts` 既有業務 code」:`git diff --stat develop...HEAD` 確認只有 `config/exceptions.py`、`config/tests/test_exceptions.py`、`openspec/changes/add-error-code-table/` 被異動,沒有動到 `apps/accounts/`、`apps/events/` 任何 view 或 serializer 檔案 — (auto) `git diff --stat` 顯示的檔案清單與異動內容不含上述項目
