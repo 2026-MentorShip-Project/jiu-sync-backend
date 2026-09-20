@@ -127,25 +127,51 @@ def _resolve_field_code(field, raw_code):
     return FIELD_CODE_OVERRIDES.get((field, raw_code), raw_code)
 
 
+def _nested_indexed_items(value):
+    """偵測 DRF 對 `many=True` 巢狀 serializer 產生的錯誤形狀，回傳
+    `[(index, item_dict), ...]`；不是這個形狀就回傳 `None`。
+
+    實測確認（DRF 3.18，透過真的 HTTP POST 打 `EventCreateSerializer`，不是手動
+    構造 `ValidationError`）：`ListSerializer` 驗證失敗時回傳的是**只包含失敗
+    索引**的 dict（例如兩筆 slots、只有索引 1 錯 → `{1: {"date": [...]}}`），
+    不是補滿通過索引、長度對齊原始輸入的完整 list（`[{}, {"date": [...]}]`）。
+    後者是這次改動之前這個函式唯一處理、也唯一被測試過的形狀，但那份測試是
+    手動構造假資料，從來沒有透過真正的 API 請求驗證過，這個落差直到補上端對端
+    測試才被抓到——`slots[0].date` 這種路徑命名先前對真實請求其實從未生效過
+    （會落到下面的一般欄位分支，`field` 停在 `"slots"`、code 也拿不到
+    `NESTED_SUBFIELD_CODE_OVERRIDES` 的對照）。
+
+    這裡兩種形狀都認得:dict 形式（真實 DRF 3.18 的行為）優先；list 形式維持
+    當防禦性 fallback（不確定未來 DRF 版本會不會換回這個形狀，或有沒有別的
+    呼叫端手動構造這種輸入，兩種都認得比只認一種安全，成本很低）。
+    """
+    if isinstance(value, dict) and value and all(isinstance(k, int) for k in value):
+        return sorted(value.items())
+    if isinstance(value, list) and any(isinstance(item, dict) and item for item in value):
+        return list(enumerate(value))
+    return None
+
+
 def _build_errors(data):
     """把 ValidationError 的 dict 形狀 `response.data`（沒有 "detail" 鍵）展開成
     `errors` 陣列：`[{"field": ..., "code": ..., "message": ...}, ...]`，涵蓋
     全部欄位，不只第一個。
 
     見 design.md D1/D2/D7。逐一走訪 `data` 的全部 key：
-    - 若該值是 list、且其中有非空 dict 元素（DRF 對 `many=True` 巢狀 serializer
-      產生的錯誤形狀，例如 `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各
-      自組成一筆 `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），
-      code 用 `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code
-      是 required 還是 invalid，這個巢狀層級前端只要求一個 code）
-    - 否則（一般欄位、或非 list 的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
+    - 若該值符合 `_nested_indexed_items` 認得的巢狀陣列欄位形狀（例如
+      `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各自組成一筆
+      `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），code 用
+      `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code 是
+      required 還是 invalid，這個巢狀層級前端只要求一個 code）
+    - 否則（一般欄位、或非陣列的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
       → 沿用既有的遞迴找 leaf 邏輯，取第一則訊息，code 透過 `_resolve_field_code`
       查 `FIELD_CODE_OVERRIDES`
     """
     errors = []
     for field, value in data.items():
-        if isinstance(value, list) and any(isinstance(item, dict) and item for item in value):
-            for index, item in enumerate(value):
+        nested_items = _nested_indexed_items(value)
+        if nested_items is not None:
+            for index, item in nested_items:
                 if isinstance(item, dict) and item:
                     for subfield, sub_value in item.items():
                         detail = _find_leaf_detail(sub_value)

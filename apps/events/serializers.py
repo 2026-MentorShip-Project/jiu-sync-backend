@@ -48,7 +48,12 @@ class SlotCreateSerializer(serializers.Serializer):
     這個值會被自動忽略,建立時一律由 ``Slot`` model 的 UUID 預設值產生。
     """
 
-    date = serializers.DateField()
+    # DRF DateField 格式錯誤的內建翻譯剛好沒收錄 zh-hant(同欄位的 TimeField
+    # 卻有中文翻譯，屬於第三方翻譯檔覆蓋不全),手動覆寫成中文，不讓英文原文
+    # 穿透到回應內容。
+    date = serializers.DateField(
+        error_messages={"invalid": "日期格式錯誤，請用 YYYY-MM-DD 格式"}
+    )
     time = serializers.TimeField(required=False, allow_null=True)
     # max_length 對齊 Slot.label 的 varchar(100)——plain Serializer 不會像
     # ModelSerializer 一樣自動從 model 繼承欄位限制,若不宣告,超長 label 要到

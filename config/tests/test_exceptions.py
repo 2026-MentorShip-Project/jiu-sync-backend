@@ -194,14 +194,35 @@ def test_handler_builds_errors_array_for_multiple_field_validation_error():
     ]
 
 
-def test_handler_builds_errors_array_for_nested_list_field_validation_error():
-    """③ 巢狀陣列欄位（模擬 DRF 對 many=True nested serializer 的錯誤形狀）
-    → 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名，code 依
-    NESTED_SUBFIELD_CODE_OVERRIDES 依子欄位名查（"date" → "SLOT_DATE_INVALID"）。
+def test_handler_builds_errors_array_for_nested_list_shape_validation_error():
+    """③ 巢狀陣列欄位,list 形狀（`[{}, {"date": [...]}]`,補滿通過索引的完整
+    list）→ 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名,code
+    依 NESTED_SUBFIELD_CODE_OVERRIDES 依子欄位名查（"date" → "SLOT_DATE_INVALID"）。
 
     `{}` 代表索引 0 沒有錯誤，索引 1 的 "date" 欄位有錯誤。
+
+    這是防禦性 fallback 形狀,不是 DRF 3.18 實際會產生的形狀（見下一則測試 ④ 用
+    真實 HTTP 請求驗證的才是實際形狀）——保留這則測試是因為不確定其他 DRF 版本
+    或手動構造的 ValidationError 會不會用這種形狀,兩種都認得成本很低。
     """
     exc = ValidationError({"slots": [{}, {"date": ["此為必需欄位。"]}]})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["code"] == "SLOT_DATE_INVALID"
+    assert response.data["errors"] == [
+        {"field": "slots[1].date", "code": "SLOT_DATE_INVALID", "message": "此為必需欄位。"}
+    ]
+
+
+def test_handler_builds_errors_array_for_nested_indexed_dict_validation_error():
+    """④ 巢狀陣列欄位,DRF 3.18 實際會產生的形狀:只包含失敗索引的 dict(不是補滿
+    通過索引的完整 list)。實測 `EventCreateSerializer` 透過真的請求驗證多筆
+    slots、只有其中一筆失敗時,DRF 回傳的是 `{1: {"date": [...]}}`,不是
+    `[{}, {"date": [...]}]`——之前只測過後者(手動構造、從未透過真實請求驗證),
+    這個落差是後續才補上端對端測試才抓到的。
+    """
+    exc = ValidationError({"slots": {1: {"date": ["此為必需欄位。"]}}})
 
     response = custom_exception_handler(exc, {})
 

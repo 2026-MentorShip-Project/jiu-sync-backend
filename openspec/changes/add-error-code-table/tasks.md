@@ -62,7 +62,21 @@
   - `_find_leaf_detail` 對空 dict/list 回傳 `None`;`_build_errors` 兩處呼叫點(一般欄位、巢狀 `slots[].<subfield>`)遇到 `None` 直接 `continue` 略過,不納入 `errors`
   - 讓 4.1 全部轉綠 — (auto) `pytest config/tests/test_exceptions.py` 該檔全綠
 
-## 5. 收尾
+## 5. Seam: 巢狀陣列欄位錯誤形狀修正 + `slots[].date` 中文訊息(見 design.md D2 修訂、Risks)
 
-- [x] 5.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run python manage.py makemigrations --check --dry-run`、`uv run pytest`(全套)— (auto) 四個指令 exit code 皆 0
-- [x] 5.2 驗證邊界需求「不改變任何驗證規則的判斷邏輯本身、不改變 `apps.accounts` 既有業務 code」:確認 `apps/accounts/views.py`(既有 `ApiError` 呼叫點)、`Event`/`User` model、既有驗證的長度上限/必填判斷邏輯本身都沒有被更動,只有「附帶什麼 code」變了 — (auto) 逐一核對 diff 內容不含既有業務 code 字串變更、不含驗證門檻數字變更
+> 補 `slots[].date` 訊息中文化時,實測發現一個更嚴重的既有落差:`slots[0].date` 這種巢狀路徑命名對真實請求從未生效過(先前的測試只驗證手動構造的假資料,沒有端對端驗證過形狀假設本身)。
+
+- [x] 5.1 [RED] 補測試:
+  - `apps/events/tests/test_views.py` 新增 `test_slot_date_wrong_format_returns_chinese_message_not_english`(單筆 slot 日期格式錯誤,驗證 `code`/`field`/中文 `message`)與 `test_slot_date_wrong_format_uses_correct_index_when_multiple_slots`(三筆 slots、只有索引 1 錯,驗證 `field` 正確標出 `"slots[1].date"`,不是 `"slots[0].date"` 或停在 `"slots"`)——都是透過真的 `client.post()`,不是手動構造 `ValidationError`
+  - `config/tests/test_exceptions.py` 新增 `test_handler_builds_errors_array_for_nested_indexed_dict_validation_error`:直接用 DRF 3.18 實際會產生的 `{"slots": {1: {"date": [...]}}}` 形狀(dict 而非 list)驗證 `_build_errors` 認得
+  — (auto) `pytest` 顯示這幾條 FAIL(`field` 停在 `"slots"`,`code` 是 DRF 原始的 `"invalid"`,`message` 是英文)
+
+- [x] 5.2 [GREEN] 實作:
+  - `config/exceptions.py` 新增 `_nested_indexed_items(value)`,統一偵測「dict 形式(`{index: {...}}`,DRF 3.18 實際行為)」與「list 形式(`[{}, {...}]`,防禦性 fallback)」兩種巢狀陣列欄位錯誤形狀;`_build_errors` 改呼叫這個共用函式
+  - `apps/events/serializers.py` 的 `SlotCreateSerializer.date` 補上 `error_messages={"invalid": "日期格式錯誤，請用 YYYY-MM-DD 格式"}`(DRF DateField 格式錯誤的內建翻譯沒收錄 zh-hant,同欄位的 TimeField 卻有,是第三方翻譯檔覆蓋不全,不是我們自己程式碼的問題)
+  - 讓 5.1 全部轉綠 — (auto) `pytest` 全套通過
+
+## 6. 收尾
+
+- [x] 6.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run python manage.py makemigrations --check --dry-run`、`uv run pytest`(全套)— (auto) 四個指令 exit code 皆 0
+- [x] 6.2 驗證邊界需求「不改變任何驗證規則的判斷邏輯本身、不改變 `apps.accounts` 既有業務 code」:確認 `apps/accounts/views.py`(既有 `ApiError` 呼叫點)、`Event`/`User` model、既有驗證的長度上限/必填判斷邏輯本身都沒有被更動,只有「附帶什麼 code」變了 — (auto) 逐一核對 diff 內容不含既有業務 code 字串變更、不含驗證門檻數字變更
