@@ -32,6 +32,18 @@ class Gone(ApiError):
         super().__init__(message, code=code, status_code=410)
 
 
+# 沒有既有業務 ApiError 指定 code 時，依 HTTP 狀態碼補上的預設 code（design.md D3）。
+# 只涵蓋這五碼；不在表裡的狀態碼（例如 410，只會透過 ApiError/Gone 走另一條分支）
+# `.get()` 回傳 None 即可，不需要額外防呆。
+STATUS_CODE_DEFAULT_CODES = {
+    400: None,
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    500: "SERVER_ERROR",
+}
+
+
 def _find_leaf(value):
     """遞迴往下找到第一個字串 leaf，直到不再是 dict/list 為止。
 
@@ -46,27 +58,52 @@ def _find_leaf(value):
     return str(value)
 
 
+def _build_errors(data):
+    """把 ValidationError 的 dict 形狀 `response.data`（沒有 "detail" 鍵）展開成
+    `errors` 陣列：`[{"field": ..., "message": ...}, ...]`，涵蓋全部欄位，不只第一個。
+
+    見 design.md D1/D2。逐一走訪 `data` 的全部 key：
+    - 若該值是 list、且其中有非空 dict 元素（DRF 對 `many=True` 巢狀 serializer
+      產生的錯誤形狀，例如 `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各
+      自組成一筆 `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2）
+    - 否則（一般欄位、或非 list 的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
+      → 沿用既有的遞迴找 leaf 邏輯（`_find_leaf`），取第一則訊息
+    """
+    errors = []
+    for field, value in data.items():
+        if isinstance(value, list) and any(isinstance(item, dict) and item for item in value):
+            for index, item in enumerate(value):
+                if isinstance(item, dict) and item:
+                    for subfield, sub_value in item.items():
+                        errors.append(
+                            {
+                                "field": f"{field}[{index}].{subfield}",
+                                "message": _find_leaf(sub_value),
+                            }
+                        )
+        else:
+            errors.append({"field": field, "message": _find_leaf(value)})
+    return errors
+
+
 def _flatten_message(data):
     """從 DRF 預設 handler 算好的 `response.data` 裡抽出一句可讀訊息。
 
-    - dict 且有 "detail" 鍵 → 用它
-    - 字串 → 直接用
-    - 其他（例如 ValidationError 的巢狀欄位字典，可能巢狀多層）→ 取第一個欄位，
-      遞迴往下找到第一個字串 leaf，格式化成 "<field>: <leaf>"。不保留完整結構，
-      見 design.md Non-Goals。
+    只處理 `{"detail": ...}` 形狀與純字串——dict 且沒有 "detail" 鍵的
+    ValidationError 形狀改由 `_build_errors` 展開成 `errors` 陣列，
+    不會呼叫到這裡，見 `custom_exception_handler`。
     """
     if isinstance(data, dict):
-        if "detail" in data:
-            return str(data["detail"])
-        field, errors = next(iter(data.items()))
-        return f"{field}: {_find_leaf(errors)}"
+        return str(data["detail"])
     return str(data)
 
 
 def custom_exception_handler(exc, context):
     """全站共用 EXCEPTION_HANDLER：把任何例外轉成 {"message": ..., "code": ...} 形狀。
 
-    見 openspec/changes/api-error-format/design.md「Decisions」。
+    ValidationError 的 dict 形狀（沒有 "detail" 鍵）額外帶上 `errors` 陣列，
+    見 design.md「Decisions」D1/D2。401/403/404/500 在沒有既有業務 `ApiError` code
+    時，依狀態碼補上固定預設值，見 D3。
     """
     response = drf_exception_handler(exc, context)
     if response is None:
@@ -75,13 +112,27 @@ def custom_exception_handler(exc, context):
         return None
 
     if isinstance(exc, ApiError):
+        # 已經透過 ApiError 明確指定 code，完全不受狀態碼查表影響（D3）。
         message = str(exc.detail)
         code = exc.api_code
+        errors = None
     else:
-        message = _flatten_message(response.data)
-        code = None
+        data = response.data
+        code = STATUS_CODE_DEFAULT_CODES.get(response.status_code)
+        if isinstance(data, dict) and "detail" not in data:
+            # DRF ValidationError 的既有 dict 形狀 → 展開成 errors 陣列。
+            errors = _build_errors(data)
+            # 頂層 message 維持是「第一個」錯誤的訊息，不是全部串接——保留給只讀
+            # message、不讀 errors 的既有呼叫端一個向後相容的行為（design.md D1）。
+            message = errors[0]["message"] if errors else ""
+        else:
+            errors = None
+            message = _flatten_message(data)
 
-    response.data = {"message": message, "code": code}
+    body = {"message": message, "code": code}
+    if errors is not None:
+        body["errors"] = errors
+    response.data = body
     return response
 
 
@@ -91,7 +142,9 @@ def handler404(request, exception):
     只在 `config.urls` 模組層級透過 `handler404 = "config.exceptions.handler404"`
     被 Django 引用，簽名是 Django 規定的 `(request, exception)`。
     """
-    return JsonResponse({"message": "找不到這個路徑", "code": None}, status=404)
+    return JsonResponse(
+        {"message": "找不到這個路徑", "code": STATUS_CODE_DEFAULT_CODES[404]}, status=404
+    )
 
 
 def handler500(request):
@@ -102,4 +155,6 @@ def handler500(request):
     這裡只改變回給使用者的 body 形狀。簽名是 Django 規定的 `(request)`，沒有
     `exception` 參數。
     """
-    return JsonResponse({"message": "伺服器發生未預期的錯誤", "code": None}, status=500)
+    return JsonResponse(
+        {"message": "伺服器發生未預期的錯誤", "code": STATUS_CODE_DEFAULT_CODES[500]}, status=500
+    )

@@ -1,5 +1,10 @@
 from django.test import Client, override_settings
-from rest_framework.exceptions import NotAuthenticated, ValidationError
+from rest_framework.exceptions import (
+    NotAuthenticated,
+    NotFound,
+    PermissionDenied,
+    ValidationError,
+)
 
 from config.exceptions import ApiError, Gone, custom_exception_handler
 
@@ -38,8 +43,22 @@ def test_handler_converts_api_error_to_message_code_shape():
     assert response.data == {"message": "找不到這筆資料", "code": "NOT_FOUND_X"}
 
 
+def test_handler_api_error_explicit_code_not_overridden_by_status_default():
+    """⑧ ApiError 明確指定 401 的 code → 不被狀態碼預設表的「UNAUTHORIZED」蓋掉（design.md D3）。"""
+    exc = ApiError("refresh token 無效", code="INVALID_REFRESH_TOKEN", status_code=401)
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.status_code == 401
+    assert response.data == {"message": "refresh token 無效", "code": "INVALID_REFRESH_TOKEN"}
+
+
 def test_handler_converts_gone_with_code_none():
-    """Gone 沒帶 code → code 明確為 None，狀態碼固定 410（跟 404 分開）。"""
+    """⑨ Gone 沒帶 code → code 明確為 None，狀態碼固定 410（跟 404 分開）。
+
+    410 刻意不在 design.md D3 新增的狀態碼→預設 code 查表範圍內（只有
+    400/401/403/404/500 五碼），這裡確認這次改動沒有連帶影響 410 的既有行為。
+    """
     exc = Gone("連結已失效")
 
     response = custom_exception_handler(exc, {})
@@ -49,27 +68,91 @@ def test_handler_converts_gone_with_code_none():
 
 
 def test_handler_converts_drf_built_in_not_authenticated():
-    """DRF 內建例外（無 code 概念）→ 統一形狀，code 為 None，不是 DRF 預設的 {"detail": ...}。"""
+    """⑤ DRF 內建例外（無 ApiError code)→ 統一形狀，不是 DRF 預設的 {"detail": ...}。
+
+    code 斷言從原本的 `is None` 改成 `== "UNAUTHORIZED"`：這是 design.md D3 的
+    刻意行為變更（401 在沒有既有業務 ApiError code 時，依狀態碼補上固定值），
+    不是遷就實作結果而放寬測試。
+    """
     exc = NotAuthenticated()
 
     response = custom_exception_handler(exc, {})
 
-    assert response.data["code"] is None
+    assert response.data["code"] == "UNAUTHORIZED"
     assert "detail" not in response.data
     assert isinstance(response.data["message"], str)
     assert response.data["message"]
 
 
-def test_handler_flattens_validation_error_to_single_message():
-    """ValidationError 的巢狀欄位字典 → 攤平成單一可讀字串，code 仍為 None。"""
+def test_handler_converts_drf_built_in_permission_denied():
+    """⑥ DRF 內建 PermissionDenied（403，無 ApiError code)→ code 依狀態碼預設為 "FORBIDDEN"。"""
+    exc = PermissionDenied()
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.status_code == 403
+    assert response.data["code"] == "FORBIDDEN"
+    assert "detail" not in response.data
+    assert isinstance(response.data["message"], str)
+    assert response.data["message"]
+
+
+def test_handler_converts_drf_built_in_not_found():
+    """⑦ DRF 內建 NotFound（404，無 ApiError code)→ code 依狀態碼預設為 "NOT_FOUND"。"""
+    exc = NotFound()
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.status_code == 404
+    assert response.data["code"] == "NOT_FOUND"
+    assert "detail" not in response.data
+    assert isinstance(response.data["message"], str)
+    assert response.data["message"]
+
+
+def test_handler_builds_errors_array_for_single_field_validation_error():
+    """① 單一欄位驗證失敗 → errors 陣列含該欄位，頂層 message 維持是該欄位訊息（向後相容）。
+
+    這裡取代舊版「message 攤平成 'field: message' 字串」的斷言方式：design.md D1
+    明確決定頂層 message 改成「第一個錯誤的訊息」本身（不含欄位名前綴），細節
+    改由新的 errors 陣列表達，這是刻意的業務邏輯變更，不是遷就實作結果。
+    """
     exc = ValidationError({"title": ["此欄位必填"]})
 
     response = custom_exception_handler(exc, {})
 
     assert response.data["code"] is None
-    assert isinstance(response.data["message"], str)
-    assert "title" in response.data["message"]
-    assert "此欄位必填" in response.data["message"]
+    assert response.data["errors"] == [{"field": "title", "message": "此欄位必填"}]
+    assert response.data["message"] == "此欄位必填"
+
+
+def test_handler_builds_errors_array_for_multiple_field_validation_error():
+    """② 多欄位同時驗證失敗 → errors 陣列包含全部失敗欄位，不是只回第一個。"""
+    exc = ValidationError(
+        {"title": ["此欄位必填"], "responseDeadline": ["必須晚於現在"]}
+    )
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["code"] is None
+    assert response.data["errors"] == [
+        {"field": "title", "message": "此欄位必填"},
+        {"field": "responseDeadline", "message": "必須晚於現在"},
+    ]
+
+
+def test_handler_builds_errors_array_for_nested_list_field_validation_error():
+    """③ 巢狀陣列欄位（模擬 DRF 對 many=True nested serializer 的錯誤形狀）
+    → 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名。
+
+    `{}` 代表索引 0 沒有錯誤，索引 1 的 "date" 欄位有錯誤。
+    """
+    exc = ValidationError({"slots": [{}, {"date": ["此為必需欄位。"]}]})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["code"] is None
+    assert response.data["errors"] == [{"field": "slots[1].date", "message": "此為必需欄位。"}]
 
 
 def test_handler_returns_none_for_unrecognized_exception():
@@ -83,7 +166,12 @@ def test_handler_returns_none_for_unrecognized_exception():
 
 @override_settings(DEBUG=False)
 def test_unmatched_url_returns_unified_json_404():
-    """完全不匹配任何 URL 的請求，走不到任何 DRF view，也要符合統一格式（handler404）。"""
+    """完全不匹配任何 URL 的請求，走不到任何 DRF view，也要符合統一格式（handler404）。
+
+    code 斷言從原本的 `is None` 改成 `== "NOT_FOUND"`：design.md D4 決定
+    `handler404` 直接寫死回傳 "NOT_FOUND"，不再固定 None，這是刻意的行為
+    變更，不是遷就實作結果而放寬測試。
+    """
     client = Client()
 
     response = client.get("/api/this-does-not-exist/")
@@ -93,7 +181,7 @@ def test_unmatched_url_returns_unified_json_404():
     assert set(data.keys()) == {"message", "code"}
     assert isinstance(data["message"], str)
     assert data["message"]
-    assert data["code"] is None
+    assert data["code"] == "NOT_FOUND"
 
 
 def test_handler_flattens_two_level_nested_validation_error():
