@@ -67,7 +67,6 @@ def test_authenticated_user_can_create_event_and_receives_id_and_share_url():
     assert response.status_code == status.HTTP_201_CREATED
     body = response.json()
     assert set(body.keys()) == {"id", "shareUrl"}
-    # Event.id 是 8 碼 base62 短 id,不是 UUID——design.md D1 amended。
     assert SHORT_ID_RE.match(body["id"])
     assert body["shareUrl"].startswith(settings.FRONTEND_BASE_URL)
     assert body["shareUrl"] == f"{settings.FRONTEND_BASE_URL}/events/{body['id']}"
@@ -493,3 +492,228 @@ def test_missing_owner_me_query_param_returns_400():
     response = client.get(EVENTS_URL)
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def _patch_payload(**overrides):
+    now = timezone.now()
+    payload = {
+        "title": "改過的標題",
+        "description": "改過的說明",
+        "location": "改過的地點",
+        "hostNickname": "改過的暱稱",
+        "hostEmail": "changed@example.com",
+        "responseDeadline": (now + timedelta(days=5)).isoformat(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_owner_patch_single_field_updates_only_that_field():
+    """① 擁有者僅送單一欄位(title)→ 200,該欄位更新、其餘五欄位維持原值,
+    回應格式與 GET 詳情相同(含 slots/displayStatus/isOwner)。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="host@example.com")
+    client = _auth_client(owner)
+
+    response = client.patch(_detail_url(event.id), {"title": "新標題"}, format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["title"] == "新標題"
+    assert body["description"] == "順便討論下次活動"
+    assert body["location"] == "台北車站"
+    assert body["hostNickname"] == "小明"
+    assert body["hostEmail"] == "host@example.com"
+    assert "slots" in body
+    assert "displayStatus" in body
+    assert body["isOwner"] is True
+
+    event.refresh_from_db()
+    assert event.title == "新標題"
+    assert event.description == "順便討論下次活動"
+    assert event.location == "台北車站"
+    assert event.host_nickname == "小明"
+    assert event.host_email == "host@example.com"
+
+
+def test_owner_patch_all_six_fields_updates_all():
+    """② 擁有者一次送六個欄位全部更新 → 200,六欄位皆正確更新並反映在回應中。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="host@example.com")
+    client = _auth_client(owner)
+    payload = _patch_payload()
+
+    response = client.patch(_detail_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["title"] == payload["title"]
+    assert body["description"] == payload["description"]
+    assert body["location"] == payload["location"]
+    assert body["hostNickname"] == payload["hostNickname"]
+    assert body["hostEmail"] == payload["hostEmail"]
+
+    event.refresh_from_db()
+    assert event.title == payload["title"]
+    assert event.description == payload["description"]
+    assert event.location == payload["location"]
+    assert event.host_nickname == payload["hostNickname"]
+    assert event.host_email == payload["hostEmail"]
+
+
+def test_owner_patch_empty_body_changes_nothing():
+    """③ 空 body {} → 200,不更動任何欄位,回傳目前狀態。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="host@example.com")
+    client = _auth_client(owner)
+
+    response = client.patch(_detail_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["title"] == event.title
+    assert body["description"] == event.description
+    assert body["location"] == event.location
+    assert body["hostNickname"] == event.host_nickname
+    assert body["hostEmail"] == event.host_email
+
+    event.refresh_from_db()
+    assert event.title == "颱風天續攤 晚餐"
+    assert event.host_email == "host@example.com"
+
+
+def test_owner_patch_ignores_fields_outside_the_six():
+    """④ body 帶 mode(六欄位外的欄位)→ 200,Event.mode 不受影響,忽略該欄位。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+    original_mode = event.mode
+
+    response = client.patch(
+        _detail_url(event.id), {"mode": "time_slots"}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    event.refresh_from_db()
+    assert event.mode == original_mode
+
+
+def test_non_owner_authenticated_user_cannot_patch_event():
+    """⑤ 已登入但非擁有者送出編輯 → 403,資料庫該筆活動完全未變動。"""
+    owner = _create_user(email="host@example.com", google_sub="sub-1")
+    other_user = _create_user(email="other@example.com", google_sub="sub-2")
+    event = _create_event(owner)
+    client = _auth_client(other_user)
+    original_title = event.title
+
+    response = client.patch(_detail_url(event.id), {"title": "偷改標題"}, format="json")
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    event.refresh_from_db()
+    assert event.title == original_title
+
+
+def test_unauthenticated_user_cannot_patch_event():
+    """⑥ 未登入(不帶 token)→ 401,資料庫未變動。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    original_title = event.title
+
+    response = client.patch(_detail_url(event.id), {"title": "偷改標題"}, format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    event.refresh_from_db()
+    assert event.title == original_title
+
+
+def test_patch_finalized_or_cancelled_event_returns_400():
+    """⑦ status="finalized"/"cancelled" 的活動編輯 → 400,資料庫未變動。直接用
+    Event.objects.create(..., status=...) 建立測試資料,不透過任何 API。"""
+    owner = _create_user()
+    client = _auth_client(owner)
+
+    for event_status in (Event.Status.FINALIZED, Event.Status.CANCELLED):
+        event = _create_event(owner, status=event_status)
+        original_title = event.title
+
+        response = client.patch(
+            _detail_url(event.id), {"title": "偷改標題"}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        event.refresh_from_db()
+        assert event.title == original_title
+
+
+def test_patch_response_deadline_equal_to_or_earlier_than_now_returns_400():
+    """⑧ responseDeadline 等於或早於送出當下時間 → 400,資料庫未變動。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+    original_deadline = event.response_deadline
+    now = timezone.now()
+
+    for deadline in (now, now - timedelta(hours=1)):
+        response = client.patch(
+            _detail_url(event.id),
+            {"responseDeadline": deadline.isoformat()},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    event.refresh_from_db()
+    assert event.response_deadline == original_deadline
+
+
+def test_patch_host_email_can_differ_from_account_email():
+    """⑨ hostEmail 改成與 request.user.email 不同、但格式合法的另一個 Email →
+    200,Event.host_email 更新為請求中的新值(確認脫鉤)。"""
+    owner = _create_user(email="account-email@example.com")
+    event = _create_event(owner, host_email="original-host-email@example.com")
+    client = _auth_client(owner)
+
+    response = client.patch(
+        _detail_url(event.id),
+        {"hostEmail": "new-contact@example.com"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["hostEmail"] == "new-contact@example.com"
+
+    event.refresh_from_db()
+    assert event.host_email == "new-contact@example.com"
+    assert event.host_email != owner.email
+
+
+def test_patch_nonexistent_event_id_returns_404_with_api_error_shape():
+    """⑩ 對不存在的活動 id 送出編輯 → 404,body 符合 api-error-format 的
+    {message, code} 形狀。"""
+    user = _create_user()
+    client = _auth_client(user)
+
+    response = client.patch(
+        _detail_url(generate_short_id()), {"title": "無效"}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    body = response.json()
+    assert set(body.keys()) == {"message", "code"}
+
+
+def test_patch_title_over_30_chars_returns_400():
+    """⑪ title 超過 30 字元 → 400(確認沿用既有長度驗證邏輯有正確接上)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+    original_title = event.title
+
+    response = client.patch(
+        _detail_url(event.id), {"title": "揪" * 31}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    event.refresh_from_db()
+    assert event.title == original_title
