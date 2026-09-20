@@ -129,39 +129,49 @@ def test_handler_converts_drf_built_in_authentication_failed_with_english_detail
 
 
 def test_handler_builds_errors_array_for_single_field_validation_error():
-    """① 單一欄位驗證失敗 → errors 陣列含該欄位，頂層 message 維持是該欄位訊息（向後相容）。
+    """① 單一欄位驗證失敗 → errors 陣列含該欄位，頂層 message/code 維持是該欄位的
+    訊息/code（向後相容）。
 
     這裡取代舊版「message 攤平成 'field: message' 字串」的斷言方式：design.md D1
     明確決定頂層 message 改成「第一個錯誤的訊息」本身（不含欄位名前綴），細節
     改由新的 errors 陣列表達，這是刻意的業務邏輯變更，不是遷就實作結果。
+
+    頂層/errors[].code 從固定 None 改成 DRF 原始 code（這裡沒有對應
+    FIELD_CODE_OVERRIDES 條目，直接沿用 DRF 預設的 "invalid"，見 design.md D7）：
+    這是後續 change 追加的刻意行為變更（400 從「不配 code」改回「每條規則配
+    code」，見 add-error-code-table design.md 的修訂記錄），不是遷就實作結果。
     """
     exc = ValidationError({"title": ["此欄位必填"]})
 
     response = custom_exception_handler(exc, {})
 
-    assert response.data["code"] is None
-    assert response.data["errors"] == [{"field": "title", "message": "此欄位必填"}]
+    assert response.data["code"] == "invalid"
+    assert response.data["errors"] == [
+        {"field": "title", "code": "invalid", "message": "此欄位必填"}
+    ]
     assert response.data["message"] == "此欄位必填"
 
 
 def test_handler_builds_errors_array_for_multiple_field_validation_error():
-    """② 多欄位同時驗證失敗 → errors 陣列包含全部失敗欄位，不是只回第一個。"""
+    """② 多欄位同時驗證失敗 → errors 陣列包含全部失敗欄位，不是只回第一個，每筆
+    各自帶自己的 code。"""
     exc = ValidationError(
         {"title": ["此欄位必填"], "responseDeadline": ["必須晚於現在"]}
     )
 
     response = custom_exception_handler(exc, {})
 
-    assert response.data["code"] is None
+    assert response.data["code"] == "invalid"
     assert response.data["errors"] == [
-        {"field": "title", "message": "此欄位必填"},
-        {"field": "responseDeadline", "message": "必須晚於現在"},
+        {"field": "title", "code": "invalid", "message": "此欄位必填"},
+        {"field": "responseDeadline", "code": "invalid", "message": "必須晚於現在"},
     ]
 
 
 def test_handler_builds_errors_array_for_nested_list_field_validation_error():
     """③ 巢狀陣列欄位（模擬 DRF 對 many=True nested serializer 的錯誤形狀）
-    → 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名。
+    → 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名，code 依
+    NESTED_SUBFIELD_CODE_OVERRIDES 依子欄位名查（"date" → "SLOT_DATE_INVALID"）。
 
     `{}` 代表索引 0 沒有錯誤，索引 1 的 "date" 欄位有錯誤。
     """
@@ -169,8 +179,28 @@ def test_handler_builds_errors_array_for_nested_list_field_validation_error():
 
     response = custom_exception_handler(exc, {})
 
-    assert response.data["code"] is None
-    assert response.data["errors"] == [{"field": "slots[1].date", "message": "此為必需欄位。"}]
+    assert response.data["code"] == "SLOT_DATE_INVALID"
+    assert response.data["errors"] == [
+        {"field": "slots[1].date", "code": "SLOT_DATE_INVALID", "message": "此為必需欄位。"}
+    ]
+
+
+def test_handler_resolves_field_code_override_for_known_field():
+    """新增:有對應 FIELD_CODE_OVERRIDES 條目的欄位（例如 title 的 max_length）
+    → code 換成我們自己語意化的字串，不是 DRF 原始的 "max_length"。"""
+    exc = ValidationError(
+        {"title": ["請確認此欄位字元長度不超過 30。"]}, code="max_length"
+    )
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["errors"] == [
+        {
+            "field": "title",
+            "code": "TITLE_TOO_LONG",
+            "message": "請確認此欄位字元長度不超過 30。",
+        }
+    ]
 
 
 def test_handler_returns_none_for_unrecognized_exception():
@@ -203,12 +233,15 @@ def test_unmatched_url_returns_unified_json_404():
 
 
 def test_handler_flattens_two_level_nested_validation_error():
-    """兩層巢狀的 ValidationError（dict 裡面又是 dict）也要攤平成純字串，不留 dict repr 痕跡。"""
+    """兩層巢狀的 ValidationError（dict 裡面又是 dict）也要攤平成純字串，不留 dict repr
+    痕跡。code 沒有對應 FIELD_CODE_OVERRIDES 條目（"parent" 不是任何已知欄位名），
+    沿用 DRF 原始 code "invalid"（design.md D7 的 fallback 行為，不是遷就實作結果）。
+    """
     exc = ValidationError({"parent": {"child": ["bad"]}})
 
     response = custom_exception_handler(exc, {})
 
-    assert response.data["code"] is None
+    assert response.data["code"] == "invalid"
     message = response.data["message"]
     assert isinstance(message, str)
     assert "{" not in message

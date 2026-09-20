@@ -56,31 +56,79 @@ STATUS_CODE_DEFAULT_MESSAGES = {
     500: "伺服器發生未預期的錯誤",
 }
 
+# DRF 內建欄位驗證（required/max_length/invalid_choice/invalid 等）自動附帶的
+# `.code`，換成我們自己語意化的 code。key 是 (欄位名, DRF 原始 code)；沒有手動
+# 呼叫 `validate_<field>` 自訂錯誤訊息的欄位（例如純粹靠 `max_length=`/
+# `required=` 這種宣告式驗證）都得靠這張表補上 code，否則 `errors[]` 裡只會有
+# DRF 自己的通用 code（"required"/"max_length" 這種），不是我們要的語意化字串。
+# 手動 `raise serializers.ValidationError(..., code=...)` 的欄位（見
+# `_validate_host_nickname_weighted_length` 等）已經在拋出當下就給了正確的
+# code，不需要在這裡重複列。查無對應時 `.get()` 回傳 None，維持原始 DRF code
+# 的 fallback（見 `_resolve_field_code`），不會讓 code 整個消失。
+FIELD_CODE_OVERRIDES = {
+    ("title", "required"): "TITLE_REQUIRED",
+    ("title", "max_length"): "TITLE_TOO_LONG",
+    ("hostNickname", "required"): "HOST_NICKNAME_REQUIRED",
+    ("mode", "required"): "MODE_INVALID",
+    ("mode", "invalid_choice"): "MODE_INVALID",
+    ("slots", "required"): "SLOTS_REQUIRED",
+    ("responseDeadline", "required"): "RESPONSE_DEADLINE_REQUIRED",
+    ("location", "max_length"): "LOCATION_TOO_LONG",
+    ("description", "max_length"): "DESCRIPTION_TOO_LONG",
+    ("hostEmail", "invalid"): "HOST_EMAIL_INVALID",
+    ("idToken", "required"): "ID_TOKEN_REQUIRED",
+    ("idToken", "blank"): "ID_TOKEN_REQUIRED",
+}
 
-def _find_leaf(value):
-    """遞迴往下找到第一個字串 leaf，直到不再是 dict/list 為止。
+# 巢狀陣列欄位（目前只有 `slots[].<subfield>`）的 code 對照——用子欄位名比對,
+# 不分是 DRF 的 required 還是 invalid，這個巢狀層級前端只要求一個 code。
+NESTED_SUBFIELD_CODE_OVERRIDES = {
+    "date": "SLOT_DATE_INVALID",
+    "time": "SLOT_TIME_INVALID",
+    "label": "SLOT_LABEL_TOO_LONG",
+}
+
+
+def _find_leaf_detail(value):
+    """遞迴往下找到第一個 leaf（不轉成字串，保留 DRF `ErrorDetail` 物件本身，
+    才能同時拿到訊息文字跟 `.code`）。
 
     - dict → 取第一個 key 對應的值，繼續往下找
     - list → 取第一個元素，繼續往下找
-    - 其他 → 已經是 leaf，轉成字串回傳
+    - 其他 → 已經是 leaf，直接回傳
     """
     if isinstance(value, dict):
-        return _find_leaf(next(iter(value.values())))
+        return _find_leaf_detail(next(iter(value.values())))
     if isinstance(value, list):
-        return _find_leaf(value[0])
-    return str(value)
+        return _find_leaf_detail(value[0])
+    return value
+
+
+def _resolve_field_code(field, raw_code):
+    """把 DRF 原始的 `.code`（例如 `"max_length"`）換成我們自己語意化的 code。
+
+    查 `FIELD_CODE_OVERRIDES`；查無對應時直接沿用 DRF 原始 code 當 fallback，
+    不會讓 code 整個消失變成 None——手動 `raise ValidationError(..., code=...)`
+    的欄位（例如 `hostNickname` 加權長度）已經在拋出當下給了正確 code，這裡查
+    不到表也只是原樣通過，行為正確。
+    """
+    return FIELD_CODE_OVERRIDES.get((field, raw_code), raw_code)
 
 
 def _build_errors(data):
     """把 ValidationError 的 dict 形狀 `response.data`（沒有 "detail" 鍵）展開成
-    `errors` 陣列：`[{"field": ..., "message": ...}, ...]`，涵蓋全部欄位，不只第一個。
+    `errors` 陣列：`[{"field": ..., "code": ..., "message": ...}, ...]`，涵蓋
+    全部欄位，不只第一個。
 
-    見 design.md D1/D2。逐一走訪 `data` 的全部 key：
+    見 design.md D1/D2/D7。逐一走訪 `data` 的全部 key：
     - 若該值是 list、且其中有非空 dict 元素（DRF 對 `many=True` 巢狀 serializer
       產生的錯誤形狀，例如 `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各
-      自組成一筆 `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2）
+      自組成一筆 `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），
+      code 用 `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code
+      是 required 還是 invalid，這個巢狀層級前端只要求一個 code）
     - 否則（一般欄位、或非 list 的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
-      → 沿用既有的遞迴找 leaf 邏輯（`_find_leaf`），取第一則訊息
+      → 沿用既有的遞迴找 leaf 邏輯，取第一則訊息，code 透過 `_resolve_field_code`
+      查 `FIELD_CODE_OVERRIDES`
     """
     errors = []
     for field, value in data.items():
@@ -88,14 +136,25 @@ def _build_errors(data):
             for index, item in enumerate(value):
                 if isinstance(item, dict) and item:
                     for subfield, sub_value in item.items():
+                        detail = _find_leaf_detail(sub_value)
                         errors.append(
                             {
                                 "field": f"{field}[{index}].{subfield}",
-                                "message": _find_leaf(sub_value),
+                                "code": NESTED_SUBFIELD_CODE_OVERRIDES.get(
+                                    subfield, getattr(detail, "code", None)
+                                ),
+                                "message": str(detail),
                             }
                         )
         else:
-            errors.append({"field": field, "message": _find_leaf(value)})
+            detail = _find_leaf_detail(value)
+            errors.append(
+                {
+                    "field": field,
+                    "code": _resolve_field_code(field, getattr(detail, "code", None)),
+                    "message": str(detail),
+                }
+            )
     return errors
 
 
@@ -133,14 +192,16 @@ def custom_exception_handler(exc, context):
         errors = None
     else:
         data = response.data
-        code = STATUS_CODE_DEFAULT_CODES.get(response.status_code)
         if isinstance(data, dict) and "detail" not in data:
             # DRF ValidationError 的既有 dict 形狀 → 展開成 errors 陣列。
             errors = _build_errors(data)
-            # 頂層 message 維持是「第一個」錯誤的訊息，不是全部串接——保留給只讀
-            # message、不讀 errors 的既有呼叫端一個向後相容的行為（design.md D1）。
+            # 頂層 message/code 維持是「第一個」錯誤的訊息/code，不是全部串接——
+            # 保留給只讀 message/code、不讀 errors 的既有呼叫端一個向後相容的
+            # 行為（design.md D1，code 比照同一邏輯延伸，見 D7）。
             message = errors[0]["message"] if errors else ""
+            code = errors[0]["code"] if errors else None
         else:
+            code = STATUS_CODE_DEFAULT_CODES.get(response.status_code)
             errors = None
             message = STATUS_CODE_DEFAULT_MESSAGES.get(
                 response.status_code, _flatten_message(data)

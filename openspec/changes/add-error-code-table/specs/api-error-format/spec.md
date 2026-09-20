@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: 統一錯誤回應形狀
-系統 SHALL 讓所有非 2xx 回應的 body 都是 `{"message": string, "code": string|null}` 這個形狀,不因為錯誤來自哪一支 view、哪一種例外類型而有不同的欄位結構。當錯誤是欄位驗證失敗時,回應 SHALL 額外包含一個 `errors` 欄位:陣列,每個元素為 `{"field": string, "message": string}`,列出**全部**驗證失敗的欄位,不只第一個。巢狀欄位(例如候選時段陣列裡某一筆的某個欄位)SHALL 用 `<陣列欄位名>[<索引>].<子欄位名>` 的路徑格式命名(例如 `slots[0].date`)。
+系統 SHALL 讓所有非 2xx 回應的 body 都是 `{"message": string, "code": string|null}` 這個形狀,不因為錯誤來自哪一支 view、哪一種例外類型而有不同的欄位結構。當錯誤是欄位驗證失敗時,回應 SHALL 額外包含一個 `errors` 欄位:陣列,每個元素為 `{"field": string, "code": string, "message": string}`,列出**全部**驗證失敗的欄位,不只第一個。巢狀欄位(例如候選時段陣列裡某一筆的某個欄位)SHALL 用 `<陣列欄位名>[<索引>].<子欄位名>` 的路徑格式命名(例如 `slots[0].date`)。頂層的 `message`/`code` SHALL 是 `errors` 陣列第一筆的 `message`/`code`,提供只讀頂層欄位、不解析 `errors` 陣列的呼叫端一個向後相容的簡化視圖。
 
 #### Scenario: 未預期的例外仍符合統一形狀
 - **WHEN** 任何 view 拋出一個沒有被特別處理過的例外(例如 DRF 內建的 `NotAuthenticated`)
@@ -9,11 +9,11 @@
 
 #### Scenario: 多個欄位同時驗證失敗時全部列出
 - **WHEN** 一次請求裡有兩個以上的欄位同時驗證失敗(例如標題超過長度上限、同時投票截止時間早於現在)
-- **THEN** 回應的 `errors` 陣列包含每一個失敗欄位各自的 `{field, message}`,不是只回第一個
+- **THEN** 回應的 `errors` 陣列包含每一個失敗欄位各自的 `{field, code, message}`,不是只回第一個
 
 #### Scenario: 巢狀陣列欄位的錯誤用索引路徑命名
 - **WHEN** 候選時段陣列裡第一筆(索引 0)的 `date` 欄位驗證失敗
-- **THEN** `errors` 陣列裡該筆錯誤的 `field` 值為 `"slots[0].date"`
+- **THEN** `errors` 陣列裡該筆錯誤的 `field` 值為 `"slots[0].date"`,`code` 為該子欄位對應的語意化字串(例如 `"SLOT_DATE_INVALID"`)
 
 ### Requirement: 未匹配任何路由的請求也符合統一格式
 系統 SHALL 讓「沒有任何 URL 路由匹配」的請求(走不到任何 view)跟「未預期的伺服器錯誤」(走不到任何 view 的例外處理)回應也符合 `{message, code}` 形狀,不是框架預設的 HTML 錯誤頁。這兩種情況的 `code` SHALL 分別依前一條需求的狀態碼預設值規則,設為 `"NOT_FOUND"`(404)與 `"SERVER_ERROR"`(500)。
@@ -35,11 +35,7 @@
 ## ADDED Requirements
 
 ### Requirement: 沒有業務代碼時,code 依狀態碼決定預設值
-系統 SHALL 在 view 沒有透過 `ApiError` 明確指定 `code` 時,依回應的 HTTP 狀態碼決定 `code` 的預設值:400(驗證錯誤)明確設為 `null`,401 為 `"UNAUTHORIZED"`,403 為 `"FORBIDDEN"`,404 為 `"NOT_FOUND"`,500 為 `"SERVER_ERROR"`。已透過 `ApiError` 指定 `code` 的既有業務錯誤(例如 `apps.accounts` 的 `INVALID_ID_TOKEN`、`INVALID_REFRESH_TOKEN`、`REFRESH_TOKEN_NOT_YOURS`)SHALL 不受影響,繼續使用該 `ApiError` 指定的值。
-
-#### Scenario: 400 驗證錯誤的 code 明確為 null
-- **WHEN** 發生一個欄位驗證失敗的 400 錯誤,且沒有透過 `ApiError` 指定 code
-- **THEN** 回應的 `code` 欄位為 `null`,錯誤細節透過 `errors` 陣列表達
+系統 SHALL 在 view 沒有透過 `ApiError` 明確指定 `code` 時,依回應的 HTTP 狀態碼決定 `code` 的預設值:401 為 `"UNAUTHORIZED"`,403 為 `"FORBIDDEN"`,404 為 `"NOT_FOUND"`,500 為 `"SERVER_ERROR"`。400(驗證錯誤)不適用這張表——`errors` 陣列每一筆各自帶有自己的 code(見「欄位驗證錯誤 SHALL 各自帶有語意化的 code」需求),頂層 `code` 是第一筆的值,不是固定預設值。已透過 `ApiError` 指定 `code` 的既有業務錯誤(例如 `apps.accounts` 的 `INVALID_ID_TOKEN`、`INVALID_REFRESH_TOKEN`、`REFRESH_TOKEN_NOT_YOURS`)SHALL 不受影響,繼續使用該 `ApiError` 指定的值。
 
 #### Scenario: 401 沒有既有業務 code 時使用預設值
 - **WHEN** 發生一個 401 未授權錯誤,且沒有透過 `ApiError` 指定 code
@@ -52,6 +48,21 @@
 #### Scenario: 既有業務 code 不受影響
 - **WHEN** view 透過 `ApiError` 明確指定了 `code`(例如 `INVALID_REFRESH_TOKEN`)
 - **THEN** 回應的 `code` 欄位維持該指定值,不被狀態碼預設值覆蓋
+
+### Requirement: 欄位驗證錯誤 SHALL 各自帶有語意化的 code
+系統 SHALL 讓每一筆欄位驗證錯誤(`errors` 陣列裡的每個元素)都帶有一個語意化的 `code`,不是泛用的 DRF 內建代碼(例如 `"required"`、`"max_length"`)。實作方式:透過 `raise ValidationError(..., code=...)` 明確指定業務規則(例如加權長度、時間必須晚於現在)的 code;純粹由宣告式欄位驗證(`max_length=`、`required=` 等)自動產生的 DRF 內建 code,系統 SHALL 透過一份「(欄位名, DRF 原始 code) → 語意化 code」的對照表換成我們自己的字串。查無對照表項目時,系統 SHALL 沿用 DRF 原始 code 當 fallback,不得讓 `code` 消失變成 `null`。
+
+#### Scenario: 宣告式驗證的 code 被換成語意化字串
+- **WHEN** 一個欄位純粹因為超過 `max_length` 宣告限制而驗證失敗(沒有自訂 `validate_<field>` 方法)
+- **THEN** 該筆 `errors` 元素的 `code` 是對照表裡定義的語意化字串,不是 DRF 原始的 `"max_length"`
+
+#### Scenario: 手動拋出的業務規則錯誤自帶正確 code
+- **WHEN** 一個欄位因為自訂業務規則(例如 `hostNickname` 加權長度超過上限、`responseDeadline` 早於現在)驗證失敗
+- **THEN** 該筆 `errors` 元素的 `code` 是拋出當下明確指定的語意化字串
+
+#### Scenario: 查無對照表項目時沿用 DRF 原始 code
+- **WHEN** 一個欄位的驗證失敗類型沒有出現在對照表裡
+- **THEN** 該筆 `errors` 元素的 `code` 是 DRF 原始的內建代碼,不是 `null`
 
 ### Requirement: 框架內建例外的 message 不得夾雜非中文原文
 系統 SHALL 讓沒有透過 `ApiError`/驗證錯誤機制自訂訊息的例外(例如 DRF 內建的 `NotAuthenticated`、`PermissionDenied`、`NotFound`,或 JWT 驗證函式庫拋出的例外)回應固定的繁體中文 `message`,不得讓函式庫預設的英文原文(例如 `"Given token not valid for any token type"`)穿透到回應內容。401/403/404/500 分別對應固定文案。驗證錯誤的 `errors` 陣列與其訊息內容不受此規則影響,維持既有(已是中文的)欄位文案。
