@@ -27,7 +27,9 @@
 DRF 對巢狀 `many=True` serializer(例如 `slots`)驗證失敗時,`response.data["slots"]` 會是一個 list,只有失敗的索引位置是非空 dict(例如 `[{}, {"date": ["此為必需欄位。"]}]` 代表第 0 筆沒問題、第 1 筆的 `date` 有問題)。展開邏輯:偵測到值是 list 時,逐一走訪索引,對每個非空 dict 元素,再取它裡面每個 key,組成 `"slots[<index>].<key>"` 當作 `field`。只處理一層巢狀(`slots[].<field>`),不處理更深的巢狀——目前 `apps.events`/`apps.accounts` 沒有更深的巢狀結構,不需要提前設計。
 
 ### D3. 401/403/404/500 的預設 code 用「狀態碼 → 固定字串」對照表
-在 `custom_exception_handler` 裡,只有當 `code` 還是 `None`(不是 `ApiError` 指定的)時,才依 `response.status_code` 查表補上:`{400: None, 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 500: "SERVER_ERROR"}`。已經透過 `ApiError` 指定 code 的既有業務錯誤完全不受這個查表影響(先判斷 `isinstance(exc, ApiError)` 的既有邏輯不變)。
+在 `custom_exception_handler` 裡,只有當 `code` 還是 `None` 時,才依 `response.status_code` 查表補上:`{400: None, 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 500: "SERVER_ERROR"}`。
+
+判斷「code 是不是 None」不能只看「這是不是 ApiError」——`ApiError(message, code=None, status_code=...)` 的 `code` 參數本身是選填的,呼叫端可以合法地只給 `status_code`、不給 `code`。所以就算 `isinstance(exc, ApiError)` 為真,還是要再檢查 `exc.api_code is not None` 才能判斷「這個例外有沒有明確指定業務 code」;`api_code` 是 `None` 時,一樣要落到 `STATUS_CODE_DEFAULT_CODES` 查表,不能因為「用了 ApiError」就整支繞過查表(這是 2026-09-20 code review 抓到的實作 bug,已修正)。`Gone`(410)不在查表範圍內,`.get()` 對查無的狀態碼自然回傳 `None`,不需要額外處理。
 
 ### D4. `handler404`/`handler500` 直接寫死對應 code
 這兩支函式是 Django URL resolver 層級,不會經過 `custom_exception_handler`,不共用 D3 的查表邏輯(維護一份 2 筆對照的常數字典沒有意義,直接寫死字串更直接)。`handler404` 回 `"NOT_FOUND"`,`handler500` 回 `"SERVER_ERROR"`。
@@ -61,6 +63,7 @@ D3 的狀態碼查表只補了 `code`,「detail」形狀分支(DRF/simplejwt 內
 - **[風險] 401/403/404/500 原本讀到 `code: null` 的既有呼叫端(如果有的話),現在會讀到固定字串,行為改變** → 緩解:目前專案前端還在對接階段,沒有已上線依賴舊行為的呼叫端;`specs/api-error-format/spec.md` 的 REMOVED/ADDED 已經明確記錄這個行為變更與遷移說明。
 - **[風險] `FIELD_CODE_OVERRIDES`/`NESTED_SUBFIELD_CODE_OVERRIDES` 是全域、扁平的對照表,耦合了 `exceptions.py`(共用基礎設施)跟各 app 的欄位語意** → 緩解:目前專案規模小,欄位名跨 serializer 沒有衝突風險;若未來規模變大、欄位名開始碰撞,再考慮把對照表拆到各 app 自己維護、`custom_exception_handler` 改成可註冊擴充點,現在做這個抽象是過度工程。
 - **[風險] `GET /api/events/{id}` 的 410/`LINK_EXPIRED` 分支目前系統沒有 finalize/cancel 端點,無法透過任何真實 API 流程觸發** → 緩解:直接建立測試資料(`Event.objects.create(status=..., cancelled_at=...)`)驗證,不依賴真的走過 finalize/cancel 流程產生資料——這是刻意的決定(見 proposal.md 修訂記錄),換取這個分支提前就位,之後 finalize/cancel 端點做出來時不用回頭補。
+- **[已修正的風險] `_find_leaf_detail` 原本假設 dict/list 一定有內容,遇到空容器(`{"field": []}`/`{"field": {}}`)會直接拋 `IndexError`/`StopIteration`,讓一個原本該回 400 的驗證錯誤,因為錯誤格式化程式自己出包變成 500** → 2026-09-20 code review 抓到並修正:`_find_leaf_detail` 對空容器回傳 `None`,`_build_errors` 遇到 `None` 直接略過該欄位,不硬湊假訊息,也不影響其他正常欄位。DRF 自己的驗證邏輯不會產生這種形狀,但 `custom_exception_handler` 是全站共用基礎設施,不能假設所有呼叫端(未來的自訂 validator、第三方套件)都只會傳入「合法」輸入。
 
 ## Migration Plan
 

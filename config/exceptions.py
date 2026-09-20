@@ -93,13 +93,25 @@ def _find_leaf_detail(value):
     """遞迴往下找到第一個 leaf（不轉成字串，保留 DRF `ErrorDetail` 物件本身，
     才能同時拿到訊息文字跟 `.code`）。
 
-    - dict → 取第一個 key 對應的值，繼續往下找
-    - list → 取第一個元素，繼續往下找
+    - dict → 取第一個 key 對應的值，繼續往下找;空 dict 沒有東西可取，回傳 None
+    - list → 取第一個元素，繼續往下找;空 list 同理回傳 None
     - 其他 → 已經是 leaf，直接回傳
+
+    `custom_exception_handler` 是全站共用的基礎設施，不是只服務我們自己控制的
+    serializer——理論上任何手動 `raise ValidationError({"field": []})` 或
+    `{"field": {}}` 這種空容器都可能被丟進來（例如未來的自訂 validator、第三方
+    套件）。DRF 自己的驗證邏輯不會產生這種形狀，但這裡本來就不能假設輸入一定
+    「合法」，回傳 None 讓呼叫端（`_build_errors`）略過，而不是讓 `next(iter(...))`/
+    `value[0]` 對空容器直接炸 `StopIteration`/`IndexError`，把一個原本該是 400
+    的驗證錯誤意外變成 500。
     """
     if isinstance(value, dict):
+        if not value:
+            return None
         return _find_leaf_detail(next(iter(value.values())))
     if isinstance(value, list):
+        if not value:
+            return None
         return _find_leaf_detail(value[0])
     return value
 
@@ -137,6 +149,10 @@ def _build_errors(data):
                 if isinstance(item, dict) and item:
                     for subfield, sub_value in item.items():
                         detail = _find_leaf_detail(sub_value)
+                        if detail is None:
+                            # 空容器（見 _find_leaf_detail 的說明）——沒有實際
+                            # 錯誤內容可回報，略過這筆，不硬湊一個假訊息。
+                            continue
                         errors.append(
                             {
                                 "field": f"{field}[{index}].{subfield}",
@@ -148,6 +164,8 @@ def _build_errors(data):
                         )
         else:
             detail = _find_leaf_detail(value)
+            if detail is None:
+                continue
             errors.append(
                 {
                     "field": field,
@@ -186,9 +204,18 @@ def custom_exception_handler(exc, context):
         return None
 
     if isinstance(exc, ApiError):
-        # 已經透過 ApiError 明確指定 code，完全不受狀態碼查表影響（D3）。
+        # 只有明確指定 code 時才不受狀態碼查表影響（D3）；ApiError 的 code
+        # 參數本身是選填的（`ApiError(message, code=None, status_code=...)`），
+        # 呼叫端沒傳等於「沒有業務 code」，這種情況要落到跟其他無業務 code 的
+        # 例外一樣的查表邏輯，不能因為「用了 ApiError」就整支繞過查表——否則
+        # `ApiError("...", status_code=401)` 這種寫法會意外拿到 code: None，
+        # 跟同一支 status_code 走 DRF 內建例外時拿到 "UNAUTHORIZED" 不一致。
         message = str(exc.detail)
-        code = exc.api_code
+        code = (
+            exc.api_code
+            if exc.api_code is not None
+            else STATUS_CODE_DEFAULT_CODES.get(response.status_code)
+        )
         errors = None
     else:
         data = response.data

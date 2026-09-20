@@ -15,6 +15,10 @@
 - **WHEN** 候選時段陣列裡第一筆(索引 0)的 `date` 欄位驗證失敗
 - **THEN** `errors` 陣列裡該筆錯誤的 `field` 值為 `"slots[0].date"`,`code` 為該子欄位對應的語意化字串(例如 `"SLOT_DATE_INVALID"`)
 
+#### Scenario: 欄位錯誤內容是空容器時不得讓格式化本身失敗
+- **WHEN** 某個欄位的驗證錯誤內容是空的 list 或 dict(例如手動拋出的 `ValidationError({"field": []})`,沒有實際錯誤訊息可取)
+- **THEN** 系統略過該欄位,不納入 `errors` 陣列,且不得因此拋出例外導致回應變成 500;其餘正常欄位的錯誤仍正確列出
+
 ### Requirement: 未匹配任何路由的請求也符合統一格式
 系統 SHALL 讓「沒有任何 URL 路由匹配」的請求(走不到任何 view)跟「未預期的伺服器錯誤」(走不到任何 view 的例外處理)回應也符合 `{message, code}` 形狀,不是框架預設的 HTML 錯誤頁。這兩種情況的 `code` SHALL 分別依前一條需求的狀態碼預設值規則,設為 `"NOT_FOUND"`(404)與 `"SERVER_ERROR"`(500)。
 
@@ -48,6 +52,10 @@
 #### Scenario: 既有業務 code 不受影響
 - **WHEN** view 透過 `ApiError` 明確指定了 `code`(例如 `INVALID_REFRESH_TOKEN`)
 - **THEN** 回應的 `code` 欄位維持該指定值,不被狀態碼預設值覆蓋
+
+#### Scenario: ApiError 未指定 code 時仍套用狀態碼預設值
+- **WHEN** view 透過 `ApiError` 只指定了 `status_code`(例如 401),沒有指定 `code`
+- **THEN** 回應的 `code` 欄位套用該狀態碼的預設值(例如 `"UNAUTHORIZED"`),不是 `null`——不能因為用了 `ApiError` 就整支繞過狀態碼查表
 
 ### Requirement: 欄位驗證錯誤 SHALL 各自帶有語意化的 code
 系統 SHALL 讓每一筆欄位驗證錯誤(`errors` 陣列裡的每個元素)都帶有一個語意化的 `code`,不是泛用的 DRF 內建代碼(例如 `"required"`、`"max_length"`)。實作方式:透過 `raise ValidationError(..., code=...)` 明確指定業務規則(例如加權長度、時間必須晚於現在)的 code;純粹由宣告式欄位驗證(`max_length=`、`required=` 等)自動產生的 DRF 內建 code,系統 SHALL 透過一份「(欄位名, DRF 原始 code) → 語意化 code」的對照表換成我們自己的字串。查無對照表項目時,系統 SHALL 沿用 DRF 原始 code 當 fallback,不得讓 `code` 消失變成 `null`。

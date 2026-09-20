@@ -48,7 +48,21 @@
   - `apps/events/views.py`:新增模組層級 `_get_event_or_404` 函式(`ApiError(..., code="EVENT_NOT_FOUND", status_code=404)`,取代 `get_object_or_404`);`get()` 算出 `displayStatus == "link_expired"` 時 `raise Gone(..., code="LINK_EXPIRED")`;`patch()` 非 active 狀態改用 `ApiError(..., code="EVENT_NOT_ACTIVE", status_code=409)`(原本是 400 的 `serializers.ValidationError`);`EventListView.get()` 的 `owner=me` 缺參數錯誤補上 `code="OWNER_PARAM_REQUIRED"`
   - 讓 3.1 全部轉綠 — (auto) `pytest` 全套通過
 
-## 4. 收尾
+## 4. Seam: code review 修正(ApiError 未指定 code 時的 fallback、空容器安全性,見 design.md D3 修訂、Risks)
 
-- [x] 4.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run python manage.py makemigrations --check --dry-run`、`uv run pytest`(全套)— (auto) 四個指令 exit code 皆 0
-- [x] 4.2 驗證邊界需求「不改變任何驗證規則的判斷邏輯本身、不改變 `apps.accounts` 既有業務 code」:確認 `apps/accounts/views.py`(既有 `ApiError` 呼叫點)、`Event`/`User` model、既有驗證的長度上限/必填判斷邏輯本身都沒有被更動,只有「附帶什麼 code」變了 — (auto) 逐一核對 diff 內容不含既有業務 code 字串變更、不含驗證門檻數字變更
+> 2026-09-20 code review 抓到兩個真實 bug,補上修正 + regression 測試。
+
+- [x] 4.1 [RED] 補測試:
+  - `config/tests/test_exceptions.py` 新增 `test_handler_api_error_without_explicit_code_falls_back_to_status_default`:`ApiError("...", status_code=401/403/404/500)`(不帶 `code`)分別驗證 `code` 落到狀態碼預設值,不是 `None`
+  - 新增 `test_handler_skips_field_with_empty_list_error_container`/`test_handler_skips_field_with_empty_dict_error_container`/`test_handler_skips_empty_container_but_keeps_other_valid_fields`:`ValidationError({"field": []})`/`{"field": {}}` 不得拋例外,該欄位從 `errors` 略過,其他正常欄位不受影響
+  — (auto) `pytest config/tests/test_exceptions.py` 顯示這幾條 FAIL(前者拿到 `code: None`,後者直接拋 `IndexError`/`StopIteration`)
+
+- [x] 4.2 [GREEN] 實作:
+  - `custom_exception_handler` 的 `isinstance(exc, ApiError)` 分支,`code` 改成 `exc.api_code if exc.api_code is not None else STATUS_CODE_DEFAULT_CODES.get(response.status_code)`,不再無條件用 `exc.api_code`
+  - `_find_leaf_detail` 對空 dict/list 回傳 `None`;`_build_errors` 兩處呼叫點(一般欄位、巢狀 `slots[].<subfield>`)遇到 `None` 直接 `continue` 略過,不納入 `errors`
+  - 讓 4.1 全部轉綠 — (auto) `pytest config/tests/test_exceptions.py` 該檔全綠
+
+## 5. 收尾
+
+- [x] 5.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run python manage.py makemigrations --check --dry-run`、`uv run pytest`(全套)— (auto) 四個指令 exit code 皆 0
+- [x] 5.2 驗證邊界需求「不改變任何驗證規則的判斷邏輯本身、不改變 `apps.accounts` 既有業務 code」:確認 `apps/accounts/views.py`(既有 `ApiError` 呼叫點)、`Event`/`User` model、既有驗證的長度上限/必填判斷邏輯本身都沒有被更動,只有「附帶什麼 code」變了 — (auto) 逐一核對 diff 內容不含既有業務 code 字串變更、不含驗證門檻數字變更

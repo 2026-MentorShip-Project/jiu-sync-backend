@@ -54,6 +54,32 @@ def test_handler_api_error_explicit_code_not_overridden_by_status_default():
     assert response.data == {"message": "refresh token 無效", "code": "INVALID_REFRESH_TOKEN"}
 
 
+def test_handler_api_error_without_explicit_code_falls_back_to_status_default():
+    """新增:ApiError 沒帶 code(只帶 message/status_code)→ 落到跟 DRF 內建例外
+    一樣的狀態碼查表邏輯,不因為「用了 ApiError」就整支繞過查表變成 code: None。
+
+    修正 Codex review 抓到的真實 bug:原本 `isinstance(exc, ApiError)` 這條分支
+    無條件用 `exc.api_code`(可能是 None),沒有 fallback 到
+    `STATUS_CODE_DEFAULT_CODES`,導致 `ApiError("...", status_code=401)` 這種
+    合法但沒帶 code 的寫法,拿到的是 code: None,跟同樣 401 走 DRF 內建例外
+    (`NotAuthenticated`)會拿到 "UNAUTHORIZED" 不一致——違反 design.md 的
+    「只有 code 還是 None 時才查表」規則,因為原本的判斷太早(在 isinstance
+    那一層)就短路掉了,沒有再看 api_code 本身是不是 None。
+    """
+    for status_code, expected_code in (
+        (401, "UNAUTHORIZED"),
+        (403, "FORBIDDEN"),
+        (404, "NOT_FOUND"),
+        (500, "SERVER_ERROR"),
+    ):
+        exc = ApiError("自訂訊息", status_code=status_code)
+
+        response = custom_exception_handler(exc, {})
+
+        assert response.status_code == status_code
+        assert response.data == {"message": "自訂訊息", "code": expected_code}
+
+
 def test_handler_converts_gone_with_code_none():
     """⑨ Gone 沒帶 code → code 明確為 None，狀態碼固定 410（跟 404 分開）。
 
@@ -230,6 +256,46 @@ def test_unmatched_url_returns_unified_json_404():
     assert isinstance(data["message"], str)
     assert data["message"]
     assert data["code"] == "NOT_FOUND"
+
+
+def test_handler_skips_field_with_empty_list_error_container():
+    """新增:欄位的錯誤內容是空 list(`{"field": []}`)→ 不拋例外(不是 500),
+    這個欄位直接從 `errors` 陣列略過,不硬湊一個假訊息。
+
+    修正 Codex review 抓到的真實 bug:`_find_leaf_detail` 原本對空 list 做
+    `value[0]` 會直接 IndexError,讓 custom_exception_handler 自己再拋一次
+    例外——本來應該回 400 的驗證錯誤,會因為錯誤格式化程式本身出包變成 500。
+    DRF 自己的驗證邏輯不會產生這種形狀,但這是全站共用的 exception handler,
+    不能假設所有呼叫端(未來的自訂 validator、第三方套件)都不會傳入這種輸入。
+    """
+    exc = ValidationError({"field": []})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["errors"] == []
+    assert response.data["message"] == ""
+    assert response.data["code"] is None
+
+
+def test_handler_skips_field_with_empty_dict_error_container():
+    """新增:欄位的錯誤內容是空 dict(`{"field": {}}`)→ 同上,不拋例外,略過。"""
+    exc = ValidationError({"field": {}})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["errors"] == []
+
+
+def test_handler_skips_empty_container_but_keeps_other_valid_fields():
+    """新增:多個欄位裡混了一個空容器 → 只略過那個空的,其他正常欄位仍然出現在
+    errors 陣列裡,不會因為一個欄位格式異常就把整包錯誤資訊都吞掉。"""
+    exc = ValidationError({"empty_field": [], "title": ["此欄位必填"]})
+
+    response = custom_exception_handler(exc, {})
+
+    assert response.data["errors"] == [
+        {"field": "title", "code": "invalid", "message": "此欄位必填"}
+    ]
 
 
 def test_handler_flattens_two_level_nested_validation_error():
