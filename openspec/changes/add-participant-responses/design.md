@@ -1,0 +1,70 @@
+## Context
+
+`apps/events` 目前有 `Event`/`Slot` model，`POST /api/events`（建立）、`GET /api/events/{id}`（查詢，`responses` 欄位寫死空陣列）、`PATCH /api/events/{id}`（主揪編輯基本資訊）、`GET /api/events?owner=me`（主揪清單）。錯誤格式已統一為 `{message, code, errors[]}`（本 change 建立在 `feature/error-code-table` 分支之上）。`compute_display_status`（`apps/events/lifecycle.py`）已能判斷活動連結是否失效（`link_expired`）。詳細動機見 proposal.md - Why。
+
+## Goals / Non-Goals
+
+**Goals:**
+- 參與者能透過分享連結初次投票、事後修改投票
+- 唯讀彙整頁（`GET /api/events/{id}`）真實顯示投票結果
+- 身分核對與修改投票分成兩支 API，中間以短期 token 銜接，不用每次修改都重新輸入暱稱＋手機末三碼
+
+**Non-Goals:**
+- 不做手機末三碼暴力破解防禦（失敗次數限制、鎖定、IP rate limit）——已與使用者確認為本次刻意排除的風險，見 Risks
+- 不允許更新投票時修改 Email 或暱稱
+- 不做投票的樂觀鎖／並發衝突偵測（見 D7）
+- 不實作前端頁面本身，僅交付後端 API
+
+## Decisions
+
+### D1. 手機末三碼：`django.contrib.auth.hashers.make_password`/`check_password`，不加防暴力破解機制
+
+只有 1000 種組合，即使用慢雜湊，已知暱稱的情況下，對外可見的核對 API 本身就是一個 oracle，1000 次請求即可窮舉——這不是雜湊演算法能解決的問題，而是輸入熵太低的先天限制。已與使用者確認：本次刻意不加失敗次數限制／鎖定機制，接受此風險，不在本次 scope 內處理。選 `make_password`（PBKDF2＋內建 per-record salt）而非手寫 `hashlib.sha256`（`RefreshTokenRecord` 的既有作法）——後者用在高熵 token 上，token 本身不可窮舉不需要 salt；手機末三碼熵極低，至少要有 per-record salt 防止「一份全域彩虹表打天下」的離線批次查表，`make_password` 是 Django 內建、免手動管理 salt 欄位的標準作法。
+
+### D2. 更新投票的身分核對與修改分成兩支 API，以 DB 儲存的一次性 token 銜接
+
+`POST /api/events/{id}/responses/verify` 核對成功後建立 `ParticipantResponseAccessToken`（明文 token 只在這次回應回傳，DB 只存 `hashlib.sha256` 雜湊值，比照 `RefreshTokenRecord` 的既有作法——token 本身熵夠高，不需要 `make_password`），效期 30 分鐘，成功用過一次（`PATCH` 消費）即標記失效，不可重複使用。`PATCH` 帶著這個 token 而非重新帶暱稱＋手機末三碼，前端不需要在修改頁面重複保存敏感輸入。Token 過期或已使用，`PATCH` 一律回 401 `ACCESS_TOKEN_INVALID`，前端導回重新核對——不細分「過期」與「已使用」等原因，處理方式相同。
+
+替代方案：每次 `PATCH` 都重新帶暱稱＋手機末三碼——更簡單、不用新表，但前端要嘛每次都重新彈 Modal 輸入（規格描述是核對一次後「開放修改」，暗示核對後有一段可連續操作的視窗），要嘛把敏感資料暫存在前端（不安全）。已與使用者確認採 token 方案。
+
+### D3. 身分核對失敗訊息統一，不區分暱稱不存在或手機碼錯誤
+
+`POST .../verify` 核對失敗時，不論是「該活動下查無此暱稱」或「暱稱存在但手機末三碼不符」，一律回同一個 401 `IDENTITY_VERIFICATION_FAILED`，避免錯誤訊息本身變成一個「暱稱是否存在」的 side channel——不然攻擊者能用回應差異窮舉出活動內所有暱稱，再針對確定存在的暱稱窮舉手機碼。
+
+### D4. 候選時段複選：`ParticipantResponse.slots` 為 `ManyToManyField(Slot)`，不建獨立 through model
+
+複選，且沒有「每個關聯本身還要帶額外欄位」的需求（不像 `Slot` 相對 `Event` 需要 `date`/`time`/`label`），plain `ManyToManyField` 讓 Django 自動建中介表即可，不需要手動定義 through model 增加複雜度。
+
+### D5. 暱稱唯一性：trim 後精確比對（大小寫敏感），DB 層 `unique_together (event, nickname)` 保證並發安全
+
+`nickname` 欄位儲存時已經 trim 過（serializer `validate_nickname` 內處理），DB 唯一約束比對到的就是 trim 後的值，不需要額外的 normalized 欄位。兩個請求同時搶同一個暱稱時，DB 唯一約束是最終防線——`IntegrityError` 捕獲後回 400 `NICKNAME_TAKEN`。
+
+`ParticipantResponse.id` 也改用短 id（見 D9），同一個 `create()` 呼叫因此有兩種可能導致 `IntegrityError` 的獨立原因（暱稱重複、id 碰撞），兩者處理方式相反（前者不該重試、後者該重試），不能用同一種「捕獲就重試」邏輯處理，見 D9 的disambiguation 做法。
+
+### D9. `ParticipantResponse.id` 採 8 碼短 id（同 `Event.id` 產生器），`IntegrityError` 捕獲後靠查詢區分成因再決定重試或拒絕
+
+已與使用者確認：`responseId` 比照 `Event.id` 用短 id，不用 UUID——短、URL 友善、跟活動識別碼風格一致。直接重用既有 `apps/events/ids.generate_short_id`，`ParticipantResponseCreateSerializer.create()` 比照 `EventCreateSerializer.create()` 的碰撞重試迴圈（`transaction.atomic()` 包住 `create()` + `slots.set()`，捕獲 `IntegrityError` 重試數次）。
+
+差異在於：`EventCreateSerializer.create()` 只有一個唯一約束（`Event.id`）可能觸發 `IntegrityError`，捕獲就直接重試沒有歧義；這裡 `ParticipantResponse` 同時有 `id`（短 id 碰撞，機率極低）與 `unique_together (event, nickname)`（暱稱重複，機率不低，且不該重試——重試只會換一個新 id，不會讓重複的暱稱變得不重複，只會一路重試到次數用完後把 `IntegrityError` 原樣往外拋，變成使用者看到的是 500 而不是預期的 400 `NICKNAME_TAKEN`）兩個獨立來源都可能觸發同一種例外。做法：`except IntegrityError` 內先查詢 `ParticipantResponse.objects.filter(event=event, nickname=nickname).exists()`——`transaction.atomic()` 已確保失敗的 insert 完全回滾，此時查到存在即代表暱稱衝突是由「別人已提交的資料」造成（不是我方這次失敗的 insert 殘留），直接回 400 `NICKNAME_TAKEN`，不重試；查無則視為 id 碰撞，進入既有重試邏輯。
+
+### D6. 三支參與者端點共用的前置條件檢查順序：資源存在 → 連結未失效 → 活動狀態
+
+`_get_event_or_404` → 連結失效檢查（`compute_display_status` 為 `link_expired` 時 410 `LINK_EXPIRED`）→ 活動狀態檢查（`status != active` 時 409 `EVENT_NOT_ACTIVE`；`status == active` 但 `now >= response_deadline` 時 409 `VOTING_CLOSED`，這是本次新增的 code，區分「活動被取消／定案」與「單純投票已截止但活動還在」兩種語意不同的 409）。三支端點（建立投票、核對身分、修改投票）皆套用同一組檢查，抽成共用函式，避免三處各寫一次容易不一致。
+
+### D7. 不加樂觀鎖，修改投票採 last-write-wins
+
+情境是同一參與者自己用同一組暱稱＋手機末三碼登入修改，不是多人協作同一筆投票，衝突機率低、後果輕（頂多蓋掉自己剛剛另一個分頁的修改）。比照 `add-event-patch` D5 的既有先例。
+
+### D8. `GET /api/events/{id}` 的 `responses` 回傳每筆投票的 `nickname`＋`selectedSlotIds`，不含 `phoneLastThree`/`email`
+
+已與使用者確認唯讀彙整頁要列出「誰投了什麼」，不是純數字統計。`phoneLastThree`（即使是雜湊）與 `email` 屬於參與者的聯絡資訊，不對外（含其他參與者）公開，只在後端驗證流程內部使用。前端若要算「每個時段幾票」，可自行從這份列表 reduce，不需要後端另外算一份 `voteCount`。
+
+## Risks / Trade-offs
+
+- **[風險] 手機末三碼可被暴力窮舉冒用身分改票（D1）** → 已與使用者確認為本次刻意接受的風險，不在 scope 內處理。緩解方向留給未來 change：失敗次數鎖定、或核對 API 加 IP／裝置層級的 rate limit。
+- **[風險] Access token 效期內若外流（例如瀏覽器分頁被他人接手使用），30 分鐘內可被用來修改投票** → 緩解：token 只存雜湊、只能使用一次、效期短；風險程度與「暱稱鎖定不可改」「僅能改時段（不能改聯絡資訊）」的範圍限制一致，可造成的傷害有限。
+- **[風險] `unique_together (event, nickname)` 意味著同一活動下兩個不同的人剛好想用同一個暱稱，後來者會被擋** → 這是規格本身的既定行為（「暱稱不可與既有暱稱重複」），不是本次技術限制的副作用。
+
+## Migration Plan
+
+新增 migration：`ParticipantResponse`（FK `Event`，M2M `Slot`）、`ParticipantResponseAccessToken`（FK `ParticipantResponse`）。純新增資料表，不修改既有 `Event`/`Slot` schema，回滾只需 reverse migration，不影響既有端點。

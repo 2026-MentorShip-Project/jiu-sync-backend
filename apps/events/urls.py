@@ -1,6 +1,12 @@
 from django.urls import path, register_converter
 
-from .views import EventCreateView, EventDetailView
+from .views import (
+    EventCreateView,
+    EventDetailView,
+    ParticipantResponseCreateView,
+    ParticipantResponseDetailView,
+    ParticipantResponseVerifyView,
+)
 
 app_name = "events"
 
@@ -26,4 +32,19 @@ register_converter(ShortIdConverter, "shortid")
 urlpatterns = [
     path("", EventCreateView.as_view(), name="event-create"),
     path("<shortid:id>/", EventDetailView.as_view(), name="event-detail"),
+    path(
+        "<shortid:id>/responses/",
+        ParticipantResponseCreateView.as_view(),
+        name="participant-response-create",
+    ),
+    path(
+        "<shortid:id>/responses/verify/",
+        ParticipantResponseVerifyView.as_view(),
+        name="participant-response-verify",
+    ),
+    path(
+        "<shortid:id>/responses/<shortid:responseId>/",
+        ParticipantResponseDetailView.as_view(),
+        name="participant-response-detail",
+    ),
 ]

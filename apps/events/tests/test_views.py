@@ -1,11 +1,15 @@
+import hashlib
 import re
+import secrets
 import uuid
 from datetime import timedelta
 
 import pytest
 from django.conf import settings
-from django.db import IntegrityError
+from django.contrib.auth.hashers import check_password, make_password
+from django.db import IntegrityError, connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -13,11 +17,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
 from apps.events.ids import generate_short_id
-from apps.events.models import Event, Slot
+from apps.events.models import Event, ParticipantResponse, ParticipantResponseAccessToken, Slot
 
 pytestmark = pytest.mark.django_db
 
 EVENTS_URL = "/api/events/"
+RESPONSE_SHORT_ID_RE = re.compile(r"^[0-9A-Za-z]{8}$")
 
 # Event.id 是 8 碼 base62 短 id,不是 UUID 形狀。
 SHORT_ID_RE = re.compile(r"^[0-9A-Za-z]{8}$")
@@ -506,8 +511,8 @@ def test_expired_bearer_token_can_still_view_event_detail_anonymously():
     assert body["hostEmail"] is None
 
 
-def test_event_detail_responses_field_is_always_empty_list():
-    """⑥ 回應的 responses 欄位固定為空陣列 []。"""
+def test_event_detail_responses_field_is_empty_list_when_no_votes():
+    """② 活動無任何投票 → responses 為空陣列(既有行為維持)。"""
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
@@ -516,6 +521,64 @@ def test_event_detail_responses_field_is_always_empty_list():
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json()["responses"] == []
+
+
+def _create_participant_response(event, nickname, slots, **overrides):
+    defaults = {
+        "event": event,
+        "nickname": nickname,
+        "phone_last_three_hash": make_password("123"),
+        "email": None,
+    }
+    defaults.update(overrides)
+    participant_response = ParticipantResponse.objects.create(**defaults)
+    participant_response.slots.set(slots)
+    return participant_response
+
+
+def test_event_detail_responses_field_contains_real_votes():
+    """① 活動有 2 筆投票 → responses 陣列含 2 筆,各自 nickname/selectedSlotIds 正確。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = Slot.objects.create(event=event, date="2026-10-02")
+    response_1 = _create_participant_response(event, "小華", [slot_1, slot_2])
+    response_2 = _create_participant_response(event, "小美", [slot_2])
+    client = APIClient()
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert len(body["responses"]) == 2
+    by_id = {item["id"]: item for item in body["responses"]}
+    assert set(by_id.keys()) == {response_1.id, response_2.id}
+    assert by_id[response_1.id]["nickname"] == "小華"
+    assert set(by_id[response_1.id]["selectedSlotIds"]) == {
+        str(slot_1.id),
+        str(slot_2.id),
+    }
+    assert by_id[response_2.id]["nickname"] == "小美"
+    assert by_id[response_2.id]["selectedSlotIds"] == [str(slot_2.id)]
+
+
+def test_event_detail_responses_field_does_not_leak_phone_or_email():
+    """③ 確認回應不含 phoneLastThree/email 欄位。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot], email="voter@example.com")
+    client = APIClient()
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert len(body["responses"]) == 1
+    item = body["responses"][0]
+    assert set(item.keys()) == {"id", "nickname", "selectedSlotIds"}
+    assert "phoneLastThree" not in item
+    assert "email" not in item
 
 
 def test_owner_list_only_contains_own_events_including_cancelled():
@@ -738,6 +801,29 @@ def test_patch_finalized_or_cancelled_event_returns_409_with_event_not_active_co
         assert event.title == original_title
 
 
+def test_patch_active_event_with_expired_deadline_still_allows_edit():
+    """⑦b status="active" 但 responseDeadline 已過(displayStatus 為
+    "voting_closed_pending")時,PATCH 仍允許編輯,不額外擋。這是刻意決策
+    (見 add-event-patch/design.md D6 的 2026-09-21 修訂記錄),不是漏洞:
+    主揪可能想在投票截止後延長 responseDeadline 重開投票、或修正內容。跟
+    參與者端點的 VOTING_CLOSED 檢查刻意不對稱。
+    """
+    owner = _create_user()
+    client = _auth_client(owner)
+    event = _create_event(
+        owner, response_deadline=timezone.now() - timedelta(days=1)
+    )
+
+    response = client.patch(
+        _detail_url(event.id), {"title": "投票已截止後仍可編輯"}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["displayStatus"] == "voting_closed_pending"
+    event.refresh_from_db()
+    assert event.title == "投票已截止後仍可編輯"
+
+
 def test_patch_response_deadline_equal_to_or_earlier_than_now_returns_400():
     """⑧ responseDeadline 等於或早於送出當下時間 → 400,code 為 "DEADLINE_IN_PAST",
     資料庫未變動。"""
@@ -832,3 +918,954 @@ def test_patch_title_over_30_chars_returns_400():
     assert response.json()["code"] == "TITLE_TOO_LONG"
     event.refresh_from_db()
     assert event.title == original_title
+
+
+def test_owner_patch_response_with_existing_votes_does_not_n_plus_one():
+    """code-review 補充:PATCH 回應也透過 EventDetailSerializer 序列化含
+    responses 欄位(同 GET),活動已有投票時不應該為每筆投票的 slots 各多打一次
+    查詢——_get_event_or_404 需帶上跟 GET 一樣的 prefetch_related。用固定筆數
+    的投票資料跑兩次(2 筆、4 筆),查詢數應相同,證明沒有隨投票筆數線性成長。"""
+    owner = _create_user()
+    client = _auth_client(owner)
+
+    event_with_two = _create_event(owner)
+    slot = event_with_two.slots.first()
+    _create_participant_response(event_with_two, "小明", [slot])
+    _create_participant_response(event_with_two, "小華", [slot])
+
+    event_with_four = _create_event(owner)
+    slot_4 = event_with_four.slots.first()
+    for name in ("小明", "小華", "小美", "小強"):
+        _create_participant_response(event_with_four, name, [slot_4])
+
+    with CaptureQueriesContext(connection) as captured_two:
+        response_two = client.patch(_detail_url(event_with_two.id), {}, format="json")
+    with CaptureQueriesContext(connection) as captured_four:
+        response_four = client.patch(_detail_url(event_with_four.id), {}, format="json")
+
+    assert response_two.status_code == status.HTTP_200_OK
+    assert response_four.status_code == status.HTTP_200_OK
+    assert len(response_two.json()["responses"]) == 2
+    assert len(response_four.json()["responses"]) == 4
+    assert len(captured_two.captured_queries) == len(captured_four.captured_queries)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/responses — 參與者初次投票(add-participant-responses)
+# ---------------------------------------------------------------------------
+
+
+def _responses_url(event_id):
+    return f"/api/events/{event_id}/responses/"
+
+
+def _add_slot(event, date="2026-10-02"):
+    return Slot.objects.create(event=event, date=date)
+
+
+def _response_payload(**overrides):
+    payload = {
+        "nickname": "小華",
+        "phoneLastThree": "123",
+        "email": "participant@example.com",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _patch_participant_response_id_default(monkeypatch, fake):
+    """設定 ``ParticipantResponse.id`` 欄位的 ``default``,理由同
+    ``_patch_event_id_default``(Django 把解析後的 default getter 快取在
+    ``Field._get_default``,需連快取一起清掉)。"""
+    field = ParticipantResponse._meta.get_field("id")
+    monkeypatch.setattr(field, "default", fake)
+    monkeypatch.delitem(field.__dict__, "_get_default", raising=False)
+
+
+def test_participant_can_submit_first_vote_successfully():
+    """① 合法輸入(暱稱＋手機末三碼＋複選 2 個時段)→ 201,回應含新建 response 的
+    id(8 碼 base62 格式),DB 有一筆對應資料,phone_last_three_hash 不等於明碼、
+    且能透過 check_password 驗證回原始輸入。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_2 = _add_slot(event)
+    client = APIClient()
+    slot_ids = [str(event.slots.first().id), str(slot_2.id)]
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=slot_ids),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert set(body.keys()) == {"id"}
+    assert RESPONSE_SHORT_ID_RE.match(body["id"])
+
+    assert ParticipantResponse.objects.count() == 1
+    participant_response = ParticipantResponse.objects.get()
+    assert str(participant_response.id) == body["id"]
+    assert participant_response.nickname == "小華"
+    assert participant_response.phone_last_three_hash != "123"
+    assert check_password("123", participant_response.phone_last_three_hash)
+    assert set(str(s) for s in participant_response.slots.values_list("id", flat=True)) == set(
+        slot_ids
+    )
+
+
+def test_participant_vote_without_email_is_allowed():
+    """② 選填 email 不帶 → 201,email 為 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    payload = _response_payload(selectedSlotIds=[str(event.slots.first().id)])
+    del payload["email"]
+
+    response = client.post(_responses_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    participant_response = ParticipantResponse.objects.get()
+    assert participant_response.email is None
+
+
+def test_participant_vote_blank_email_returns_400_with_semantic_code():
+    """code-review 補充:email 帶空字串(而非省略或 null)→ 400,code 為
+    語意化的 PARTICIPANT_EMAIL_INVALID,不是 DRF 原始未對照的 "blank"。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    payload = _response_payload(email="", selectedSlotIds=[str(event.slots.first().id)])
+
+    response = client.post(_responses_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "PARTICIPANT_EMAIL_INVALID"
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_with_duplicate_nickname_returns_400():
+    """③ 暱稱與既有(trim 後)重複 → 400 NICKNAME_TAKEN,DB 未新增。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+    client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[slot_id]),
+        format="json",
+    )
+    assert ParticipantResponse.objects.count() == 1
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_TAKEN"
+    assert ParticipantResponse.objects.count() == 1
+
+
+def test_participant_vote_with_duplicate_nickname_after_trim_returns_400():
+    """④ 暱稱前後帶空白但 trim 後與既有重複 → 400 NICKNAME_TAKEN。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+    client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="  小華  ", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_TAKEN"
+    assert ParticipantResponse.objects.count() == 1
+
+
+def test_participant_vote_missing_required_fields_returns_400():
+    """⑤ 暱稱缺漏／手機末三碼缺漏／selectedSlotIds 空陣列 → 400 對應 code。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    payload_without_nickname = _response_payload(selectedSlotIds=[slot_id])
+    del payload_without_nickname["nickname"]
+    response = client.post(_responses_url(event.id), payload_without_nickname, format="json")
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_REQUIRED"
+
+    payload_without_phone = _response_payload(selectedSlotIds=[slot_id])
+    del payload_without_phone["phoneLastThree"]
+    response = client.post(_responses_url(event.id), payload_without_phone, format="json")
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "PHONE_LAST_THREE_REQUIRED"
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[]),
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SELECTED_SLOTS_REQUIRED"
+
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_invalid_phone_last_three_returns_400():
+    """⑥ 手機末三碼非 3 位數字(帶字母、2 位、4 位)→ 400 PHONE_LAST_THREE_INVALID。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    for invalid_phone in ("12a", "12", "1234"):
+        response = client.post(
+            _responses_url(event.id),
+            _response_payload(phoneLastThree=invalid_phone, selectedSlotIds=[slot_id]),
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["code"] == "PHONE_LAST_THREE_INVALID"
+
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_full_width_digit_phone_last_three_returns_400():
+    """code-review 補充:手機末三碼帶全形數字(Unicode \\d 會誤判為合法數字)
+    → 400 PHONE_LAST_THREE_INVALID,不視為合法的 3 位數字。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(phoneLastThree="１２３", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "PHONE_LAST_THREE_INVALID"
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_whitespace_only_nickname_or_phone_returns_required_code():
+    """code-review 補充:nickname／phoneLastThree 帶純空白字串(DRF CharField
+    trim_whitespace 後視為空)→ 400,code 仍是語意化的 *_REQUIRED,不是 DRF 原始
+    的 "blank"。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="   ", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_REQUIRED"
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(phoneLastThree="   ", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "PHONE_LAST_THREE_REQUIRED"
+
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_with_slot_not_belonging_to_event_returns_400():
+    """⑦ selectedSlotIds 內含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,不建立
+    任何資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    other_event = _create_event(owner)
+    client = APIClient()
+    foreign_slot_id = str(other_event.slots.first().id)
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[foreign_slot_id]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_NOT_FOUND"
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_nonexistent_event_returns_404():
+    """⑧ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    client = APIClient()
+
+    response = client.post(
+        _responses_url(generate_short_id()),
+        _response_payload(selectedSlotIds=[str(uuid.uuid4())]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_participant_vote_link_expired_returns_410():
+    """⑨ 活動連結已失效(status=cancelled 超過 7 天)→ 410 LINK_EXPIRED,不建立
+    任何資料。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = APIClient()
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_event_not_active_returns_409():
+    """⑩ 活動 status 非 active(取消／定案,未超過 7 天)→ 409 EVENT_NOT_ACTIVE。"""
+    owner = _create_user()
+    client = APIClient()
+    now = timezone.now()
+
+    finalized_event = _create_event(
+        owner, status=Event.Status.FINALIZED, finalized_at=now
+    )
+    finalized_event.final_slot = finalized_event.slots.first()
+    finalized_event.save()
+    cancelled_event = _create_event(
+        owner, status=Event.Status.CANCELLED, cancelled_at=now
+    )
+
+    for event in (finalized_event, cancelled_event):
+        response = client.post(
+            _responses_url(event.id),
+            _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.json()["code"] == "EVENT_NOT_ACTIVE"
+
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_voting_closed_returns_409():
+    """⑪ 活動 status=active 但 response_deadline 已過 → 409 VOTING_CLOSED。"""
+    owner = _create_user()
+    event = _create_event(owner, response_deadline=timezone.now() - timedelta(hours=1))
+    client = APIClient()
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "VOTING_CLOSED"
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_response_id_collision_retries_and_still_succeeds(monkeypatch):
+    """⑫(D9)用 mock 讓 generate_short_id 前兩次回傳同一個已存在的 id、第三次
+    回傳新 id → 仍 201 成功建立(驗證碰撞重試路徑);另外驗證兩個不同暱稱正常
+    各自成功時不會誤觸發重試。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    # 先建立一筆真實資料,佔用一個 id。
+    first_response = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="小明", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+    assert first_response.status_code == status.HTTP_201_CREATED
+    existing_id = first_response.json()["id"]
+    real_generate = generate_short_id
+    calls = {"n": 0}
+
+    def colliding_once_then_real():
+        calls["n"] += 1
+        return existing_id if calls["n"] == 1 else real_generate()
+
+    _patch_participant_response_id_default(monkeypatch, colliding_once_then_real)
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert calls["n"] >= 2
+    assert response.json()["id"] != existing_id
+    assert ParticipantResponse.objects.count() == 2
+
+
+def test_participant_response_different_nicknames_do_not_trigger_retry():
+    """⑫ 補充:兩個不同暱稱的正常請求各自成功,不會誤觸發 NICKNAME_TAKEN 或
+    id 碰撞重試路徑。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    slot_id = str(event.slots.first().id)
+
+    response_1 = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="小明", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+    response_2 = client.post(
+        _responses_url(event.id),
+        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        format="json",
+    )
+
+    assert response_1.status_code == status.HTTP_201_CREATED
+    assert response_2.status_code == status.HTTP_201_CREATED
+    assert ParticipantResponse.objects.count() == 2
+
+
+def _verify_url(event_id):
+    return f"/api/events/{event_id}/responses/verify/"
+
+
+def _create_verifiable_participant_response(event, **overrides):
+    """`_create_participant_response`(見上方,Task 2 測試已定義)的簡化版本
+    ——固定暱稱「小華」、手機末三碼「123」、勾選 `event` 的第一個 slot,供本節
+    身分核對測試重複使用,呼叫端只需視需要覆寫個別欄位。"""
+    defaults = {"email": "participant@example.com"}
+    defaults.update(overrides)
+    return _create_participant_response(event, "小華", [event.slots.first()], **defaults)
+
+
+def test_participant_verify_identity_success_returns_access_token_and_vote_content():
+    """① 正確暱稱＋正確手機末三碼 → 200,回應含 accessToken(明文)、expiresAt、
+    原投票內容(nickname/email/selectedSlotIds,供前端預填);DB 新增一筆 token
+    紀錄,token_hash 不等於明碼 accessToken。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_id = str(event.slots.first().id)
+    participant_response = _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(event.id),
+        {"nickname": "小華", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert set(body.keys()) == {
+        "accessToken",
+        "expiresAt",
+        "nickname",
+        "email",
+        "selectedSlotIds",
+    }
+    assert isinstance(body["accessToken"], str) and body["accessToken"]
+    assert body["nickname"] == "小華"
+    assert body["email"] == "participant@example.com"
+    assert body["selectedSlotIds"] == [slot_id]
+
+    assert ParticipantResponseAccessToken.objects.count() == 1
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.response_id == participant_response.id
+    assert token_record.token_hash != body["accessToken"]
+    assert body["accessToken"] not in token_record.token_hash
+    assert token_record.used_at is None
+
+
+def test_participant_verify_nonexistent_nickname_returns_401():
+    """② 暱稱不存在 → 401 IDENTITY_VERIFICATION_FAILED,不核發存取憑證。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(event.id),
+        {"nickname": "沒有這個人", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["code"] == "IDENTITY_VERIFICATION_FAILED"
+    assert ParticipantResponseAccessToken.objects.count() == 0
+
+
+def test_participant_verify_wrong_phone_last_three_returns_same_401_body_as_missing_nickname():
+    """③ 暱稱存在但手機末三碼錯誤 → 401 IDENTITY_VERIFICATION_FAILED,與②回應
+    body 完全相同,驗證不洩漏差異;不核發存取憑證。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    wrong_phone_response = client.post(
+        _verify_url(event.id),
+        {"nickname": "小華", "phoneLastThree": "999"},
+        format="json",
+    )
+    missing_nickname_response = client.post(
+        _verify_url(event.id),
+        {"nickname": "沒有這個人", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert wrong_phone_response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert wrong_phone_response.json()["code"] == "IDENTITY_VERIFICATION_FAILED"
+    assert wrong_phone_response.json() == missing_nickname_response.json()
+    assert ParticipantResponseAccessToken.objects.count() == 0
+
+
+def test_participant_verify_nonexistent_event_returns_404():
+    """④ 活動不存在 → 404 EVENT_NOT_FOUND,沿用共用前置檢查函式。"""
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(generate_short_id()),
+        {"nickname": "小華", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_participant_verify_link_expired_returns_410():
+    """④ 活動連結已失效(status=cancelled 超過 7 天)→ 410 LINK_EXPIRED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(event.id),
+        {"nickname": "小華", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+    assert ParticipantResponseAccessToken.objects.count() == 0
+
+
+def test_participant_verify_event_not_active_returns_409():
+    """④ 活動 status 非 active(取消,未超過 7 天)→ 409 EVENT_NOT_ACTIVE。"""
+    owner = _create_user()
+    event = _create_event(
+        owner, status=Event.Status.CANCELLED, cancelled_at=timezone.now()
+    )
+    _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(event.id),
+        {"nickname": "小華", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_NOT_ACTIVE"
+    assert ParticipantResponseAccessToken.objects.count() == 0
+
+
+def test_participant_verify_voting_closed_returns_409():
+    """④ 活動 status=active 但 response_deadline 已過 → 409 VOTING_CLOSED。"""
+    owner = _create_user()
+    event = _create_event(owner, response_deadline=timezone.now() - timedelta(hours=1))
+    _create_verifiable_participant_response(event)
+    client = APIClient()
+
+    response = client.post(
+        _verify_url(event.id),
+        {"nickname": "小華", "phoneLastThree": "123"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "VOTING_CLOSED"
+    assert ParticipantResponseAccessToken.objects.count() == 0
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/events/{id}/responses/{responseId} — 參與者更新投票(add-participant-responses)
+# ---------------------------------------------------------------------------
+
+
+def _patch_response_url(event_id, response_id):
+    return f"/api/events/{event_id}/responses/{response_id}/"
+
+
+def _issue_access_token(participant_response, **overrides):
+    """核發一組測試用存取憑證：比照 view 端 ``_hash_participant_access_token``
+    (sha256、不加 salt)手動建立 DB 紀錄,回傳明文 token 供測試組請求 body。"""
+    plaintext_token = overrides.pop("plaintext_token", secrets.token_urlsafe(32))
+    defaults = {
+        "response": participant_response,
+        "token_hash": hashlib.sha256(plaintext_token.encode()).hexdigest(),
+        "expires_at": timezone.now() + timedelta(minutes=30),
+    }
+    defaults.update(overrides)
+    ParticipantResponseAccessToken.objects.create(**defaults)
+    return plaintext_token
+
+
+def test_participant_patch_with_valid_token_updates_slots_only():
+    """① 帶有效未過期未使用的 token,修改 selectedSlotIds → 200,DB 該筆投票的
+    slots 已更新為新集合,nickname/email/phone_last_three_hash 皆未變動。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(
+        event, "小華", [slot_1], email="participant@example.com"
+    )
+    original_phone_hash = participant_response.phone_last_three_hash
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    participant_response.refresh_from_db()
+    assert set(
+        str(s) for s in participant_response.slots.values_list("id", flat=True)
+    ) == {str(slot_2.id)}
+    assert participant_response.nickname == "小華"
+    assert participant_response.email == "participant@example.com"
+    assert participant_response.phone_last_three_hash == original_phone_hash
+
+
+def test_participant_patch_token_already_used_returns_401():
+    """② token 使用後再次帶同一個 token 送出 → 401 ACCESS_TOKEN_INVALID(一次性
+    驗證),第二次請求不再變動資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    first_response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        format="json",
+    )
+    assert first_response.status_code == status.HTTP_200_OK
+
+    second_response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+
+    assert second_response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert second_response.json()["code"] == "ACCESS_TOKEN_INVALID"
+    participant_response.refresh_from_db()
+    assert set(
+        str(s) for s in participant_response.slots.values_list("id", flat=True)
+    ) == {str(slot_2.id)}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_participant_patch_concurrent_requests_with_same_token_only_one_succeeds():
+    """code-review 補充:兩個請求幾乎同時帶著同一個有效 token 送出 PATCH,
+    DB 層級的 compare-and-swap(``UPDATE ... WHERE used_at IS NULL``)必須保證
+    只有一個真的成功消費 token、寫入 slots——不能只靠 Python 物件裡讀到的舊值
+    判斷(見 views.py 的 ``claimed`` 計數)。用 ``transaction=True`` 讓兩個執行緒
+    各自拿到真正獨立的 DB connection,才測得出真實的併發行為。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_patch(target_slot_id):
+        start_barrier.wait()
+        client = APIClient()
+        try:
+            response = client.patch(
+                _patch_response_url(event.id, participant_response.id),
+                {"accessToken": token, "selectedSlotIds": [str(target_slot_id)]},
+                format="json",
+            )
+            status_codes.append(response.status_code)
+        finally:
+            # transaction=True 讓每個執行緒拿到獨立的 DB connection——測試結束
+            # 後不主動關閉,pytest-django 拆測試 DB 時會因為連線還在用而炸掉。
+            connection.close()
+
+    threads = [
+        threading.Thread(target=send_patch, args=(slot_1.id,)),
+        threading.Thread(target=send_patch, args=(slot_2.id,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_200_OK,
+        status.HTTP_401_UNAUTHORIZED,
+    ]
+    token_record = ParticipantResponseAccessToken.objects.get(response=participant_response)
+    assert token_record.used_at is not None
+
+
+def test_participant_patch_expired_token_returns_401():
+    """③ token 已過期(直接建立 expires_at 為過去的測試資料)→ 401
+    ACCESS_TOKEN_INVALID,不更動資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(
+        participant_response, expires_at=timezone.now() - timedelta(minutes=1)
+    )
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["code"] == "ACCESS_TOKEN_INVALID"
+    participant_response.refresh_from_db()
+    assert set(
+        str(s) for s in participant_response.slots.values_list("id", flat=True)
+    ) == {str(slot_1.id)}
+
+
+def test_participant_patch_nonexistent_or_malformed_token_returns_401():
+    """④ token 不存在／格式錯誤 → 401 ACCESS_TOKEN_INVALID。涵蓋:完全隨機、
+    非該 event 核發過任何 token 的字串;請求根本沒帶 accessToken 欄位。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": "not-a-real-token", "selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["code"] == "ACCESS_TOKEN_INVALID"
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["code"] == "ACCESS_TOKEN_INVALID"
+
+
+def test_participant_patch_token_belongs_to_another_response_returns_401():
+    """⑤ token 屬於另一筆 response,拿來改這筆的 responseId → 401
+    ACCESS_TOKEN_INVALID,不更動資料,對應 token 未被消費。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    response_a = _create_participant_response(event, "小華", [slot_1])
+    response_b = _create_participant_response(event, "小美", [slot_1])
+    token_for_a = _issue_access_token(response_a)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, response_b.id),
+        {"accessToken": token_for_a, "selectedSlotIds": [str(slot_2.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["code"] == "ACCESS_TOKEN_INVALID"
+    response_b.refresh_from_db()
+    assert set(
+        str(s) for s in response_b.slots.values_list("id", flat=True)
+    ) == {str(slot_1.id)}
+    token_record = ParticipantResponseAccessToken.objects.get(response=response_a)
+    assert token_record.used_at is None
+
+
+def test_participant_patch_ignores_locked_fields():
+    """⑥ body 帶 nickname/email/phoneLastThree 企圖修改 → 皆被忽略,DB 對應欄位
+    不變(僅 selectedSlotIds 生效)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(
+        event, "小華", [slot_1], email="participant@example.com"
+    )
+    original_phone_hash = participant_response.phone_last_three_hash
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {
+            "accessToken": token,
+            "selectedSlotIds": [str(slot_2.id)],
+            "nickname": "偷改暱稱",
+            "email": "hacker@example.com",
+            "phoneLastThree": "999",
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    participant_response.refresh_from_db()
+    assert participant_response.nickname == "小華"
+    assert participant_response.email == "participant@example.com"
+    assert participant_response.phone_last_three_hash == original_phone_hash
+    assert set(
+        str(s) for s in participant_response.slots.values_list("id", flat=True)
+    ) == {str(slot_2.id)}
+
+
+def test_participant_patch_with_slot_not_belonging_to_event_returns_400():
+    """⑦ selectedSlotIds 含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,DB
+    未變動,token 未被消費。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    other_event = _create_event(owner)
+    slot_1 = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    foreign_slot_id = str(other_event.slots.first().id)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [foreign_slot_id]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_NOT_FOUND"
+    participant_response.refresh_from_db()
+    assert set(
+        str(s) for s in participant_response.slots.values_list("id", flat=True)
+    ) == {str(slot_1.id)}
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.used_at is None
+
+
+def test_participant_patch_link_expired_returns_410_and_token_unconsumed():
+    """⑧ 活動連結已失效(status=cancelled 超過 7 天)→ 沿用共用前置檢查,410
+    LINK_EXPIRED,token 未被消費。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    slot_1 = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.used_at is None
+
+
+def test_participant_patch_event_not_active_returns_409_and_token_unconsumed():
+    """⑧ 活動 status 非 active(取消,未超過 7 天)→ 沿用共用前置檢查,409
+    EVENT_NOT_ACTIVE,token 未被消費。"""
+    owner = _create_user()
+    event = _create_event(
+        owner, status=Event.Status.CANCELLED, cancelled_at=timezone.now()
+    )
+    slot_1 = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_NOT_ACTIVE"
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.used_at is None
+
+
+def test_participant_patch_voting_closed_returns_409_and_token_unconsumed():
+    """⑧ 活動 status=active 但 response_deadline 已過 → 沿用共用前置檢查,409
+    VOTING_CLOSED,token 未被消費。"""
+    owner = _create_user()
+    event = _create_event(owner, response_deadline=timezone.now() - timedelta(hours=1))
+    slot_1 = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "VOTING_CLOSED"
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.used_at is None

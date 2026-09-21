@@ -70,3 +70,55 @@ class Event(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class ParticipantResponse(models.Model):
+    """一位參與者對某場 :class:`Event` 的投票——暱稱＋手機末三碼雜湊＋選填
+    Email＋複選的候選時段。
+
+    ``id`` 比照 ``Event.id`` 用短 id(重用同一個產生器),不用 UUID——與活動
+    識別碼風格一致、URL 更短。``Meta.unique_together`` 保證同一活動下暱稱不可
+    重複;搭配短 id 碰撞重試邏輯的完整說明見
+    openspec/changes/add-participant-responses/design.md D9。
+    """
+
+    id = models.CharField(
+        primary_key=True, max_length=8, default=generate_short_id, editable=False
+    )
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="responses")
+    nickname = models.CharField(max_length=40)
+    phone_last_three_hash = models.CharField(max_length=128)
+    email = models.EmailField(null=True, blank=True)
+    slots = models.ManyToManyField(Slot, related_name="responses")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("event", "nickname")
+
+    def __str__(self):
+        return self.nickname
+
+
+class ParticipantResponseAccessToken(models.Model):
+    """身分核對成功後核發的一次性存取憑證,供後續 ``PATCH`` 修改投票時免重新
+    輸入暱稱＋手機末三碼(見 design.md D2)。
+
+    只存 ``hashlib.sha256`` 雜湊值,不存明碼——比照既有
+    ``apps.accounts.models.RefreshTokenRecord`` 的作法：token 本身用
+    ``secrets.token_urlsafe`` 產生、熵夠高,不像手機末三碼只有 1000 種組合,
+    不需要 ``make_password`` 的 per-record salt。``used_at`` 非空即代表已被
+    ``PATCH`` 消費過,不可再次使用;``expires_at`` 固定核發後 30 分鐘。
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    response = models.ForeignKey(
+        ParticipantResponse, on_delete=models.CASCADE, related_name="access_tokens"
+    )
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return str(self.id)

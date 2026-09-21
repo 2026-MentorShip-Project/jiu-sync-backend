@@ -1,4 +1,10 @@
+import hashlib
+import secrets
+from datetime import timedelta
+
 from django.conf import settings
+from django.contrib.auth.hashers import check_password, make_password
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
@@ -11,26 +17,60 @@ from config.exceptions import ApiError, Gone
 
 from .authentication import OptionalJWTAuthentication
 from .lifecycle import compute_display_status
-from .models import Event
+from .models import Event, ParticipantResponseAccessToken
 from .serializers import (
     EventCreateSerializer,
     EventDetailSerializer,
     EventPatchSerializer,
     EventSummarySerializer,
+    ParticipantResponseCreateSerializer,
+    ParticipantResponsePatchSerializer,
+    ParticipantResponseVerifySerializer,
 )
 
+# ParticipantResponseAccessToken 的效期,核發後固定 30 分鐘(design.md D2)。
+PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
 
-def _get_event_or_404(id):
-    """``GET``/``PATCH /api/events/{id}`` 共用的活動查找,查無資料時拋
-    ``EVENT_NOT_FOUND``(404)。不用 ``get_object_or_404``——那樣拿到的是 DRF
-    泛用的 ``NotFound``,只有粗粒度的 ``"NOT_FOUND"`` code。
+# 暱稱查無資料時,仍對這個固定雜湊值跑一次 check_password,讓「暱稱不存在」與
+# 「暱稱存在但手機碼錯誤」兩種失敗耗費的時間趨於一致——design.md D3 只保證
+# 回應「內容」不洩漏差異,若略過雜湊比對直接短路,兩種失敗的回應時間仍可被用來
+# 側錄暱稱是否存在(code-review 抓到)。模組載入時算一次即可,不用每次請求
+# 重新雜湊。
+_DUMMY_PHONE_HASH_FOR_TIMING = make_password("000")
+
+
+def _get_event_or_404(id, queryset=None):
+    """``GET``/``PATCH /api/events/{id}`` 與參與者三支端點共用的活動查找,查無
+    資料時拋 ``EVENT_NOT_FOUND``(404)。不用 ``get_object_or_404``——那樣拿到的
+    是 DRF 泛用的 ``NotFound``,只有粗粒度的 ``"NOT_FOUND"`` code。
+
+    ``queryset`` 預設 ``None`` 時用最小的 ``select_related``——三支參與者端點
+    都不會用 ``EventDetailSerializer`` 序列化整筆活動,不需要 ``responses``。
+    ``EventDetailView`` 的 ``GET``/``PATCH`` 都會回傳含 ``responses`` 欄位的
+    ``EventDetailSerializer`` 結果,兩者都傳入客製化的
+    ``prefetch_related("responses__slots")`` queryset 換掉預設值(見
+    ``EventDetailSerializer.get_responses()``),避免 N+1;不影響其他呼叫端。
     """
-    event = Event.objects.select_related("owner", "final_slot").filter(pk=id).first()
+    if queryset is None:
+        queryset = Event.objects.select_related("owner", "final_slot")
+    event = queryset.filter(pk=id).first()
     if event is None:
         raise ApiError(
             "找不到此活動，可能已被刪除或網址錯誤", code="EVENT_NOT_FOUND", status_code=404
         )
     return event
+
+
+def _event_with_responses_queryset():
+    """``EventDetailView`` 的 ``GET``/``PATCH`` 共用——兩者都回傳含
+    ``responses`` 欄位的 ``EventDetailSerializer`` 結果,都需要
+    ``prefetch_related("responses__slots")`` 避免 N+1(見
+    ``EventDetailSerializer.get_responses()``),抽成共用函式避免兩處各自重複
+    一次一模一樣的 queryset 組合。
+    """
+    return Event.objects.select_related("owner", "final_slot").prefetch_related(
+        "responses__slots"
+    )
 
 
 class EventListView(APIView):
@@ -121,24 +161,15 @@ class EventDetailView(APIView):
         return [OptionalJWTAuthentication()]
 
     def get(self, request, id):
-        event = _get_event_or_404(id)
-        display_status = compute_display_status(
-            event.status,
-            event.response_deadline,
-            event.finalized_at,
-            event.cancelled_at,
-            event.final_slot.date if event.final_slot else None,
-            timezone.now(),
-        )
-        if display_status == "link_expired":
-            raise Gone("此活動連結已失效（活動結束超過7天）", code="LINK_EXPIRED")
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        display_status = _display_status_or_410(event)
         serializer = EventDetailSerializer(
             event, context={"request": request, "display_status": display_status}
         )
         return Response(serializer.data)
 
     def patch(self, request, id):
-        event = _get_event_or_404(id)
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         if request.user != event.owner:
             raise PermissionDenied("僅活動擁有者可編輯此活動")
         if event.status != Event.Status.ACTIVE:
@@ -152,3 +183,217 @@ class EventDetailView(APIView):
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data)
+
+
+def _display_status_or_410(event):
+    """算出 event 的 displayStatus;連結已失效(``"link_expired"``)時直接拋
+    410 ``Gone``,否則回傳算出的 displayStatus 字串。``EventDetailView.get()``
+    與 ``_check_participation_preconditions`` 共用同一份判斷邏輯,避免兩處各自
+    重複一次 ``compute_display_status(...)`` 呼叫與 link_expired 判斷。
+    """
+    display_status = compute_display_status(
+        event.status,
+        event.response_deadline,
+        event.finalized_at,
+        event.cancelled_at,
+        event.final_slot.date if event.final_slot else None,
+        timezone.now(),
+    )
+    if display_status == "link_expired":
+        raise Gone("此活動連結已失效（活動結束超過7天）", code="LINK_EXPIRED")
+    return display_status
+
+
+def _check_participation_preconditions(event):
+    """三支參與者端點(建立投票／身分核對／更新投票)共用前置條件檢查:
+    連結未失效 → 活動狀態為進行中 → 未過投票截止時間。見
+    openspec/changes/add-participant-responses/design.md D6。
+    """
+    _display_status_or_410(event)
+    if event.status != Event.Status.ACTIVE:
+        raise ApiError(
+            "活動已取消或已定案，無法投票", code="EVENT_NOT_ACTIVE", status_code=409
+        )
+    if timezone.now() >= event.response_deadline:
+        raise ApiError("投票已截止", code="VOTING_CLOSED", status_code=409)
+
+
+class ParticipantResponseCreateView(APIView):
+    """``POST /api/events/{id}/responses`` — 任何人(含未登入)透過活動分享連結
+    提交初次投票。完全公開,不需要登入,不採用任何身分驗證(即使帶了
+    Authorization header 也不解析)。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        _check_participation_preconditions(event)
+
+        serializer = ParticipantResponseCreateSerializer(
+            data=request.data, context={"event": event}
+        )
+        serializer.is_valid(raise_exception=True)
+        participant_response = serializer.save()
+
+        return Response(
+            {"id": str(participant_response.id)}, status=status.HTTP_201_CREATED
+        )
+
+
+def _hash_participant_access_token(token_value):
+    """回傳存取憑證明文的 SHA-256 hex digest。
+
+    不加 salt——比照 ``apps.accounts.services._hash_refresh_token`` 的既有作法
+    （見該函式 docstring）：``secrets.token_urlsafe`` 產生的高熵字串本身不可
+    窮舉，跟手機末三碼（見 ``design.md`` D1）那種低熵輸入需要 per-record salt
+    的情況不同。
+    """
+    return hashlib.sha256(token_value.encode()).hexdigest()
+
+
+class ParticipantResponseVerifyView(APIView):
+    """``POST /api/events/{id}/responses/verify`` — 任何人(含未登入)透過活動
+    分享連結核對身分(暱稱＋手機末三碼)。完全公開,不需要登入,不採用任何身分
+    驗證,同 ``ParticipantResponseCreateView``。
+
+    核對成功核發一組一次性存取憑證(明文只在這次回應回傳,DB 只存雜湊值,見
+    ``_hash_participant_access_token``),供後續 ``PATCH`` 修改投票使用。查無
+    此暱稱、或暱稱存在但手機末三碼不符,皆回同一個 401
+    ``IDENTITY_VERIFICATION_FAILED``(design.md D3),不讓回應內容洩漏兩者的
+    差異——因此這裡刻意不呼叫 ``get_object_or_404`` 之類會分岔出不同錯誤訊息
+    的寫法,兩個失敗分支共用同一段 ``raise``。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        _check_participation_preconditions(event)
+
+        serializer = ParticipantResponseVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        nickname = serializer.validated_data["nickname"]
+        phone_last_three = serializer.validated_data["phoneLastThree"]
+
+        participant_response = event.responses.filter(nickname=nickname).first()
+        if participant_response is not None:
+            phone_matches = check_password(
+                phone_last_three, participant_response.phone_last_three_hash
+            )
+        else:
+            check_password(phone_last_three, _DUMMY_PHONE_HASH_FOR_TIMING)
+            phone_matches = False
+
+        if participant_response is None or not phone_matches:
+            raise ApiError(
+                "暱稱或手機末三碼不正確",
+                code="IDENTITY_VERIFICATION_FAILED",
+                status_code=401,
+            )
+
+        plaintext_token = secrets.token_urlsafe(32)
+        expires_at = timezone.now() + PARTICIPANT_ACCESS_TOKEN_TTL
+        ParticipantResponseAccessToken.objects.create(
+            response=participant_response,
+            token_hash=_hash_participant_access_token(plaintext_token),
+            expires_at=expires_at,
+        )
+
+        return Response(
+            {
+                "accessToken": plaintext_token,
+                "expiresAt": expires_at,
+                "nickname": participant_response.nickname,
+                "email": participant_response.email,
+                "selectedSlotIds": [
+                    str(slot_id)
+                    for slot_id in participant_response.slots.values_list("id", flat=True)
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ParticipantResponseDetailView(APIView):
+    """``PATCH /api/events/{id}/responses/{responseId}`` — 參與者憑
+    ``POST .../verify`` 核發的一次性存取憑證修改候選時段選擇。完全公開,不需要
+    登入,不採用任何身分驗證(同另外兩支參與者端點)——身分驗證改用請求 body
+    裡的 ``accessToken`` 完成,見 ``patch()``。
+
+    ``accessToken`` 刻意不放進 ``ParticipantResponsePatchSerializer`` 宣告
+    (見該類別 docstring),這裡直接從 ``request.data`` 取值、比對雜湊。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def patch(self, request, id, responseId):
+        event = _get_event_or_404(id)
+
+        # 先驗證存取憑證(design.md D2):存在、未過期、未使用過、關聯的
+        # response 對得上 URL 的 responseId(同時隱含對得上這個活動)——任一
+        # 不符皆回同一個 401 ACCESS_TOKEN_INVALID,不細分原因(design.md D2)。
+        # 這一步刻意排在共用前置條件檢查與 slot 驗證之前:token 本身無效時,
+        # 不該讓請求者靠著觀察 410/409/400 的差異推敲出活動目前的狀態。
+        token_value = request.data.get("accessToken")
+        token_record = None
+        if isinstance(token_value, str) and token_value:
+            token_record = (
+                ParticipantResponseAccessToken.objects.select_related("response")
+                .filter(token_hash=_hash_participant_access_token(token_value))
+                .first()
+            )
+
+        now = timezone.now()
+        if (
+            token_record is None
+            or token_record.used_at is not None
+            or token_record.expires_at <= now
+            or token_record.response_id != responseId
+            or token_record.response.event_id != event.id
+        ):
+            raise ApiError(
+                "存取憑證無效、已過期或已被使用，請重新核對身分",
+                code="ACCESS_TOKEN_INVALID",
+                status_code=401,
+            )
+
+        # 前置條件(連結未失效／狀態進行中／未過投票截止時間)與候選時段驗證
+        # 失敗都不消費 token——讓使用者修正請求後,原本那組 token 仍可重試。
+        _check_participation_preconditions(event)
+
+        serializer = ParticipantResponsePatchSerializer(
+            data=request.data, context={"event": event}
+        )
+        serializer.is_valid(raise_exception=True)
+        slot_ids = serializer.validated_data["selectedSlotIds"]
+
+        participant_response = token_record.response
+        with transaction.atomic():
+            # Compare-and-swap:UPDATE ... WHERE used_at IS NULL 才是真正保證
+            # 一次性消費的地方——上面那段早期檢查只是為了快速失敗,兩個請求
+            # 帶著同一個 token 同時通過早期檢查、同時走到這裡時,DB 層級只有
+            # 一個 UPDATE 能真的把 used_at 從 NULL 改掉,affected row 數可拿來
+            # 判斷輸贏,不能只憑 Python 物件裡讀到的舊值(code-review 抓到:
+            # 純 .save() 沒有 WHERE 條件,兩個請求會都成功覆寫)。
+            claimed = ParticipantResponseAccessToken.objects.filter(
+                pk=token_record.pk, used_at__isnull=True
+            ).update(used_at=now)
+            if claimed == 0:
+                raise ApiError(
+                    "存取憑證無效、已過期或已被使用，請重新核對身分",
+                    code="ACCESS_TOKEN_INVALID",
+                    status_code=401,
+                )
+            participant_response.slots.set(slot_ids)
+
+        return Response(
+            {
+                "id": str(participant_response.id),
+                "selectedSlotIds": [str(slot_id) for slot_id in slot_ids],
+            },
+            status=status.HTTP_200_OK,
+        )
