@@ -208,6 +208,11 @@ def _check_participation_preconditions(event):
     """三支參與者端點(建立投票／身分核對／更新投票)共用前置條件檢查:
     連結未失效 → 活動狀態為進行中 → 未過投票截止時間。見
     openspec/changes/add-participant-responses/design.md D6。
+
+    ``VOTING_CLOSED`` 統一回 409(狀態衝突,跟 EVENT_NOT_ACTIVE 同一類、也跟既有
+    PATCH /api/events/{id} 慣例一致)。曾在 D10 短暫讓
+    ``ParticipantResponseCreateView`` 單獨改回 400,使用者事後確認要統一改回
+    409,見 D10 修訂記錄。
     """
     _display_status_or_410(event)
     if event.status != Event.Status.ACTIVE:
@@ -215,7 +220,9 @@ def _check_participation_preconditions(event):
             "活動已取消或已定案，無法投票", code="EVENT_NOT_ACTIVE", status_code=409
         )
     if timezone.now() >= event.response_deadline:
-        raise ApiError("投票已截止", code="VOTING_CLOSED", status_code=409)
+        raise ApiError(
+            "投票已截止，請聯繫主揪重新開放投票", code="VOTING_CLOSED", status_code=409
+        )
 
 
 class ParticipantResponseCreateView(APIView):
@@ -373,15 +380,21 @@ class ParticipantResponseDetailView(APIView):
 
         participant_response = token_record.response
         with transaction.atomic():
-            # Compare-and-swap:UPDATE ... WHERE used_at IS NULL 才是真正保證
-            # 一次性消費的地方——上面那段早期檢查只是為了快速失敗,兩個請求
-            # 帶著同一個 token 同時通過早期檢查、同時走到這裡時,DB 層級只有
-            # 一個 UPDATE 能真的把 used_at 從 NULL 改掉,affected row 數可拿來
-            # 判斷輸贏,不能只憑 Python 物件裡讀到的舊值(code-review 抓到:
-            # 純 .save() 沒有 WHERE 條件,兩個請求會都成功覆寫)。
+            # Compare-and-swap:UPDATE ... WHERE used_at IS NULL AND expires_at
+            # > 當下 才是真正保證一次性消費、且消費當下仍未過期的地方——上面
+            # 那段早期檢查只是為了快速失敗,兩個請求帶著同一個 token 同時通過
+            # 早期檢查、同時走到這裡時,DB 層級只有一個 UPDATE 能真的把
+            # used_at 從 NULL 改掉,affected row 數可拿來判斷輸贏,不能只憑
+            # Python 物件裡讀到的舊值(code-review 抓到:純 .save() 沒有
+            # WHERE 條件,兩個請求會都成功覆寫)。expires_at 也要在同一個
+            # UPDATE 裡重新核對、用重新取得的當下時間——否則 token 若剛好在
+            # 早期檢查通過之後、這個 UPDATE 執行之前的極短空檔到期,早期檢查
+            # 用的是舊的 now,不會抓到,會讓已過期的 token 仍成功消費
+            # (Codex 二次審查抓到)。
+            claimed_at = timezone.now()
             claimed = ParticipantResponseAccessToken.objects.filter(
-                pk=token_record.pk, used_at__isnull=True
-            ).update(used_at=now)
+                pk=token_record.pk, used_at__isnull=True, expires_at__gt=claimed_at
+            ).update(used_at=claimed_at)
             if claimed == 0:
                 raise ApiError(
                     "存取憑證無效、已過期或已被使用，請重新核對身分",

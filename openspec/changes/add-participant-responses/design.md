@@ -59,11 +59,36 @@
 
 已與使用者確認唯讀彙整頁要列出「誰投了什麼」，不是純數字統計。`phoneLastThree`（即使是雜湊）與 `email` 屬於參與者的聯絡資訊，不對外（含其他參與者）公開，只在後端驗證流程內部使用。前端若要算「每個時段幾票」，可自行從這份列表 reduce，不需要後端另外算一份 `voteCount`。
 
+### D10. `VOTING_CLOSED` 統一回 409（曾短暫讓 `POST .../responses` 單獨回 400，已改回）
+
+commit 後使用者追加要求：三支參與者端點共用的 `_check_participation_preconditions` 原本 `VOTING_CLOSED` 統一回 409（跟 `EVENT_NOT_ACTIVE`、既有 `PATCH /api/events/{id}` 的 409 慣例一致）。第一版曾依當時的指示，讓 `POST .../responses`（建立投票）這一支單獨改回 400、`verify`／`PATCH` 維持 409（共用函式新增 `voting_closed_status_code` 參數）。
+
+> **修訂記錄（2026-09-21）**：使用者確認不要這個不對稱，三支端點的 `VOTING_CLOSED` 統一改回 409——跟專案既有「狀態衝突用 409、欄位驗證用 400」的錯誤代碼慣例一致（見 `add-error-code-table`）。移除 `voting_closed_status_code` 參數，`_check_participation_preconditions` 固定回 409。
+
+### D11. 參與者暱稱不可與主揪 `hostNickname` 相同（`NICKNAME_CONFLICTS_WITH_HOST`）
+
+commit 後使用者追加要求：初次投票時，暱稱除了不可與既有參與者暱稱重複（`NICKNAME_TAKEN`，D5），也不可與該活動主揪的 `hostNickname` 相同——避免參與者列表出現一個看起來像主揪本人、但其實是別人冒用的暱稱。比對規則沿用既有暱稱比對慣例（D5）：trim 後精確比對、大小寫敏感。`Event.host_nickname` 是靜態欄位（同一活動內不會被併發修改成跟某個參與者暱稱衝突的值——`EventPatchSerializer` 改 `hostNickname` 時不會回頭檢查既有參與者），所以這個檢查純粹是 serializer 層的驗證（`validate_nickname` 內比對，透過 `context={"event": event}` 拿到 `event.host_nickname`），不需要 DB 唯一約束或 `IntegrityError` 這類並發防護——這點跟 D5/D9（暱稱互相比對，需要 DB 約束防 race）不同。
+
+### D12. `ParticipantResponse.comment`：選填留言，本次只接受並儲存，不做顯示 API
+
+commit 後使用者追加要求：初次投票時可附上一段選填留言，供未來另一支「顯示所有人留言」的 API 使用——**本次 scope 明確只到「接受並儲存」**，不做顯示/彙整 API（那是未來 change 的範圍）。長度上限比照 `Event.final_note`（200 字），沒有格式驗證（純自由文字）。刻意讓空字串（`""`）視為「沒有留言」而非驗證錯誤（`allow_blank=True`，正規化成 `None` 存入 DB）——這跟 `email` 欄位空字串視為無效（`PARTICIPANT_EMAIL_INVALID`）不同，因為 email 有「格式對不對」的概念、comment 沒有。`GET /api/events/{id}` 的 `responses` 欄位（D8）刻意不含 `comment`——D8 的彙整頁範圍是「誰投了什麼時段」，留言顯示是明確排除在本次 scope 外的獨立功能。
+
+### D13. `PATCH .../responses/{responseId}` 的一次性 token 消費，compare-and-swap 需一併重新核對到期時間
+
+Codex 二次審查抓到：`patch()` 開頭的早期檢查（token 是否存在／已用過／過期／對得上 `responseId` 與活動）用的是請求一開始取得的 `now`，但真正保證一次性消費的 compare-and-swap（`UPDATE ... WHERE used_at IS NULL`）發生在共用前置條件檢查、slot 驗證之後——這中間有真實的時間間隔。原本的 CAS 只檢查 `used_at IS NULL`，沒有重新檢查 `expires_at`：若 token 剛好在早期檢查通過之後、CAS 執行之前的空檔到期，仍會成功消費、修改投票，跟 spec「憑有效、未過期 token」的要求有落差（這跟 D9/token 的一次性消費 race 是同一類「用舊資料判斷、忘了在真正寫入的瞬間重新核對」的錯誤，只是這次是「到期時間」而非「是否已使用」）。
+
+修法：CAS 的 `UPDATE` 加上 `expires_at__gt=<CAS 執行當下重新取得的 now>` 條件，`claimed_at`（CAS 用的當下時間）與 `used_at` 寫入值用同一個變數，不沿用早期檢查的舊 `now`。已用真實時間流逝驗證（在 `_check_participation_preconditions` 呼叫點人為注入延遲，讓效期極短的 token 確實在早期檢查與 CAS 之間到期），修正前測試會失敗（token 仍被成功消費）、修正後通過。
+
+### D14. `selectedSlotIds` 元素非合法 UUID 字串時，補上 `SLOT_ID_INVALID` 語意化 code
+
+用實際請求測試畸形 request body 時發現：`selectedSlotIds` 送入非 UUID 字串的元素（例如舊版三態 `{"id":..., "availability":...}` 物件格式），DRF `UUIDField` 產生的原始 `.code` 是 `"invalid"`，但 `FIELD_CODE_OVERRIDES` 只對照了 `selectedSlotIds` 的 `required`/`empty`，漏了 `invalid`，導致回應 `code: "invalid"`（未語意化，前端拿不到穩定字串）。已與使用者確認補上 `("selectedSlotIds", "invalid"): "SLOT_ID_INVALID"`——`ParticipantResponseCreateSerializer`/`ParticipantResponsePatchSerializer` 的 `selectedSlotIds` 欄位名相同，同一張表對照即可涵蓋兩支端點，不需分別處理。
+
 ## Risks / Trade-offs
 
 - **[風險] 手機末三碼可被暴力窮舉冒用身分改票（D1）** → 已與使用者確認為本次刻意接受的風險，不在 scope 內處理。緩解方向留給未來 change：失敗次數鎖定、或核對 API 加 IP／裝置層級的 rate limit。
 - **[風險] Access token 效期內若外流（例如瀏覽器分頁被他人接手使用），30 分鐘內可被用來修改投票** → 緩解：token 只存雜湊、只能使用一次、效期短；風險程度與「暱稱鎖定不可改」「僅能改時段（不能改聯絡資訊）」的範圍限制一致，可造成的傷害有限。
 - **[風險] `unique_together (event, nickname)` 意味著同一活動下兩個不同的人剛好想用同一個暱稱，後來者會被擋** → 這是規格本身的既定行為（「暱稱不可與既有暱稱重複」），不是本次技術限制的副作用。
+- **[風險] `ParticipantResponseAccessToken` 無清除策略，資料表隨核對次數無限累積**（Codex 二次審查提出）→ 每次呼叫 `verify` 都會新增一筆 token，即使已過期或已使用也永久保留，非本次 blocker，留給未來 change：定期清除過期／已使用超過一段時間的 token；或核發新 token 時順便刪掉同一 response 的舊 token；`expires_at` 若要支援排程清理，屆時可補 index。
 
 ## Migration Plan
 

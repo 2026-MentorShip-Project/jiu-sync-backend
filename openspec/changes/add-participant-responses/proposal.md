@@ -32,3 +32,6 @@
 - 修改 `config/exceptions.py`：`FIELD_CODE_OVERRIDES` 補上本次新增欄位的 code
 - `responseId` 比照 `Event.id` 採 8 碼 base62 短 id（重用既有 `apps/events/ids.generate_short_id`），非 UUID；碰撞重試邏輯需與「暱稱重複」的 `IntegrityError` 分開判斷，見 design.md D9
 - 已同步更新前後端對焦用的 Swagger artifact（`https://claude.ai/artifact/FgVxgLaS7L8Pf2MNEz92Vf`，由 prototype-7f session 維護）：新增本次三支端點、`ParticipantResponse`/`ApiError` schema 改版、`responseId` 短 id 格式說明；並標記舊版 `POST /api/responses/mine`（Email＋密碼查詢）因密碼欄位拿掉而設計基礎不成立，待後續 change 處理
+- **commit 後追加**（design.md D11/D12）：`ParticipantResponse` 新增選填 `comment` 欄位（本次僅接受並儲存，顯示 API 留待未來 change）；暱稱新增不可與主揪 `hostNickname` 相同的規則（`NICKNAME_CONFLICTS_WITH_HOST`）
+- **Codex 二次審查**（design.md D13）：`PATCH .../responses/{responseId}` 的一次性 token compare-and-swap 補上到期時間重新核對，修掉早期檢查與真正消費之間的極短空檔可能讓過期 token 仍成功消費的落差；`ParticipantResponseAccessToken` 無清除策略記入 Risks，非本次 blocker
+- **實測畸形 request body 發現**（design.md D14）：`selectedSlotIds` 元素非 UUID 格式時補上語意化 code `SLOT_ID_INVALID`（原本回傳未對照的 DRF 原始碼 `"invalid"`）

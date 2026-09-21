@@ -89,6 +89,9 @@ class ParticipantResponse(models.Model):
     nickname = models.CharField(max_length=40)
     phone_last_three_hash = models.CharField(max_length=128)
     email = models.EmailField(null=True, blank=True)
+    # 選填留言,長度上限比照 Event.final_note——目前只接受並儲存,尚無獨立的
+    # 留言列表 API 讀取它(使用者已確認這是刻意分兩階段的範圍)。
+    comment = models.CharField(max_length=200, null=True, blank=True)
     slots = models.ManyToManyField(Slot, related_name="responses")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -206,12 +206,25 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
     nickname = serializers.CharField(max_length=40)
     phoneLastThree = serializers.CharField()
     email = serializers.EmailField(required=False, allow_null=True, default=None)
+    # comment 是自由文字留言,不像 email 有「格式對不對」的概念——空字串就是
+    # 「沒有留言」,沒有理由當成錯誤拒絕,所以刻意 allow_blank=True(跟 email
+    # 的 blank 視為無效是不同的決策,見 config/exceptions.py 的對照)。
+    comment = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True, max_length=200, default=None
+    )
     selectedSlotIds = serializers.ListField(
         child=serializers.UUIDField(), allow_empty=False
     )
 
     def validate_nickname(self, value):
-        return value.strip()
+        trimmed = value.strip()
+        event = self.context["event"]
+        if trimmed == event.host_nickname:
+            raise serializers.ValidationError(
+                "此暱稱與主揪暱稱相同，請改用其他暱稱",
+                code="NICKNAME_CONFLICTS_WITH_HOST",
+            )
+        return trimmed
 
     def validate_phoneLastThree(self, value):
         return _validate_phone_last_three_format(value)
@@ -224,6 +237,7 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
         nickname = validated_data["nickname"]
         slot_ids = validated_data["selectedSlotIds"]
         phone_last_three_hash = make_password(validated_data["phoneLastThree"])
+        comment = validated_data.get("comment") or None
 
         # ParticipantResponse.id 短 id 碰撞、與 unique_together (event,
         # nickname) 暱稱重複,是同一個 create() 呼叫下兩個獨立來源都可能觸發
@@ -237,6 +251,7 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
                         nickname=nickname,
                         phone_last_three_hash=phone_last_three_hash,
                         email=validated_data.get("email"),
+                        comment=comment,
                     )
                     response.slots.set(slot_ids)
                 return response

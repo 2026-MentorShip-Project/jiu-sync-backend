@@ -85,8 +85,10 @@ FIELD_CODE_OVERRIDES = {
     ("phoneLastThree", "invalid"): "PHONE_LAST_THREE_INVALID",
     ("selectedSlotIds", "required"): "SELECTED_SLOTS_REQUIRED",
     ("selectedSlotIds", "empty"): "SELECTED_SLOTS_REQUIRED",
+    ("selectedSlotIds", "invalid"): "SLOT_ID_INVALID",
     ("email", "invalid"): "PARTICIPANT_EMAIL_INVALID",
     ("email", "blank"): "PARTICIPANT_EMAIL_INVALID",
+    ("comment", "max_length"): "COMMENT_TOO_LONG",
 }
 
 # 巢狀陣列欄位（目前只有 `slots[].<subfield>`）的 code 對照——用子欄位名比對,

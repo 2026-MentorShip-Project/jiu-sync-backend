@@ -28,3 +28,12 @@
 
 - [x] 5.1 跑 `uv run ruff check .`、`uv run python manage.py check`、`uv run pytest`(全套)，確認三者皆乾淨無誤 — (auto) 三個指令 exit code 皆 0
 - [x] 5.2 驗證邊界需求「未涵蓋範圍不得被誤實作」：確認沒有加入手機末三碼失敗次數鎖定／rate limit、沒有讓 `PATCH .../responses/{id}` 接受修改 `email`/`nickname` — (auto) `git diff --stat feature/error-code-table...HEAD -- apps/events` 顯示的檔案清單與異動內容不含上述項目
+
+## 6. commit 後追加需求（留言欄位／主揪暱稱衝突／VOTING_CLOSED 狀態碼，design.md D10/D11/D12/D13）
+
+> 這輪未嚴格先紅後綠——程式碼與測試撰寫順序顛倒，已記錄於
+> `docs/agents/incident-log/2026-09-21.md`，測試最終仍全數涵蓋並通過。
+
+- [x] 6.1 `ParticipantResponse` 新增 `comment`（CharField，max_length=200，null/blank）欄位與 migration；`ParticipantResponseCreateSerializer` 新增 `comment`（選填，`allow_blank=True`，空字串正規化成 `None`）；`validate_nickname` 新增與 `event.host_nickname` 精確比對（trim 後），相同時拒絕並回 `NICKNAME_CONFLICTS_WITH_HOST`；`_check_participation_preconditions` 新增 `voting_closed_status_code` 參數（預設 409），`ParticipantResponseCreateView` 傳入 400；`config/exceptions.py` 補 `("comment", "max_length")`。補測試：留言可正常儲存／不帶留言為 null／空字串留言正規化為 null／超長 400 `COMMENT_TOO_LONG`；暱稱與主揪暱稱相同（含 trim 後相同）→ 400 `NICKNAME_CONFLICTS_WITH_HOST`；投票已截止 → 400（不是 409）`VOTING_CLOSED`，且更新既有兩則因暱稱誤撞新規則而失敗的測試（碰撞重試、不同暱稱不誤觸發重試）改用不會與主揪暱稱衝突的測試暱稱。`verify`/`PATCH` 兩支端點的 `VOTING_CLOSED` 測試維持 409，未受影響 — (auto) `pytest`（全套 154 passed）、`ruff check`、`manage.py check` 皆乾淨
+- [x] 6.2 使用者確認 `VOTING_CLOSED` 統一改回 409（撤回 6.1 的 400 不對稱）：移除 `voting_closed_status_code` 參數，`_check_participation_preconditions` 固定回 409；同步修正 spec.md/測試。另外處理 Codex 二次審查兩項發現（design.md D13）：① `PATCH .../responses/{responseId}` 的 token compare-and-swap 補上 `expires_at__gt=<CAS 當下重新取得的 now>`，修掉早期檢查與真正消費之間的極短空檔可能讓過期 token 仍成功消費的落差，補一則用真實時間流逝（人為延遲注入）驗證的測試，修正前先確認會 FAIL；② `ParticipantResponseAccessToken` 無清除策略記入 design.md Risks，非本次 blocker，不動程式碼 — (auto) `pytest`（全套 155 passed）、`ruff check`、`manage.py check` 皆乾淨
+- [x] 6.3 用真實請求實測畸形 request body 時發現：`selectedSlotIds` 元素非合法 UUID 字串 → 回應 `code: "invalid"`（DRF 原始碼，未語意化）。已與使用者確認補上 `FIELD_CODE_OVERRIDES` 的 `("selectedSlotIds", "invalid"): "SLOT_ID_INVALID"`（同時涵蓋 create／patch 兩支端點，欄位名相同）；`POST .../responses`、`PATCH .../responses/{responseId}` 各補一則測試（RED 先確認會拿到未對照的 `"invalid"`，補表後轉綠）；spec.md 兩個 Requirement 補上 `SLOT_ID_INVALID` 的 Scenario 與修訂記錄（design.md D14）— (auto) `pytest`（全套 157 passed）、`ruff check`、`manage.py check` 皆乾淨
