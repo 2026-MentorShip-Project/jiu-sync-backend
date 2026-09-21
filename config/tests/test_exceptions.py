@@ -195,13 +195,16 @@ def test_handler_builds_errors_array_for_multiple_field_validation_error():
 
 
 def test_handler_builds_errors_array_for_nested_list_field_validation_error():
-    """③ 巢狀陣列欄位（模擬 DRF 對 many=True nested serializer 的錯誤形狀）
-    → 對應的 errors 項目 field 用 "slots[<index>].<子欄位>" 路徑命名，code 依
-    NESTED_SUBFIELD_CODE_OVERRIDES 依子欄位名查（"date" → "SLOT_DATE_INVALID"）。
+    """③ 巢狀陣列欄位（DRF 對 `ChildSerializer(many=True)` 實際產生的錯誤
+    形狀——以索引為 key 的 dict，只有失敗的索引才會出現，不是原本誤以為的
+    list、也不會有成功索引的空 dict 佔位，見 add-participant-responses 的
+    code-review 修正）→ 對應的 errors 項目 field 用 "slots[<index>].<子欄位>"
+    路徑命名，code 依 NESTED_SUBFIELD_CODE_OVERRIDES 依子欄位名查
+    （"date" → "SLOT_DATE_INVALID"）。
 
-    `{}` 代表索引 0 沒有錯誤，索引 1 的 "date" 欄位有錯誤。
+    只有索引 1 的 "date" 欄位有錯誤，索引 0 成功、不出現在錯誤 dict 裡。
     """
-    exc = ValidationError({"slots": [{}, {"date": ["此為必需欄位。"]}]})
+    exc = ValidationError({"slots": {1: {"date": ["此為必需欄位。"]}}})
 
     response = custom_exception_handler(exc, {})
 

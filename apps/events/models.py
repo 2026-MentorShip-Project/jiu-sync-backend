@@ -74,7 +74,7 @@ class Event(models.Model):
 
 class ParticipantResponse(models.Model):
     """一位參與者對某場 :class:`Event` 的投票——暱稱＋手機末三碼雜湊＋選填
-    Email＋複選的候選時段。
+    Email／留言＋每個候選時段的三態表態（見 :class:`ParticipantResponseSlotAvailability`）。
 
     ``id`` 比照 ``Event.id`` 用短 id(重用同一個產生器),不用 UUID——與活動
     識別碼風格一致、URL 更短。``Meta.unique_together`` 保證同一活動下暱稱不可
@@ -92,7 +92,11 @@ class ParticipantResponse(models.Model):
     # 選填留言,長度上限比照 Event.final_note——目前只接受並儲存,尚無獨立的
     # 留言列表 API 讀取它(使用者已確認這是刻意分兩階段的範圍)。
     comment = models.CharField(max_length=200, null=True, blank=True)
-    slots = models.ManyToManyField(Slot, related_name="responses")
+    # 三態表態(available/if_needed/unavailable)需要在關聯本身多帶一個欄位,
+    # 改用帶 through model 的 M2M,見 design.md D4(2026-09-21 修訂)/D4a。
+    slots = models.ManyToManyField(
+        Slot, through="ParticipantResponseSlotAvailability", related_name="responses"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -101,6 +105,35 @@ class ParticipantResponse(models.Model):
 
     def __str__(self):
         return self.nickname
+
+
+class ParticipantResponseSlotAvailability(models.Model):
+    """``ParticipantResponse``＋``Slot`` 的 through model，多帶一個
+    ``availability`` 三態欄位。見 design.md D4a。
+
+    ``response``／``slot`` 皆 ``CASCADE``——投票或候選時段被刪除時，表態紀錄
+    一併清除，不留孤兒資料。``Meta.unique_together`` 保證同一參與者對同一
+    候選時段只有一筆表態。
+    """
+
+    class Availability(models.TextChoices):
+        AVAILABLE = "available"
+        IF_NEEDED = "if_needed"
+        UNAVAILABLE = "unavailable"
+
+    response = models.ForeignKey(
+        ParticipantResponse, on_delete=models.CASCADE, related_name="slot_availabilities"
+    )
+    slot = models.ForeignKey(
+        Slot, on_delete=models.CASCADE, related_name="response_availabilities"
+    )
+    availability = models.CharField(max_length=20, choices=Availability.choices)
+
+    class Meta:
+        unique_together = ("response", "slot")
+
+    def __str__(self):
+        return f"{self.response_id}:{self.slot_id}={self.availability}"
 
 
 class ParticipantResponseAccessToken(models.Model):

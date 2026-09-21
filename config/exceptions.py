@@ -83,20 +83,21 @@ FIELD_CODE_OVERRIDES = {
     ("phoneLastThree", "required"): "PHONE_LAST_THREE_REQUIRED",
     ("phoneLastThree", "blank"): "PHONE_LAST_THREE_REQUIRED",
     ("phoneLastThree", "invalid"): "PHONE_LAST_THREE_INVALID",
-    ("selectedSlotIds", "required"): "SELECTED_SLOTS_REQUIRED",
-    ("selectedSlotIds", "empty"): "SELECTED_SLOTS_REQUIRED",
-    ("selectedSlotIds", "invalid"): "SLOT_ID_INVALID",
+    ("slotAvailabilities", "required"): "SLOT_AVAILABILITIES_REQUIRED",
     ("email", "invalid"): "PARTICIPANT_EMAIL_INVALID",
     ("email", "blank"): "PARTICIPANT_EMAIL_INVALID",
     ("comment", "max_length"): "COMMENT_TOO_LONG",
 }
 
-# 巢狀陣列欄位（目前只有 `slots[].<subfield>`）的 code 對照——用子欄位名比對,
-# 不分是 DRF 的 required 還是 invalid，這個巢狀層級前端只要求一個 code。
+# 巢狀陣列欄位（`slots[].<subfield>`、`slotAvailabilities[].<subfield>`）的
+# code 對照——用子欄位名比對, 不分是 DRF 的 required 還是 invalid，這個巢狀
+# 層級前端只要求一個 code。
 NESTED_SUBFIELD_CODE_OVERRIDES = {
     "date": "SLOT_DATE_INVALID",
     "time": "SLOT_TIME_INVALID",
     "label": "SLOT_LABEL_TOO_LONG",
+    "slotId": "SLOT_ID_INVALID",
+    "availability": "AVAILABILITY_INVALID",
 }
 
 
@@ -144,19 +145,21 @@ def _build_errors(data):
     全部欄位，不只第一個。
 
     見 design.md D1/D2/D7。逐一走訪 `data` 的全部 key：
-    - 若該值是 list、且其中有非空 dict 元素（DRF 對 `many=True` 巢狀 serializer
-      產生的錯誤形狀，例如 `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各
-      自組成一筆 `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），
-      code 用 `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code
-      是 required 還是 invalid，這個巢狀層級前端只要求一個 code）
-    - 否則（一般欄位、或非 list 的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
+    - 若該值是 dict、且 key 全部是 int（DRF 對 `ChildSerializer(many=True)` 巢狀
+      serializer 產生的錯誤形狀，例如 `slots`/`slotAvailabilities`——實測確認
+      是「以索引為 key 的 dict」，不是原本以為的 list，add-participant-responses
+      的 code-review 紀錄有修正說明）→ 依索引展開，每個子欄位各自組成一筆
+      `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），code 用
+      `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code 是
+      required 還是 invalid，這個巢狀層級前端只要求一個 code）
+    - 否則（一般欄位、或巢狀但非索引 dict，例如 `{"parent": {"child": [...]}}`）
       → 沿用既有的遞迴找 leaf 邏輯，取第一則訊息，code 透過 `_resolve_field_code`
       查 `FIELD_CODE_OVERRIDES`
     """
     errors = []
     for field, value in data.items():
-        if isinstance(value, list) and any(isinstance(item, dict) and item for item in value):
-            for index, item in enumerate(value):
+        if isinstance(value, dict) and value and all(isinstance(k, int) for k in value):
+            for index, item in value.items():
                 if isinstance(item, dict) and item:
                     for subfield, sub_value in item.items():
                         detail = _find_leaf_detail(sub_value)

@@ -17,7 +17,7 @@ from config.exceptions import ApiError, Gone
 
 from .authentication import OptionalJWTAuthentication
 from .lifecycle import compute_display_status
-from .models import Event, ParticipantResponseAccessToken
+from .models import Event, ParticipantResponseAccessToken, ParticipantResponseSlotAvailability
 from .serializers import (
     EventCreateSerializer,
     EventDetailSerializer,
@@ -48,8 +48,8 @@ def _get_event_or_404(id, queryset=None):
     都不會用 ``EventDetailSerializer`` 序列化整筆活動,不需要 ``responses``。
     ``EventDetailView`` 的 ``GET``/``PATCH`` 都會回傳含 ``responses`` 欄位的
     ``EventDetailSerializer`` 結果,兩者都傳入客製化的
-    ``prefetch_related("responses__slots")`` queryset 換掉預設值(見
-    ``EventDetailSerializer.get_responses()``),避免 N+1;不影響其他呼叫端。
+    ``prefetch_related("responses__slot_availabilities")`` queryset 換掉預設值
+    (見 ``EventDetailSerializer.get_responses()``),避免 N+1;不影響其他呼叫端。
     """
     if queryset is None:
         queryset = Event.objects.select_related("owner", "final_slot")
@@ -64,12 +64,12 @@ def _get_event_or_404(id, queryset=None):
 def _event_with_responses_queryset():
     """``EventDetailView`` 的 ``GET``/``PATCH`` 共用——兩者都回傳含
     ``responses`` 欄位的 ``EventDetailSerializer`` 結果,都需要
-    ``prefetch_related("responses__slots")`` 避免 N+1(見
+    ``prefetch_related("responses__slot_availabilities")`` 避免 N+1(見
     ``EventDetailSerializer.get_responses()``),抽成共用函式避免兩處各自重複
     一次一模一樣的 queryset 組合。
     """
     return Event.objects.select_related("owner", "final_slot").prefetch_related(
-        "responses__slots"
+        "responses__slot_availabilities"
     )
 
 
@@ -315,9 +315,12 @@ class ParticipantResponseVerifyView(APIView):
                 "expiresAt": expires_at,
                 "nickname": participant_response.nickname,
                 "email": participant_response.email,
-                "selectedSlotIds": [
-                    str(slot_id)
-                    for slot_id in participant_response.slots.values_list("id", flat=True)
+                "slotAvailabilities": [
+                    {
+                        "slotId": str(availability.slot_id),
+                        "availability": availability.availability,
+                    }
+                    for availability in participant_response.slot_availabilities.all()
                 ],
             },
             status=status.HTTP_200_OK,
@@ -376,7 +379,7 @@ class ParticipantResponseDetailView(APIView):
             data=request.data, context={"event": event}
         )
         serializer.is_valid(raise_exception=True)
-        slot_ids = serializer.validated_data["selectedSlotIds"]
+        availabilities = serializer.validated_data["slotAvailabilities"]
 
         participant_response = token_record.response
         with transaction.atomic():
@@ -401,12 +404,31 @@ class ParticipantResponseDetailView(APIView):
                     code="ACCESS_TOKEN_INVALID",
                     status_code=401,
                 )
-            participant_response.slots.set(slot_ids)
+            # 每次更新都是完整覆蓋(design.md D4 2026-09-21 修訂③,請求本身
+            # 已由 serializer 驗證涵蓋該活動全部候選時段、恰好各一次)——先刪
+            # 除既有表態列、再整批重建,比逐筆 update_or_create 簡單,不用比對
+            # 哪些筆要新增/更新/刪除,見 design.md D4a。
+            ParticipantResponseSlotAvailability.objects.filter(
+                response=participant_response
+            ).delete()
+            ParticipantResponseSlotAvailability.objects.bulk_create(
+                [
+                    ParticipantResponseSlotAvailability(
+                        response=participant_response,
+                        slot_id=item["slotId"],
+                        availability=item["availability"],
+                    )
+                    for item in availabilities
+                ]
+            )
 
         return Response(
             {
                 "id": str(participant_response.id),
-                "selectedSlotIds": [str(slot_id) for slot_id in slot_ids],
+                "slotAvailabilities": [
+                    {"slotId": str(item["slotId"]), "availability": item["availability"]}
+                    for item in availabilities
+                ],
             },
             status=status.HTTP_200_OK,
         )

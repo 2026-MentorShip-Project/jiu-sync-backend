@@ -9,7 +9,7 @@ from rest_framework import serializers
 from config.exceptions import ApiError
 
 from .lifecycle import compute_display_status
-from .models import Event, ParticipantResponse, Slot
+from .models import Event, ParticipantResponse, ParticipantResponseSlotAvailability, Slot
 
 HOST_NICKNAME_MAX_WEIGHTED_LENGTH = 40
 MIN_SLOTS = 1
@@ -24,15 +24,39 @@ PARTICIPANT_RESPONSE_ID_COLLISION_MAX_ATTEMPTS = 3
 PHONE_LAST_THREE_RE = re.compile(r"^\d{3}$", re.ASCII)
 
 
-def _validate_candidate_slot_ids(value, event):
-    """驗證 ``selectedSlotIds`` 內每個 slot id 皆屬於指定活動,查到任一不屬於
-    則拋 ``SLOT_NOT_FOUND``。``ParticipantResponseCreateSerializer``/
-    ``ParticipantResponsePatchSerializer`` 的 ``validate_selectedSlotIds`` 共用
-    同一份檢查邏輯,避免兩處各寫一次容易不一致。"""
-    valid_slot_ids = set(event.slots.values_list("id", flat=True))
-    if any(slot_id not in valid_slot_ids for slot_id in value):
+class SlotAvailabilityInputSerializer(serializers.Serializer):
+    """``slotAvailabilities`` 陣列裡單筆表態:``{slotId, availability}``。
+    ``ParticipantResponseCreateSerializer``/``ParticipantResponsePatchSerializer``
+    共用同一份巢狀格式(見 design.md D4 2026-09-21 修訂)。"""
+
+    slotId = serializers.UUIDField()
+    availability = serializers.ChoiceField(
+        choices=ParticipantResponseSlotAvailability.Availability.values
+    )
+
+
+def _validate_slot_availabilities(value, event):
+    """驗證 ``slotAvailabilities``:每個 ``slotId`` 皆屬於指定活動、且該活動
+    全部候選時段都必須恰好出現一次(不可缺漏、不可重複)——已與使用者確認
+    每次送出都是該活動候選時段的完整表態,不是部分更新(design.md D4 2026-09-21
+    修訂③)。``ParticipantResponseCreateSerializer``/
+    ``ParticipantResponsePatchSerializer`` 的 ``validate_slotAvailabilities``
+    共用同一份檢查邏輯,避免兩處各寫一次容易不一致。"""
+    event_slot_ids = set(event.slots.values_list("id", flat=True))
+    submitted_slot_ids = [item["slotId"] for item in value]
+    submitted_slot_id_set = set(submitted_slot_ids)
+
+    if not submitted_slot_id_set.issubset(event_slot_ids):
         raise serializers.ValidationError(
             "候選時段不存在於此活動", code="SLOT_NOT_FOUND"
+        )
+    if (
+        submitted_slot_id_set != event_slot_ids
+        or len(submitted_slot_ids) != len(event_slot_ids)
+    ):
+        raise serializers.ValidationError(
+            "每個候選時段都必須表態，且不可重複",
+            code="SLOT_AVAILABILITY_INCOMPLETE",
         )
     return value
 
@@ -198,9 +222,10 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
 
     Plain ``Serializer``(不是 ``ModelSerializer``)——``phoneLastThree`` 需要
     先雜湊才能寫入 ``ParticipantResponse.phone_last_three_hash``,
-    ``selectedSlotIds`` 對應的是 M2M 關聯而非單一 model 欄位,兩者都不適合用
-    ``source=`` 直接映射。View 呼叫時須帶入 ``context={"event": event}``,
-    ``validate_selectedSlotIds`` 用來確認候選時段確實屬於該活動。
+    ``slotAvailabilities`` 對應的是帶額外欄位的 M2M 關聯而非單一 model 欄位,
+    兩者都不適合用 ``source=`` 直接映射。View 呼叫時須帶入
+    ``context={"event": event}``,``validate_slotAvailabilities`` 用來確認
+    候選時段確實屬於該活動、且每個時段都恰好表態一次。
     """
 
     nickname = serializers.CharField(max_length=40)
@@ -212,9 +237,13 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
     comment = serializers.CharField(
         required=False, allow_null=True, allow_blank=True, max_length=200, default=None
     )
-    selectedSlotIds = serializers.ListField(
-        child=serializers.UUIDField(), allow_empty=False
-    )
+    # ``ChildSerializer(many=True)``——實測 DRF 對這種寫法的巢狀驗證錯誤形狀是
+    # 「以索引為 key 的 dict」(``{0: {"slotId": [...]}}``),不是原本以為的
+    # list。``config/exceptions.py`` 的 ``_build_errors`` 已對照這個真實形狀
+    # 展開成 ``slotAvailabilities[0].slotId`` 這種巢狀欄位路徑,沿用
+    # ``EventCreateSerializer.slots`` 同一種寫法(見 add-participant-responses
+    # 的 code-review 紀錄——這個形狀誤解連帶修正了 slots[] 既有的同款 bug)。
+    slotAvailabilities = SlotAvailabilityInputSerializer(many=True)
 
     def validate_nickname(self, value):
         trimmed = value.strip()
@@ -229,13 +258,13 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
     def validate_phoneLastThree(self, value):
         return _validate_phone_last_three_format(value)
 
-    def validate_selectedSlotIds(self, value):
-        return _validate_candidate_slot_ids(value, self.context["event"])
+    def validate_slotAvailabilities(self, value):
+        return _validate_slot_availabilities(value, self.context["event"])
 
     def create(self, validated_data):
         event = self.context["event"]
         nickname = validated_data["nickname"]
-        slot_ids = validated_data["selectedSlotIds"]
+        availabilities = validated_data["slotAvailabilities"]
         phone_last_three_hash = make_password(validated_data["phoneLastThree"])
         comment = validated_data.get("comment") or None
 
@@ -253,7 +282,16 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
                         email=validated_data.get("email"),
                         comment=comment,
                     )
-                    response.slots.set(slot_ids)
+                    ParticipantResponseSlotAvailability.objects.bulk_create(
+                        [
+                            ParticipantResponseSlotAvailability(
+                                response=response,
+                                slot_id=item["slotId"],
+                                availability=item["availability"],
+                            )
+                            for item in availabilities
+                        ]
+                    )
                 return response
             except IntegrityError:
                 if ParticipantResponse.objects.filter(
@@ -291,7 +329,7 @@ class ParticipantResponsePatchSerializer(serializers.Serializer):
     """``PATCH /api/events/{id}/responses/{responseId}`` 請求 body — 參與者
     更新投票的候選時段。
 
-    只宣告 ``selectedSlotIds``——``nickname``/``email``/``phoneLastThree`` 刻意
+    只宣告 ``slotAvailabilities``——``nickname``/``email``/``phoneLastThree`` 刻意
     不宣告,即使請求 body 帶了這些 key,DRF 只讀取已宣告欄位,不會被採信,沿用
     專案既有「未宣告欄位自動被忽略」慣例(見 ``EventPatchSerializer`` 同款寫
     法)。``accessToken`` 也不在這裡宣告——存取憑證的驗證屬於認證/授權範疇
@@ -299,15 +337,16 @@ class ParticipantResponsePatchSerializer(serializers.Serializer):
     ``responseId``),不是『這次要改成什麼』的資料驗證,兩者關注點不同,改由
     view 層(``ParticipantResponseDetailView.patch()``)直接讀 ``request.data``
     處理。View 呼叫時須帶入 ``context={"event": event}``,供
-    ``validate_selectedSlotIds`` 確認候選時段確實屬於該活動。
+    ``validate_slotAvailabilities`` 確認候選時段確實屬於該活動、且每個時段
+    都恰好表態一次(每次更新都是完整覆蓋,見 design.md D4 2026-09-21 修訂③)。
     """
 
-    selectedSlotIds = serializers.ListField(
-        child=serializers.UUIDField(), allow_empty=False
-    )
+    # 見 ParticipantResponseCreateSerializer 對應欄位的說明——``many=True`` 的
+    # 巢狀驗證錯誤形狀是「以索引為 key 的 dict」，被 `_build_errors` 正確展開。
+    slotAvailabilities = SlotAvailabilityInputSerializer(many=True)
 
-    def validate_selectedSlotIds(self, value):
-        return _validate_candidate_slot_ids(value, self.context["event"])
+    def validate_slotAvailabilities(self, value):
+        return _validate_slot_availabilities(value, self.context["event"])
 
 
 class SlotSerializer(serializers.ModelSerializer):
@@ -391,16 +430,21 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         return event.host_email
 
     def get_responses(self, event):
-        # D8:只回傳 nickname/selectedSlotIds,刻意不含 phoneLastThree(含雜湊)
-        # /email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。
-        # view 端(EventDetailView.get())已 prefetch_related("responses__slots"),
-        # 這裡用 .all() 走的是 prefetch cache,不會額外觸發 query。
+        # D8:只回傳 nickname/slotAvailabilities,刻意不含 phoneLastThree(含雜湊)
+        # /email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。三態表態
+        # 見 design.md D4/D8(2026-09-21 修訂)。view 端(_event_with_responses_queryset())
+        # 已 prefetch_related("responses__slot_availabilities"),這裡用 .all()
+        # 走的是 prefetch cache,不會額外觸發 query。
         return [
             {
                 "id": participant_response.id,
                 "nickname": participant_response.nickname,
-                "selectedSlotIds": [
-                    str(slot.id) for slot in participant_response.slots.all()
+                "slotAvailabilities": [
+                    {
+                        "slotId": str(availability.slot_id),
+                        "availability": availability.availability,
+                    }
+                    for availability in participant_response.slot_availabilities.all()
                 ],
             }
             for participant_response in event.responses.all()

@@ -31,9 +31,21 @@
 
 `POST .../verify` 核對失敗時，不論是「該活動下查無此暱稱」或「暱稱存在但手機末三碼不符」，一律回同一個 401 `IDENTITY_VERIFICATION_FAILED`，避免錯誤訊息本身變成一個「暱稱是否存在」的 side channel——不然攻擊者能用回應差異窮舉出活動內所有暱稱，再針對確定存在的暱稱窮舉手機碼。
 
-### D4. 候選時段複選：`ParticipantResponse.slots` 為 `ManyToManyField(Slot)`，不建獨立 through model
+### D4. 候選時段改採三態表態（`available`/`if_needed`/`unavailable`），`ParticipantResponse.slots` 改為帶 through model 的 M2M
 
-複選，且沒有「每個關聯本身還要帶額外欄位」的需求（不像 `Slot` 相對 `Event` 需要 `date`/`time`/`label`），plain `ManyToManyField` 讓 Django 自動建中介表即可，不需要手動定義 through model 增加複雜度。
+第一版決策（已作廢，原文見下方存檔）：候選時段複選，`ParticipantResponse.slots` 用 plain `ManyToManyField(Slot)`，不建 through model。
+
+> **修訂記錄（2026-09-21）**：使用者事後明確要求改為三態表態，不是二元複選——每個候選時段都要能表達「可以」／「勉強可以」／「沒辦法」三種狀態，不是只有「選了」或「沒選」。這代表關聯本身需要額外欄位（`availability`），plain `ManyToManyField` 不夠用，改成帶 `through="ParticipantResponseSlotAvailability"` 的 M2M。已透過 AskUserQuestion 確認四個關鍵點：① enum 字串值採 `available`/`if_needed`/`unavailable`（英文 snake_case，跟既有 `mode` 欄位命名風格一致）；② request body 用物件陣列 `[{slotId, availability}, ...]`（不用 `{slotId: availability}` 對照表）；③ 每次送出（初次投票／更新投票）都必須涵蓋該活動**全部**候選時段、每個恰好一次，不可省略也不可重複——省略不視為預設某個狀態，直接拒絕整筆請求；④ `GET /api/events/{id}` 的彙整頁（D8）一併顯示三態，不是只有「有選/沒選」。
+>
+> 欄位命名同步從 `selectedSlotIds`（純 id 陣列）改為 `slotAvailabilities`（帶狀態的物件陣列）——舊名稱在新結構下會誤導（不再只是「有被選中的 id 清單」），沿用「陣列元素是完整表態」的新語意重新命名，屬於這次結構改動的自然結果，非獨立決策。
+>
+> **原第一版理由（存檔）**：複選，且當時判斷沒有「每個關聯本身還要帶額外欄位」的需求（不像 `Slot` 相對 `Event` 需要 `date`/`time`/`label`），plain `ManyToManyField` 讓 Django 自動建中介表即可。這個判斷在三態需求出現後不再成立。
+
+### D4a. `ParticipantResponseSlotAvailability`：新增 through model，`unique_together (response, slot)` 保證同一參與者對同一時段只有一筆表態
+
+`response`／`slot` 兩個 FK 皆 `CASCADE`（參與者投票或候選時段被刪除時，表態紀錄一併清除，不留孤兒資料）。`availability` 為 `CharField(choices=...)`，三態存字串值（`available`/`if_needed`/`unavailable`），不用獨立的 `TextChoices` 拆成三個 boolean 欄位——三態本質上是單一維度的列舉，一個欄位比三個互斥 boolean 欄位更不容易出現「三個欄位同時為 true」這種不合法狀態。
+
+寫入策略：初次投票（`create()`）用 `bulk_create` 一次寫入全部表態列；更新投票（`PATCH`）用「先刪除該筆投票既有的全部表態列、再 `bulk_create` 新的一批」，不用逐筆 `update_or_create`——請求本身要求每次都是全量覆蓋（見 D4 修訂記錄③），先刪後建邏輯簡單、不用比對哪些筆要新增/更新/刪除，且整段包在 `transaction.atomic()` 內，失敗會整個回滾。
 
 ### D5. 暱稱唯一性：trim 後精確比對（大小寫敏感），DB 層 `unique_together (event, nickname)` 保證並發安全
 
@@ -55,9 +67,11 @@
 
 情境是同一參與者自己用同一組暱稱＋手機末三碼登入修改，不是多人協作同一筆投票，衝突機率低、後果輕（頂多蓋掉自己剛剛另一個分頁的修改）。比照 `add-event-patch` D5 的既有先例。
 
-### D8. `GET /api/events/{id}` 的 `responses` 回傳每筆投票的 `nickname`＋`selectedSlotIds`，不含 `phoneLastThree`/`email`
+### D8. `GET /api/events/{id}` 的 `responses` 回傳每筆投票的 `nickname`＋`slotAvailabilities`（三態），不含 `phoneLastThree`/`email`
 
 已與使用者確認唯讀彙整頁要列出「誰投了什麼」，不是純數字統計。`phoneLastThree`（即使是雜湊）與 `email` 屬於參與者的聯絡資訊，不對外（含其他參與者）公開，只在後端驗證流程內部使用。前端若要算「每個時段幾票」，可自行從這份列表 reduce，不需要後端另外算一份 `voteCount`。
+
+> **修訂記錄（2026-09-21）**：`selectedSlotIds`（純 id 陣列）改為 `slotAvailabilities`（`[{slotId, availability}, ...]`），跟隨 D4 的三態表態改動——彙整頁一併顯示每位參與者對每個時段的明確狀態（`available`/`if_needed`/`unavailable`），不是只有「有選/沒選」的二元資訊，已與使用者確認這是本次三態需求的必要延伸，不留到未來 change。
 
 ### D10. `VOTING_CLOSED` 統一回 409（曾短暫讓 `POST .../responses` 單獨回 400，已改回）
 
@@ -82,6 +96,12 @@ Codex 二次審查抓到：`patch()` 開頭的早期檢查（token 是否存在�
 ### D14. `selectedSlotIds` 元素非合法 UUID 字串時，補上 `SLOT_ID_INVALID` 語意化 code
 
 用實際請求測試畸形 request body 時發現：`selectedSlotIds` 送入非 UUID 字串的元素（例如舊版三態 `{"id":..., "availability":...}` 物件格式），DRF `UUIDField` 產生的原始 `.code` 是 `"invalid"`，但 `FIELD_CODE_OVERRIDES` 只對照了 `selectedSlotIds` 的 `required`/`empty`，漏了 `invalid`，導致回應 `code: "invalid"`（未語意化，前端拿不到穩定字串）。已與使用者確認補上 `("selectedSlotIds", "invalid"): "SLOT_ID_INVALID"`——`ParticipantResponseCreateSerializer`/`ParticipantResponsePatchSerializer` 的 `selectedSlotIds` 欄位名相同，同一張表對照即可涵蓋兩支端點，不需分別處理。
+
+### D15. Squash migration 後，已跑過舊 migration 的本地 dev DB 需手動修復（code-review 發現）
+
+三態改版把 task 1-6 已 commit 的 4 個 migration（0003-0006）刪除重建成單一乾淨 0003（見 D4a）。code-review 抓到：Django migration 的套用記錄（`django_migrations` 表）只認檔名，不認內容。本地開發用的 Postgres 在改版前已經跑過舊版 `0003_participantresponse`／`0004_participantresponseaccesstoken`，`migrate` 因此不會重跑新內容的 0003，導致實際 schema 停留在舊版（缺 `ParticipantResponseSlotAvailability` through table、缺 `comment` 欄位），且留下孤兒表 `events_participantresponse_slots`（舊版 plain M2M 自動產生的中介表）。
+
+已實測確認本地 dev DB 確實中招（`\dt events_*` 只看到舊表、無 through table）。修法：手動 `DROP TABLE` 孤兒表與內容不符的舊表，並從 `django_migrations` 刪除對應的 `0003_participantresponse`／`0004_participantresponseaccesstoken` 記錄，重跑 `migrate events` 讓新版 migration 真正套用；修復後重新跑過完整測試套件（161 個測試全綠，`ruff`/`manage.py check`/`makemigrations --check` 皆乾淨）確認無殘留影響。pytest 用的 test DB 每次從 migration 檔案全新建立，不受影響，只有已存在的持久化資料庫（本地 dev）會中招。因為此分支尚未合併到 main/develop、也沒有其他協作者已 pull 這個 squash 前的版本，影響範圍僅限這台機器的本地 dev DB，不需要額外的遷移腳本或文件通知其他人。
 
 ## Risks / Trade-offs
 

@@ -37,3 +37,44 @@
 - [x] 6.1 `ParticipantResponse` 新增 `comment`（CharField，max_length=200，null/blank）欄位與 migration；`ParticipantResponseCreateSerializer` 新增 `comment`（選填，`allow_blank=True`，空字串正規化成 `None`）；`validate_nickname` 新增與 `event.host_nickname` 精確比對（trim 後），相同時拒絕並回 `NICKNAME_CONFLICTS_WITH_HOST`；`_check_participation_preconditions` 新增 `voting_closed_status_code` 參數（預設 409），`ParticipantResponseCreateView` 傳入 400；`config/exceptions.py` 補 `("comment", "max_length")`。補測試：留言可正常儲存／不帶留言為 null／空字串留言正規化為 null／超長 400 `COMMENT_TOO_LONG`；暱稱與主揪暱稱相同（含 trim 後相同）→ 400 `NICKNAME_CONFLICTS_WITH_HOST`；投票已截止 → 400（不是 409）`VOTING_CLOSED`，且更新既有兩則因暱稱誤撞新規則而失敗的測試（碰撞重試、不同暱稱不誤觸發重試）改用不會與主揪暱稱衝突的測試暱稱。`verify`/`PATCH` 兩支端點的 `VOTING_CLOSED` 測試維持 409，未受影響 — (auto) `pytest`（全套 154 passed）、`ruff check`、`manage.py check` 皆乾淨
 - [x] 6.2 使用者確認 `VOTING_CLOSED` 統一改回 409（撤回 6.1 的 400 不對稱）：移除 `voting_closed_status_code` 參數，`_check_participation_preconditions` 固定回 409；同步修正 spec.md/測試。另外處理 Codex 二次審查兩項發現（design.md D13）：① `PATCH .../responses/{responseId}` 的 token compare-and-swap 補上 `expires_at__gt=<CAS 當下重新取得的 now>`，修掉早期檢查與真正消費之間的極短空檔可能讓過期 token 仍成功消費的落差，補一則用真實時間流逝（人為延遲注入）驗證的測試，修正前先確認會 FAIL；② `ParticipantResponseAccessToken` 無清除策略記入 design.md Risks，非本次 blocker，不動程式碼 — (auto) `pytest`（全套 155 passed）、`ruff check`、`manage.py check` 皆乾淨
 - [x] 6.3 用真實請求實測畸形 request body 時發現：`selectedSlotIds` 元素非合法 UUID 字串 → 回應 `code: "invalid"`（DRF 原始碼，未語意化）。已與使用者確認補上 `FIELD_CODE_OVERRIDES` 的 `("selectedSlotIds", "invalid"): "SLOT_ID_INVALID"`（同時涵蓋 create／patch 兩支端點，欄位名相同）；`POST .../responses`、`PATCH .../responses/{responseId}` 各補一則測試（RED 先確認會拿到未對照的 `"invalid"`，補表後轉綠）；spec.md 兩個 Requirement 補上 `SLOT_ID_INVALID` 的 Scenario 與修訂記錄（design.md D14）— (auto) `pytest`（全套 157 passed）、`ruff check`、`manage.py check` 皆乾淨
+
+## 7. commit 後追加需求（候選時段改三態表態，design.md D4 2026-09-21 修訂／D4a）
+
+> 使用者事後明確要求候選時段從二元複選改為 `available`/`if_needed`/`unavailable`
+> 三態，取代 task 1-6 已完成並 commit 的二元複選設計——已透過 AskUserQuestion
+> 確認四個關鍵決策點（enum 命名、body 結構、是否須涵蓋全部候選時段、GET 彙整頁
+> 是否跟著改),詳見 design.md D4/D4a。
+
+- [x] 7.1 `ParticipantResponse.slots` 從 plain `ManyToManyField` 改為帶
+  `through="ParticipantResponseSlotAvailability"` 的 M2M；新增
+  `ParticipantResponseSlotAvailability` model（`response`/`slot` FK 皆
+  CASCADE，`availability` CharField choices，`unique_together (response,
+  slot)`）。因 Django 不支援 plain M2M 直接 `AlterField` 成帶 through 的 M2M
+  （schema editor 會拋 `ValueError: ... not compatible types`），刪除
+  task 1-6 累積的 4 個舊 migration（0003-0006，皆未合併到 main/develop、只存在
+  這條未合併的 feature branch），重新產生單一乾淨的 migration。三支序列化器
+  （create/verify/patch）與 `GET` 的 `get_responses()` 全數改用
+  `slotAvailabilities: [{slotId, availability}, ...]`（新增
+  `SlotAvailabilityInputSerializer`、共用的 `_validate_slot_availabilities`
+  同時檢查「屬於該活動」與「恰好涵蓋全部候選時段各一次」）；PATCH 的寫入策略
+  改為「先刪除該筆投票既有的全部表態列、再整批重建」。`config/exceptions.py`
+  新增 `SLOT_AVAILABILITIES_REQUIRED`／`SLOT_ID_INVALID`／`AVAILABILITY_INVALID`
+  對照。改寫全部受影響測試（helper `_create_participant_response`/
+  `_response_payload` 改參數化支援三態；新增 exhaustiveness 相關測試：缺漏
+  時段、重複時段、`availability` 非法值）— (auto) `pytest`（全套 161
+  passed）、`ruff check`、`manage.py check`、`makemigrations --check
+  --dry-run` 皆乾淨
+- [x] 7.2 過程中發現並修正兩個非預期的既有/新落差：① `config/exceptions.py`
+  的 `_build_errors` 對「`ChildSerializer(many=True)` 巢狀驗證錯誤」的形狀
+  假設錯誤——原本以為是 list（成功索引補空 dict 佔位），實測確認 DRF 3.18
+  實際回傳的是「以索引為 key 的 dict、只有失敗索引才出現」，導致這條巢狀
+  code 對照（`slots[].date` 等）自 `add-events-api` 以來從未真的生效過，一律
+  fallback 成 DRF 原始 code；修正判斷條件，補回歸測試證明
+  `slots[0].label` 現在真的能拿到 `SLOT_LABEL_TOO_LONG`，並修正
+  `config/tests/test_exceptions.py` 裡一則用同款錯誤假設手寫的測試 fixture。
+  ② `test_participant_can_submit_first_vote_successfully` 用
+  `event.slots.first()` 在已呼叫 `_add_slot()` 新增第二個 slot 之後才取值，
+  `Slot.id` 是 UUID、`.first()` 無 `order_by` 時不保證回傳最初建立的那筆，
+  導致測試偶發真正選到兩個「不同名字、相同 id」的 slot（重複 id 被新的
+  exhaustiveness 檢查攔下）——改成在新增第二個 slot 之前先取值 — (auto)
+  `pytest`（全套 161 passed）皆乾淨

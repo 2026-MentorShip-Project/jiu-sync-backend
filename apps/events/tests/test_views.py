@@ -18,7 +18,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import User
 from apps.events.ids import generate_short_id
-from apps.events.models import Event, ParticipantResponse, ParticipantResponseAccessToken, Slot
+from apps.events.models import (
+    Event,
+    ParticipantResponse,
+    ParticipantResponseAccessToken,
+    ParticipantResponseSlotAvailability,
+    Slot,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -281,6 +287,26 @@ def test_slot_label_over_100_chars_returns_400():
     assert Event.objects.count() == 0
 
 
+def test_slot_label_over_100_chars_error_has_nested_semantic_code():
+    """code-review 補充:確認上一則測試的 400 回應,`errors[]` 裡巢狀欄位
+    `slots[0].label` 的 code 真的是語意化的 SLOT_LABEL_TOO_LONG,不是未對照的
+    DRF 原始碼——`config/exceptions.py::_build_errors` 原本誤判
+    `ChildSerializer(many=True)` 的巢狀驗證錯誤形狀是 list,實際是以索引為
+    key 的 dict,這條巢狀 code 對照從未真的生效過(add-participant-responses
+    的 code-review 修正)。"""
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(slots=[{"date": "2026-10-01", "label": "a" * 101}])
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    matching = [e for e in body["errors"] if e["field"] == "slots[0].label"]
+    assert len(matching) == 1
+    assert matching[0]["code"] == "SLOT_LABEL_TOO_LONG"
+
+
 @override_settings(FRONTEND_BASE_URL="https://example.com/")
 def test_share_url_has_no_double_slash_when_frontend_base_url_has_trailing_slash():
     """⑩ FRONTEND_BASE_URL 帶結尾斜線(例如 "https://example.com/")→ 組出的
@@ -524,7 +550,18 @@ def test_event_detail_responses_field_is_empty_list_when_no_votes():
     assert response.json()["responses"] == []
 
 
-def _create_participant_response(event, nickname, slots, **overrides):
+def _create_participant_response(event, nickname, availabilities, **overrides):
+    """建立一筆 ``ParticipantResponse`` 及其時段表態,直接走 ORM(不經過
+    serializer,不受「必須表態該活動全部候選時段」的 API 層驗證限制,見
+    design.md D4 2026-09-21 修訂)。
+
+    ``availabilities``:
+    - dict ``{slot: "available"/"if_needed"/"unavailable", ...}``——明確指定
+      每個時段的表態,測試需要驗證三態細節時用這個形式。
+    - ``Slot`` 物件的可迭代(list/tuple)——簡化寫法,每個時段都視為
+      ``"available"``,多數測試只關心「這位參與者有標記這個時段」,不需要
+      三態細節。
+    """
     defaults = {
         "event": event,
         "nickname": nickname,
@@ -533,18 +570,37 @@ def _create_participant_response(event, nickname, slots, **overrides):
     }
     defaults.update(overrides)
     participant_response = ParticipantResponse.objects.create(**defaults)
-    participant_response.slots.set(slots)
+    if isinstance(availabilities, dict):
+        items = list(availabilities.items())
+    else:
+        items = [
+            (slot, ParticipantResponseSlotAvailability.Availability.AVAILABLE)
+            for slot in availabilities
+        ]
+    ParticipantResponseSlotAvailability.objects.bulk_create(
+        [
+            ParticipantResponseSlotAvailability(
+                response=participant_response, slot=slot, availability=availability
+            )
+            for slot, availability in items
+        ]
+    )
     return participant_response
 
 
 def test_event_detail_responses_field_contains_real_votes():
-    """① 活動有 2 筆投票 → responses 陣列含 2 筆,各自 nickname/selectedSlotIds 正確。"""
+    """① 活動有 2 筆投票 → responses 陣列含 2 筆,各自 nickname/slotAvailabilities
+    正確(三態)。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_1 = event.slots.first()
     slot_2 = Slot.objects.create(event=event, date="2026-10-02")
-    response_1 = _create_participant_response(event, "小華", [slot_1, slot_2])
-    response_2 = _create_participant_response(event, "小美", [slot_2])
+    response_1 = _create_participant_response(
+        event, "小華", {slot_1: "available", slot_2: "if_needed"}
+    )
+    response_2 = _create_participant_response(
+        event, "小美", {slot_1: "unavailable", slot_2: "available"}
+    )
     client = APIClient()
 
     response = client.get(_detail_url(event.id))
@@ -555,12 +611,15 @@ def test_event_detail_responses_field_contains_real_votes():
     by_id = {item["id"]: item for item in body["responses"]}
     assert set(by_id.keys()) == {response_1.id, response_2.id}
     assert by_id[response_1.id]["nickname"] == "小華"
-    assert set(by_id[response_1.id]["selectedSlotIds"]) == {
-        str(slot_1.id),
-        str(slot_2.id),
-    }
+    assert {
+        (item["slotId"], item["availability"])
+        for item in by_id[response_1.id]["slotAvailabilities"]
+    } == {(str(slot_1.id), "available"), (str(slot_2.id), "if_needed")}
     assert by_id[response_2.id]["nickname"] == "小美"
-    assert by_id[response_2.id]["selectedSlotIds"] == [str(slot_2.id)]
+    assert {
+        (item["slotId"], item["availability"])
+        for item in by_id[response_2.id]["slotAvailabilities"]
+    } == {(str(slot_1.id), "unavailable"), (str(slot_2.id), "available")}
 
 
 def test_event_detail_responses_field_does_not_leak_phone_or_email():
@@ -577,7 +636,7 @@ def test_event_detail_responses_field_does_not_leak_phone_or_email():
     body = response.json()
     assert len(body["responses"]) == 1
     item = body["responses"][0]
-    assert set(item.keys()) == {"id", "nickname", "selectedSlotIds"}
+    assert set(item.keys()) == {"id", "nickname", "slotAvailabilities"}
     assert "phoneLastThree" not in item
     assert "email" not in item
 
@@ -974,6 +1033,20 @@ def _response_payload(**overrides):
     return payload
 
 
+def _slot_availabilities(available=(), if_needed=(), unavailable=()):
+    """組出 ``slotAvailabilities`` 請求陣列,依語意分類要表態的 slot id——
+    三態需求(design.md D4 2026-09-21 修訂)要求每次送出都涵蓋該活動全部候選
+    時段,呼叫端需自行確保三個分類合計等於該活動的候選時段總數。"""
+    items = []
+    for slot_id in available:
+        items.append({"slotId": str(slot_id), "availability": "available"})
+    for slot_id in if_needed:
+        items.append({"slotId": str(slot_id), "availability": "if_needed"})
+    for slot_id in unavailable:
+        items.append({"slotId": str(slot_id), "availability": "unavailable"})
+    return items
+
+
 def _patch_participant_response_id_default(monkeypatch, fake):
     """設定 ``ParticipantResponse.id`` 欄位的 ``default``,理由同
     ``_patch_event_id_default``(Django 把解析後的 default getter 快取在
@@ -989,13 +1062,20 @@ def test_participant_can_submit_first_vote_successfully():
     且能透過 check_password 驗證回原始輸入。"""
     owner = _create_user()
     event = _create_event(owner)
+    # slot_1 須在 _add_slot 之前取得——Slot.id 是 UUID,.first() 沒有明確
+    # order_by 時不保證回傳最初建立的那筆,活動有 2 個以上 slot 時才會露餡
+    # (測到 duplicate slotId 觸發 SLOT_AVAILABILITY_INCOMPLETE 才發現這個既有
+    # fixture 寫法的潛在 flaky 點)。
+    slot_1 = event.slots.first()
     slot_2 = _add_slot(event)
     client = APIClient()
-    slot_ids = [str(event.slots.first().id), str(slot_2.id)]
+    slot_ids = [str(slot_1.id), str(slot_2.id)]
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=slot_ids),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=slot_ids)
+        ),
         format="json",
     )
 
@@ -1013,6 +1093,9 @@ def test_participant_can_submit_first_vote_successfully():
     assert set(str(s) for s in participant_response.slots.values_list("id", flat=True)) == set(
         slot_ids
     )
+    assert set(
+        participant_response.slot_availabilities.values_list("availability", flat=True)
+    ) == {"available"}
 
 
 def test_participant_vote_without_email_is_allowed():
@@ -1020,7 +1103,9 @@ def test_participant_vote_without_email_is_allowed():
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
-    payload = _response_payload(selectedSlotIds=[str(event.slots.first().id)])
+    payload = _response_payload(
+        slotAvailabilities=_slot_availabilities(available=[event.slots.first().id])
+    )
     del payload["email"]
 
     response = client.post(_responses_url(event.id), payload, format="json")
@@ -1036,7 +1121,10 @@ def test_participant_vote_blank_email_returns_400_with_semantic_code():
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
-    payload = _response_payload(email="", selectedSlotIds=[str(event.slots.first().id)])
+    payload = _response_payload(
+        email="",
+        slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+    )
 
     response = client.post(_responses_url(event.id), payload, format="json")
 
@@ -1054,7 +1142,10 @@ def test_participant_vote_nickname_conflicts_with_host_nickname_returns_400():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小明", selectedSlotIds=[str(event.slots.first().id)]),
+        _response_payload(
+            nickname="小明",
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+        ),
         format="json",
     )
 
@@ -1073,7 +1164,8 @@ def test_participant_vote_nickname_conflicts_with_host_nickname_after_trim_retur
     response = client.post(
         _responses_url(event.id),
         _response_payload(
-            nickname="  小明  ", selectedSlotIds=[str(event.slots.first().id)]
+            nickname="  小明  ",
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
         ),
         format="json",
     )
@@ -1092,7 +1184,8 @@ def test_participant_vote_with_comment_is_stored():
     response = client.post(
         _responses_url(event.id),
         _response_payload(
-            comment="期待這次揪團！", selectedSlotIds=[str(event.slots.first().id)]
+            comment="期待這次揪團！",
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
         ),
         format="json",
     )
@@ -1111,7 +1204,9 @@ def test_participant_vote_without_comment_stores_null():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id])
+        ),
         format="json",
     )
 
@@ -1129,7 +1224,10 @@ def test_participant_vote_blank_comment_stores_null():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(comment="", selectedSlotIds=[str(event.slots.first().id)]),
+        _response_payload(
+            comment="",
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+        ),
         format="json",
     )
 
@@ -1147,7 +1245,8 @@ def test_participant_vote_comment_over_200_chars_returns_400():
     response = client.post(
         _responses_url(event.id),
         _response_payload(
-            comment="a" * 201, selectedSlotIds=[str(event.slots.first().id)]
+            comment="a" * 201,
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
         ),
         format="json",
     )
@@ -1165,14 +1264,14 @@ def test_participant_vote_with_duplicate_nickname_returns_400():
     slot_id = str(event.slots.first().id)
     client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[slot_id]),
+        _response_payload(slotAvailabilities=_slot_availabilities(available=[slot_id])),
         format="json",
     )
     assert ParticipantResponse.objects.count() == 1
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[slot_id]),
+        _response_payload(slotAvailabilities=_slot_availabilities(available=[slot_id])),
         format="json",
     )
 
@@ -1189,13 +1288,18 @@ def test_participant_vote_with_duplicate_nickname_after_trim_returns_400():
     slot_id = str(event.slots.first().id)
     client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="小華", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="  小華  ", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="  小華  ",
+            slotAvailabilities=_slot_availabilities(available=[slot_id]),
+        ),
         format="json",
     )
 
@@ -1205,31 +1309,72 @@ def test_participant_vote_with_duplicate_nickname_after_trim_returns_400():
 
 
 def test_participant_vote_missing_required_fields_returns_400():
-    """⑤ 暱稱缺漏／手機末三碼缺漏／selectedSlotIds 空陣列 → 400 對應 code。"""
+    """⑤ 暱稱缺漏／手機末三碼缺漏／slotAvailabilities 缺漏 → 400 對應 code。"""
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
     slot_id = str(event.slots.first().id)
 
-    payload_without_nickname = _response_payload(selectedSlotIds=[slot_id])
+    payload_without_nickname = _response_payload(
+        slotAvailabilities=_slot_availabilities(available=[slot_id])
+    )
     del payload_without_nickname["nickname"]
     response = client.post(_responses_url(event.id), payload_without_nickname, format="json")
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert response.json()["code"] == "NICKNAME_REQUIRED"
 
-    payload_without_phone = _response_payload(selectedSlotIds=[slot_id])
+    payload_without_phone = _response_payload(
+        slotAvailabilities=_slot_availabilities(available=[slot_id])
+    )
     del payload_without_phone["phoneLastThree"]
     response = client.post(_responses_url(event.id), payload_without_phone, format="json")
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert response.json()["code"] == "PHONE_LAST_THREE_REQUIRED"
 
+    payload_without_slot_availabilities = _response_payload()
+    response = client.post(
+        _responses_url(event.id), payload_without_slot_availabilities, format="json"
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_AVAILABILITIES_REQUIRED"
+
+    assert ParticipantResponse.objects.count() == 0
+
+
+def test_participant_vote_slot_availabilities_incomplete_returns_400():
+    """新增(三態需求,design.md D4 2026-09-21 修訂③):該活動有 2 個候選時段,
+    只表態其中 1 個 → 400 SLOT_AVAILABILITY_INCOMPLETE,不建立任何資料。同一個
+    slot id 表態兩次(即使另一個時段也有表態,合計筆數超過時段總數)→ 同樣的
+    400 SLOT_AVAILABILITY_INCOMPLETE。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event)
+    client = APIClient()
+
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[slot_1.id])
+        ),
         format="json",
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert response.json()["code"] == "SELECTED_SLOTS_REQUIRED"
+    assert response.json()["code"] == "SLOT_AVAILABILITY_INCOMPLETE"
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(
+            slotAvailabilities=[
+                {"slotId": str(slot_1.id), "availability": "available"},
+                {"slotId": str(slot_1.id), "availability": "if_needed"},
+                {"slotId": str(slot_2.id), "availability": "unavailable"},
+            ]
+        ),
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_AVAILABILITY_INCOMPLETE"
 
     assert ParticipantResponse.objects.count() == 0
 
@@ -1244,7 +1389,10 @@ def test_participant_vote_invalid_phone_last_three_returns_400():
     for invalid_phone in ("12a", "12", "1234"):
         response = client.post(
             _responses_url(event.id),
-            _response_payload(phoneLastThree=invalid_phone, selectedSlotIds=[slot_id]),
+            _response_payload(
+                phoneLastThree=invalid_phone,
+                slotAvailabilities=_slot_availabilities(available=[slot_id]),
+            ),
             format="json",
         )
         assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -1263,7 +1411,10 @@ def test_participant_vote_full_width_digit_phone_last_three_returns_400():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(phoneLastThree="１２３", selectedSlotIds=[slot_id]),
+        _response_payload(
+            phoneLastThree="１２３",
+            slotAvailabilities=_slot_availabilities(available=[slot_id]),
+        ),
         format="json",
     )
 
@@ -1283,7 +1434,9 @@ def test_participant_vote_whitespace_only_nickname_or_phone_returns_required_cod
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="   ", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="   ", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -1291,7 +1444,10 @@ def test_participant_vote_whitespace_only_nickname_or_phone_returns_required_cod
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(phoneLastThree="   ", selectedSlotIds=[slot_id]),
+        _response_payload(
+            phoneLastThree="   ",
+            slotAvailabilities=_slot_availabilities(available=[slot_id]),
+        ),
         format="json",
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -1301,8 +1457,8 @@ def test_participant_vote_whitespace_only_nickname_or_phone_returns_required_cod
 
 
 def test_participant_vote_with_slot_not_belonging_to_event_returns_400():
-    """⑦ selectedSlotIds 內含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,不建立
-    任何資料。"""
+    """⑦ slotAvailabilities 內含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,不
+    建立任何資料。"""
     owner = _create_user()
     event = _create_event(owner)
     other_event = _create_event(owner)
@@ -1311,7 +1467,9 @@ def test_participant_vote_with_slot_not_belonging_to_event_returns_400():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[foreign_slot_id]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[foreign_slot_id])
+        ),
         format="json",
     )
 
@@ -1320,10 +1478,9 @@ def test_participant_vote_with_slot_not_belonging_to_event_returns_400():
     assert ParticipantResponse.objects.count() == 0
 
 
-def test_participant_vote_selected_slot_ids_not_uuid_returns_400():
-    """新增(對照實測發現):selectedSlotIds 元素不是合法 UUID 字串(例如舊版
-    三態格式的物件 `{"id": ..., "availability": ...}`)→ 400
-    SLOT_ID_INVALID,不是未對照的 DRF 原始碼 "invalid"，不建立任何資料。"""
+def test_participant_vote_slot_id_not_uuid_returns_400():
+    """新增(對照實測發現):slotAvailabilities[].slotId 不是合法 UUID 字串
+    → 400 SLOT_ID_INVALID,不是未對照的 DRF 原始碼 "invalid"，不建立任何資料。"""
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
@@ -1331,9 +1488,7 @@ def test_participant_vote_selected_slot_ids_not_uuid_returns_400():
     response = client.post(
         _responses_url(event.id),
         _response_payload(
-            selectedSlotIds=[
-                {"id": str(event.slots.first().id), "availability": "available"}
-            ]
+            slotAvailabilities=[{"slotId": "not-a-uuid", "availability": "available"}]
         ),
         format="json",
     )
@@ -1343,13 +1498,38 @@ def test_participant_vote_selected_slot_ids_not_uuid_returns_400():
     assert ParticipantResponse.objects.count() == 0
 
 
+def test_participant_vote_availability_invalid_choice_returns_400():
+    """新增(三態需求):slotAvailabilities[].availability 不是
+    available/if_needed/unavailable 三者之一 → 400 AVAILABILITY_INVALID,不
+    建立任何資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(
+            slotAvailabilities=[
+                {"slotId": str(event.slots.first().id), "availability": "maybe"}
+            ]
+        ),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "AVAILABILITY_INVALID"
+    assert ParticipantResponse.objects.count() == 0
+
+
 def test_participant_vote_nonexistent_event_returns_404():
     """⑧ 活動不存在 → 404 EVENT_NOT_FOUND。"""
     client = APIClient()
 
     response = client.post(
         _responses_url(generate_short_id()),
-        _response_payload(selectedSlotIds=[str(uuid.uuid4())]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[str(uuid.uuid4())])
+        ),
         format="json",
     )
 
@@ -1370,7 +1550,9 @@ def test_participant_vote_link_expired_returns_410():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id])
+        ),
         format="json",
     )
 
@@ -1397,7 +1579,11 @@ def test_participant_vote_event_not_active_returns_409():
     for event in (finalized_event, cancelled_event):
         response = client.post(
             _responses_url(event.id),
-            _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+            _response_payload(
+                slotAvailabilities=_slot_availabilities(
+                    available=[event.slots.first().id]
+                )
+            ),
             format="json",
         )
 
@@ -1419,7 +1605,9 @@ def test_participant_vote_voting_closed_returns_409():
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(selectedSlotIds=[str(event.slots.first().id)]),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id])
+        ),
         format="json",
     )
 
@@ -1442,7 +1630,9 @@ def test_participant_response_id_collision_retries_and_still_succeeds(monkeypatc
     # 規則會擋下來,這裡要測的是 id 碰撞重試,跟主揪暱稱衝突無關。
     first_response = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小美", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="小美", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
     assert first_response.status_code == status.HTTP_201_CREATED
@@ -1458,7 +1648,9 @@ def test_participant_response_id_collision_retries_and_still_succeeds(monkeypatc
 
     response = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="小華", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
 
@@ -1479,12 +1671,16 @@ def test_participant_response_different_nicknames_do_not_trigger_retry():
     # 暱稱刻意不用 "小明"(`_create_event` 預設的 hostNickname),理由同上。
     response_1 = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小美", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="小美", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
     response_2 = client.post(
         _responses_url(event.id),
-        _response_payload(nickname="小華", selectedSlotIds=[slot_id]),
+        _response_payload(
+            nickname="小華", slotAvailabilities=_slot_availabilities(available=[slot_id])
+        ),
         format="json",
     )
 
@@ -1508,8 +1704,8 @@ def _create_verifiable_participant_response(event, **overrides):
 
 def test_participant_verify_identity_success_returns_access_token_and_vote_content():
     """① 正確暱稱＋正確手機末三碼 → 200,回應含 accessToken(明文)、expiresAt、
-    原投票內容(nickname/email/selectedSlotIds,供前端預填);DB 新增一筆 token
-    紀錄,token_hash 不等於明碼 accessToken。"""
+    原投票內容(nickname/email/slotAvailabilities,供前端預填);DB 新增一筆
+    token 紀錄,token_hash 不等於明碼 accessToken。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_id = str(event.slots.first().id)
@@ -1529,12 +1725,14 @@ def test_participant_verify_identity_success_returns_access_token_and_vote_conte
         "expiresAt",
         "nickname",
         "email",
-        "selectedSlotIds",
+        "slotAvailabilities",
     }
     assert isinstance(body["accessToken"], str) and body["accessToken"]
     assert body["nickname"] == "小華"
     assert body["email"] == "participant@example.com"
-    assert body["selectedSlotIds"] == [slot_id]
+    assert body["slotAvailabilities"] == [
+        {"slotId": slot_id, "availability": "available"}
+    ]
 
     assert ParticipantResponseAccessToken.objects.count() == 1
     token_record = ParticipantResponseAccessToken.objects.get()
@@ -1685,8 +1883,8 @@ def _issue_access_token(participant_response, **overrides):
 
 
 def test_participant_patch_with_valid_token_updates_slots_only():
-    """① 帶有效未過期未使用的 token,修改 selectedSlotIds → 200,DB 該筆投票的
-    slots 已更新為新集合,nickname/email/phone_last_three_hash 皆未變動。"""
+    """① 帶有效未過期未使用的 token,修改 slotAvailabilities → 200,DB 該筆
+    投票的表態已更新為新內容,nickname/email/phone_last_three_hash 皆未變動。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_1 = event.slots.first()
@@ -1700,7 +1898,12 @@ def test_participant_patch_with_valid_token_updates_slots_only():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
         format="json",
     )
 
@@ -1708,7 +1911,11 @@ def test_participant_patch_with_valid_token_updates_slots_only():
     participant_response.refresh_from_db()
     assert set(
         str(s) for s in participant_response.slots.values_list("id", flat=True)
-    ) == {str(slot_2.id)}
+    ) == {str(slot_1.id), str(slot_2.id)}
+    assert {
+        (str(a.slot_id), a.availability)
+        for a in participant_response.slot_availabilities.all()
+    } == {(str(slot_1.id), "unavailable"), (str(slot_2.id), "available")}
     assert participant_response.nickname == "小華"
     assert participant_response.email == "participant@example.com"
     assert participant_response.phone_last_three_hash == original_phone_hash
@@ -1727,30 +1934,41 @@ def test_participant_patch_token_already_used_returns_401():
 
     first_response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
         format="json",
     )
     assert first_response.status_code == status.HTTP_200_OK
 
     second_response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_1.id], unavailable=[slot_2.id]
+            ),
+        },
         format="json",
     )
 
     assert second_response.status_code == status.HTTP_401_UNAUTHORIZED
     assert second_response.json()["code"] == "ACCESS_TOKEN_INVALID"
     participant_response.refresh_from_db()
-    assert set(
-        str(s) for s in participant_response.slots.values_list("id", flat=True)
-    ) == {str(slot_2.id)}
+    assert {
+        (str(a.slot_id), a.availability)
+        for a in participant_response.slot_availabilities.all()
+    } == {(str(slot_1.id), "unavailable"), (str(slot_2.id), "available")}
 
 
 @pytest.mark.django_db(transaction=True)
 def test_participant_patch_concurrent_requests_with_same_token_only_one_succeeds():
     """code-review 補充:兩個請求幾乎同時帶著同一個有效 token 送出 PATCH,
     DB 層級的 compare-and-swap(``UPDATE ... WHERE used_at IS NULL``)必須保證
-    只有一個真的成功消費 token、寫入 slots——不能只靠 Python 物件裡讀到的舊值
+    只有一個真的成功消費 token、寫入表態——不能只靠 Python 物件裡讀到的舊值
     判斷(見 views.py 的 ``claimed`` 計數)。用 ``transaction=True`` 讓兩個執行緒
     各自拿到真正獨立的 DB connection,才測得出真實的併發行為。"""
     import threading
@@ -1765,13 +1983,18 @@ def test_participant_patch_concurrent_requests_with_same_token_only_one_succeeds
     status_codes = []
     start_barrier = threading.Barrier(2)
 
-    def send_patch(target_slot_id):
+    def send_patch(target_slot_id, other_slot_id):
         start_barrier.wait()
         client = APIClient()
         try:
             response = client.patch(
                 _patch_response_url(event.id, participant_response.id),
-                {"accessToken": token, "selectedSlotIds": [str(target_slot_id)]},
+                {
+                    "accessToken": token,
+                    "slotAvailabilities": _slot_availabilities(
+                        available=[target_slot_id], unavailable=[other_slot_id]
+                    ),
+                },
                 format="json",
             )
             status_codes.append(response.status_code)
@@ -1781,8 +2004,8 @@ def test_participant_patch_concurrent_requests_with_same_token_only_one_succeeds
             connection.close()
 
     threads = [
-        threading.Thread(target=send_patch, args=(slot_1.id,)),
-        threading.Thread(target=send_patch, args=(slot_2.id,)),
+        threading.Thread(target=send_patch, args=(slot_1.id, slot_2.id)),
+        threading.Thread(target=send_patch, args=(slot_2.id, slot_1.id)),
     ]
     for t in threads:
         t.start()
@@ -1812,7 +2035,12 @@ def test_participant_patch_expired_token_returns_401():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_2.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
         format="json",
     )
 
@@ -1858,7 +2086,10 @@ def test_participant_patch_token_expiring_between_precheck_and_claim_returns_401
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[slot_1.id]),
+        },
         format="json",
     )
 
@@ -1879,7 +2110,10 @@ def test_participant_patch_nonexistent_or_malformed_token_returns_401():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": "not-a-real-token", "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": "not-a-real-token",
+            "slotAvailabilities": _slot_availabilities(available=[slot_1.id]),
+        },
         format="json",
     )
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
@@ -1887,7 +2121,7 @@ def test_participant_patch_nonexistent_or_malformed_token_returns_401():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"selectedSlotIds": [str(slot_1.id)]},
+        {"slotAvailabilities": _slot_availabilities(available=[slot_1.id])},
         format="json",
     )
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
@@ -1908,7 +2142,12 @@ def test_participant_patch_token_belongs_to_another_response_returns_401():
 
     response = client.patch(
         _patch_response_url(event.id, response_b.id),
-        {"accessToken": token_for_a, "selectedSlotIds": [str(slot_2.id)]},
+        {
+            "accessToken": token_for_a,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
         format="json",
     )
 
@@ -1924,7 +2163,7 @@ def test_participant_patch_token_belongs_to_another_response_returns_401():
 
 def test_participant_patch_ignores_locked_fields():
     """⑥ body 帶 nickname/email/phoneLastThree 企圖修改 → 皆被忽略,DB 對應欄位
-    不變(僅 selectedSlotIds 生效)。"""
+    不變(僅 slotAvailabilities 生效)。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_1 = event.slots.first()
@@ -1940,7 +2179,9 @@ def test_participant_patch_ignores_locked_fields():
         _patch_response_url(event.id, participant_response.id),
         {
             "accessToken": token,
-            "selectedSlotIds": [str(slot_2.id)],
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
             "nickname": "偷改暱稱",
             "email": "hacker@example.com",
             "phoneLastThree": "999",
@@ -1955,11 +2196,11 @@ def test_participant_patch_ignores_locked_fields():
     assert participant_response.phone_last_three_hash == original_phone_hash
     assert set(
         str(s) for s in participant_response.slots.values_list("id", flat=True)
-    ) == {str(slot_2.id)}
+    ) == {str(slot_1.id), str(slot_2.id)}
 
 
 def test_participant_patch_with_slot_not_belonging_to_event_returns_400():
-    """⑦ selectedSlotIds 含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,DB
+    """⑦ slotAvailabilities 含不屬於該活動的 slot id → 400 SLOT_NOT_FOUND,DB
     未變動,token 未被消費。"""
     owner = _create_user()
     event = _create_event(owner)
@@ -1972,7 +2213,10 @@ def test_participant_patch_with_slot_not_belonging_to_event_returns_400():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [foreign_slot_id]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[foreign_slot_id]),
+        },
         format="json",
     )
 
@@ -1986,9 +2230,9 @@ def test_participant_patch_with_slot_not_belonging_to_event_returns_400():
     assert token_record.used_at is None
 
 
-def test_participant_patch_selected_slot_ids_not_uuid_returns_400():
-    """新增(對照實測發現):selectedSlotIds 元素不是合法 UUID 字串 → 400
-    SLOT_ID_INVALID,DB 未變動,token 未被消費。"""
+def test_participant_patch_slot_id_not_uuid_returns_400():
+    """新增(對照實測發現):slotAvailabilities[].slotId 不是合法 UUID 字串 →
+    400 SLOT_ID_INVALID,DB 未變動,token 未被消費。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_1 = event.slots.first()
@@ -2000,7 +2244,7 @@ def test_participant_patch_selected_slot_ids_not_uuid_returns_400():
         _patch_response_url(event.id, participant_response.id),
         {
             "accessToken": token,
-            "selectedSlotIds": [{"id": str(slot_1.id), "availability": "available"}],
+            "slotAvailabilities": [{"slotId": "not-a-uuid", "availability": "available"}],
         },
         format="json",
     )
@@ -2011,6 +2255,39 @@ def test_participant_patch_selected_slot_ids_not_uuid_returns_400():
     assert set(
         str(s) for s in participant_response.slots.values_list("id", flat=True)
     ) == {str(slot_1.id)}
+    token_record = ParticipantResponseAccessToken.objects.get()
+    assert token_record.used_at is None
+
+
+def test_participant_patch_slot_availabilities_incomplete_returns_400():
+    """新增(三態需求,design.md D4 2026-09-21 修訂③):活動有 2 個候選時段,
+    PATCH 只表態其中 1 個 → 400 SLOT_AVAILABILITY_INCOMPLETE,DB 未變動,token
+    未被消費。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(
+        event, "小華", {slot_1: "available", slot_2: "unavailable"}
+    )
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[slot_2.id]),
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_AVAILABILITY_INCOMPLETE"
+    assert {
+        (str(a.slot_id), a.availability)
+        for a in participant_response.slot_availabilities.all()
+    } == {(str(slot_1.id), "available"), (str(slot_2.id), "unavailable")}
     token_record = ParticipantResponseAccessToken.objects.get()
     assert token_record.used_at is None
 
@@ -2031,7 +2308,10 @@ def test_participant_patch_link_expired_returns_410_and_token_unconsumed():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[slot_1.id]),
+        },
         format="json",
     )
 
@@ -2055,7 +2335,10 @@ def test_participant_patch_event_not_active_returns_409_and_token_unconsumed():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[slot_1.id]),
+        },
         format="json",
     )
 
@@ -2077,7 +2360,10 @@ def test_participant_patch_voting_closed_returns_409_and_token_unconsumed():
 
     response = client.patch(
         _patch_response_url(event.id, participant_response.id),
-        {"accessToken": token, "selectedSlotIds": [str(slot_1.id)]},
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(available=[slot_1.id]),
+        },
         format="json",
     )
 
