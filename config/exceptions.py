@@ -87,6 +87,9 @@ FIELD_CODE_OVERRIDES = {
     ("email", "invalid"): "PARTICIPANT_EMAIL_INVALID",
     ("email", "blank"): "PARTICIPANT_EMAIL_INVALID",
     ("comment", "max_length"): "COMMENT_TOO_LONG",
+    ("message", "required"): "MESSAGE_REQUIRED",
+    ("message", "blank"): "MESSAGE_REQUIRED",
+    ("message", "max_length"): "MESSAGE_TOO_LONG",
 }
 
 # 巢狀陣列欄位（`slots[].<subfield>`、`slotAvailabilities[].<subfield>`）的

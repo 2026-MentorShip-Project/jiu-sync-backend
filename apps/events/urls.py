@@ -1,6 +1,7 @@
 from django.urls import path, register_converter
 
 from .views import (
+    CommentListCreateView,
     EventCreateView,
     EventDetailView,
     ParticipantResponseCreateView,
@@ -46,5 +47,10 @@ urlpatterns = [
         "<shortid:id>/responses/<shortid:responseId>/",
         ParticipantResponseDetailView.as_view(),
         name="participant-response-detail",
+    ),
+    path(
+        "<shortid:id>/comments/",
+        CommentListCreateView.as_view(),
+        name="comment-list-create",
     ),
 ]

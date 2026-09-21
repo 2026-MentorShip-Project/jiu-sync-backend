@@ -136,6 +136,31 @@ class ParticipantResponseSlotAvailability(models.Model):
         return f"{self.response_id}:{self.slot_id}={self.availability}"
 
 
+class Comment(models.Model):
+    """任何人（含未登入）對某場 :class:`Event` 留下的一則留言，完全獨立於
+    :class:`ParticipantResponse`（不需要先投票、不綁投票記錄），見
+    openspec/changes/add-event-comments/design.md D2。
+
+    不要求同一活動內暱稱唯一（同一人可留多則留言，見 D6）——因此沒有
+    ``unique_together``，短 id 碰撞重試邏輯不需要像 ``ParticipantResponse``
+    那樣先查暱稱區分成因，``IntegrityError`` 一律視為 id 碰撞（見 D7）。
+    """
+
+    id = models.CharField(
+        primary_key=True, max_length=8, default=generate_short_id, editable=False
+    )
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="comments")
+    nickname = models.CharField(max_length=40)
+    message = models.CharField(max_length=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.nickname}: {self.message}"
+
+
 class ParticipantResponseAccessToken(models.Model):
     """身分核對成功後核發的一次性存取憑證,供後續 ``PATCH`` 修改投票時免重新
     輸入暱稱＋手機末三碼(見 design.md D2)。

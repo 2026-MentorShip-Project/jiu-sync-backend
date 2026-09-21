@@ -19,6 +19,8 @@ from .authentication import OptionalJWTAuthentication
 from .lifecycle import compute_display_status
 from .models import Event, ParticipantResponseAccessToken, ParticipantResponseSlotAvailability
 from .serializers import (
+    CommentCreateSerializer,
+    CommentSerializer,
     EventCreateSerializer,
     EventDetailSerializer,
     EventPatchSerializer,
@@ -441,3 +443,38 @@ class ParticipantResponseDetailView(APIView):
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class CommentListCreateView(APIView):
+    """``GET``/``POST /api/events/{id}/comments`` — 活動留言板，任何人（含未
+    登入）皆可查詢、留言。完全公開，不需要登入，不採用任何身分驗證，同三支
+    參與者端點；且完全獨立於 ``ParticipantResponse``（design.md D2），不需要
+    先投票或核對身分。
+
+    前提條件刻意只檢查「連結未失效」（``_display_status_or_410``），不呼叫
+    ``_check_participation_preconditions``——活動狀態（進行中／已定案／已
+    取消）與投票截止時間皆不影響能否留言，這點跟參與者投票三支端點明確不同
+    （design.md D5）。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, id):
+        event = _get_event_or_404(id)
+        _display_status_or_410(event)
+        # Comment.Meta.ordering 已定義 created_at 遞增,.all() 就是這個順序,
+        # 不需要重複 order_by(code-review 抓到)。
+        serializer = CommentSerializer(event.comments.all(), many=True)
+        return Response(serializer.data)
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        _display_status_or_410(event)
+
+        serializer = CommentCreateSerializer(data=request.data, context={"event": event})
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.save()
+
+        response_serializer = CommentSerializer(comment)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)

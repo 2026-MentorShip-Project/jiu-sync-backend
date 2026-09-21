@@ -11,7 +11,7 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import IntegrityError, connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
-from django.utils import timezone
+from django.utils import dateparse, timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -19,6 +19,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from apps.accounts.models import User
 from apps.events.ids import generate_short_id
 from apps.events.models import (
+    Comment,
     Event,
     ParticipantResponse,
     ParticipantResponseAccessToken,
@@ -2443,3 +2444,276 @@ def test_participant_patch_voting_closed_returns_409_and_token_unconsumed():
     assert response.json()["code"] == "VOTING_CLOSED"
     token_record = ParticipantResponseAccessToken.objects.get()
     assert token_record.used_at is None
+
+
+# ---------------------------------------------------------------------------
+# POST/GET /api/events/{id}/comments (add-event-comments)
+# ---------------------------------------------------------------------------
+
+
+def _comments_url(event_id):
+    return f"/api/events/{event_id}/comments/"
+
+
+def _comment_payload(**overrides):
+    payload = {"nickname": "小華", "message": "期待這次聚會！"}
+    payload.update(overrides)
+    return payload
+
+
+def test_comment_can_be_posted_successfully():
+    """① 合法暱稱＋內容 → 201,回應含 id(8 碼 base62)/nickname/message/
+    createdAt,DB 有一筆對應資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.post(_comments_url(event.id), _comment_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert set(body.keys()) == {"id", "nickname", "message", "createdAt"}
+    assert RESPONSE_SHORT_ID_RE.match(body["id"])
+    assert body["nickname"] == "小華"
+    assert body["message"] == "期待這次聚會！"
+
+    assert Comment.objects.count() == 1
+    comment = Comment.objects.get()
+    assert str(comment.id) == body["id"]
+    assert comment.event_id == event.id
+
+
+def test_comment_nickname_is_trimmed():
+    """② 暱稱前後帶空白,trim 後儲存。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.post(
+        _comments_url(event.id),
+        _comment_payload(nickname="  小華  "),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["nickname"] == "小華"
+    assert Comment.objects.get().nickname == "小華"
+
+
+def test_comment_missing_nickname_returns_400():
+    """③ 暱稱缺漏 → 400 NICKNAME_REQUIRED,不建立任何資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    payload = _comment_payload()
+    del payload["nickname"]
+
+    response = client.post(_comments_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_REQUIRED"
+    assert Comment.objects.count() == 0
+
+
+def test_comment_missing_message_returns_400():
+    """④ 內容缺漏 → 400 MESSAGE_REQUIRED,不建立任何資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    payload = _comment_payload()
+    del payload["message"]
+
+    response = client.post(_comments_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "MESSAGE_REQUIRED"
+    assert Comment.objects.count() == 0
+
+
+def test_comment_message_over_200_chars_returns_400():
+    """⑤ 內容超過 200 字 → 400 MESSAGE_TOO_LONG,不建立任何資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.post(
+        _comments_url(event.id),
+        _comment_payload(message="a" * 201),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "MESSAGE_TOO_LONG"
+    assert Comment.objects.count() == 0
+
+
+def test_comment_allowed_when_event_finalized_or_cancelled():
+    """⑥ 活動 status 為 finalized/cancelled(未超過 7 天)仍可成功留言——留言的
+    前提條件只看連結是否失效,不看活動狀態(design.md D5)。"""
+    owner = _create_user()
+    client = APIClient()
+    now = timezone.now()
+
+    finalized_event = _create_event(
+        owner, status=Event.Status.FINALIZED, finalized_at=now
+    )
+    finalized_event.final_slot = finalized_event.slots.first()
+    finalized_event.save()
+    cancelled_event = _create_event(owner, status=Event.Status.CANCELLED, cancelled_at=now)
+
+    for event in (finalized_event, cancelled_event):
+        response = client.post(
+            _comments_url(event.id), _comment_payload(), format="json"
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+    assert Comment.objects.count() == 2
+
+
+def test_comment_link_expired_returns_410():
+    """⑦ 活動連結已失效(status=cancelled 超過 7 天)→ 410 LINK_EXPIRED,不建立
+    任何資料。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = APIClient()
+
+    response = client.post(_comments_url(event.id), _comment_payload(), format="json")
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+    assert Comment.objects.count() == 0
+
+
+def test_comment_list_link_expired_returns_410():
+    """code-review 補充:GET 端也要驗證連結已失效的 410 分支——原本只有
+    POST 那條測到,GET 用同一個 ``_display_status_or_410`` 呼叫卻沒有直接
+    測試涵蓋。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+
+
+def test_comment_post_nonexistent_event_returns_404():
+    """⑧ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    client = APIClient()
+
+    response = client.post(
+        _comments_url(generate_short_id()), _comment_payload(), format="json"
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_comment_same_nickname_can_post_multiple_times():
+    """⑨ 同一暱稱可連續留言兩次,皆成功——留言不要求活動內暱稱唯一
+    (design.md D6,跟 ParticipantResponse.nickname 的唯一限制不同)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    first = client.post(
+        _comments_url(event.id), _comment_payload(message="第一則"), format="json"
+    )
+    second = client.post(
+        _comments_url(event.id), _comment_payload(message="第二則"), format="json"
+    )
+
+    assert first.status_code == status.HTTP_201_CREATED
+    assert second.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event, nickname="小華").count() == 2
+
+
+def _patch_comment_id_default(monkeypatch, fake):
+    """設定 ``Comment.id`` 欄位的 ``default``,理由同 ``_patch_event_id_default``
+    (Django 把解析後的 default getter 快取在 ``Field._get_default``,需連快取
+    一起清掉)。"""
+    field = Comment._meta.get_field("id")
+    monkeypatch.setattr(field, "default", fake)
+    monkeypatch.delitem(field.__dict__, "_get_default", raising=False)
+
+
+def test_comment_id_collision_retries_and_still_succeeds(monkeypatch):
+    """⑩ Comment.id 產生器撞到既有 id 時重試,換到不重複的 id 後仍建立成功。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+    existing = Comment.objects.create(event=event, nickname="小美", message="先佔一個 id")
+    real_generate = generate_short_id
+    calls = {"n": 0}
+
+    def colliding_once_then_real():
+        calls["n"] += 1
+        return existing.id if calls["n"] == 1 else real_generate()
+
+    _patch_comment_id_default(monkeypatch, colliding_once_then_real)
+
+    response = client.post(_comments_url(event.id), _comment_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert calls["n"] >= 2
+    assert Comment.objects.count() == 2
+
+
+def test_comment_list_returns_all_sorted_by_created_at_ascending():
+    """⑪ 活動有 3 則留言(刻意用不同的建立順序/created_at)→ 200,回應陣列依
+    created_at 由舊到新排序。``created_at`` 是 ``auto_now_add``,``.create()``
+    時傳入的值會被忽略、強制寫成當下時間——建立後改用 ``.update()``(繞過
+    ``auto_now_add`` 的 ``pre_save``,只有 ``.save()``/``.create()`` 才會觸發)
+    才能真正控制每筆的時間,驗證排序不是碰巧跟建立順序一致。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    now = timezone.now()
+    third = Comment.objects.create(event=event, nickname="小美", message="第三則")
+    first = Comment.objects.create(event=event, nickname="小華", message="第一則")
+    second = Comment.objects.create(event=event, nickname="小明", message="第二則")
+    Comment.objects.filter(pk=third.pk).update(created_at=now)
+    Comment.objects.filter(pk=first.pk).update(created_at=now - timedelta(minutes=10))
+    Comment.objects.filter(pk=second.pk).update(created_at=now - timedelta(minutes=5))
+    first.refresh_from_db()
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert [item["id"] for item in body] == [first.id, second.id, third.id]
+    assert body[0]["id"] == first.id
+    assert body[0]["nickname"] == "小華"
+    assert body[0]["message"] == "第一則"
+    assert dateparse.parse_datetime(body[0]["createdAt"]) == first.created_at
+
+
+def test_comment_list_returns_empty_array_when_no_comments():
+    """⑫ 活動無留言 → 200,空陣列。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == []
+
+
+def test_comment_list_nonexistent_event_returns_404():
+    """⑬ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    client = APIClient()
+
+    response = client.get(_comments_url(generate_short_id()))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
