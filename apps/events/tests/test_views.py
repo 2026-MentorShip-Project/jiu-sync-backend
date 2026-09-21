@@ -1761,8 +1761,10 @@ def _create_verifiable_participant_response(event, **overrides):
 
 def test_participant_verify_identity_success_returns_access_token_and_vote_content():
     """① 正確暱稱＋正確手機末三碼 → 200,回應含 accessToken(明文)、expiresAt、
-    原投票內容(nickname/email/slotAvailabilities,供前端預填);DB 新增一筆
-    token 紀錄,token_hash 不等於明碼 accessToken。"""
+    該筆投票的 id(供前端拼接後續 PATCH .../responses/{responseId} 的 URL,
+    換裝置或清除 localStorage 後仍能繼續操作)、原投票內容
+    (nickname/email/slotAvailabilities,供前端預填);DB 新增一筆 token 紀錄,
+    token_hash 不等於明碼 accessToken。"""
     owner = _create_user()
     event = _create_event(owner)
     slot_id = str(event.slots.first().id)
@@ -1780,10 +1782,12 @@ def test_participant_verify_identity_success_returns_access_token_and_vote_conte
     assert set(body.keys()) == {
         "accessToken",
         "expiresAt",
+        "id",
         "nickname",
         "email",
         "slotAvailabilities",
     }
+    assert body["id"] == participant_response.id
     assert isinstance(body["accessToken"], str) and body["accessToken"]
     assert body["nickname"] == "小華"
     assert body["email"] == "participant@example.com"

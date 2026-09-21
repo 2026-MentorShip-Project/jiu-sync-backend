@@ -274,8 +274,11 @@ class ParticipantResponseVerifyView(APIView):
     驗證,同 ``ParticipantResponseCreateView``。
 
     核對成功核發一組一次性存取憑證(明文只在這次回應回傳,DB 只存雜湊值,見
-    ``_hash_participant_access_token``),供後續 ``PATCH`` 修改投票使用。查無
-    此暱稱、或暱稱存在但手機末三碼不符,皆回同一個 401
+    ``_hash_participant_access_token``),供後續 ``PATCH`` 修改投票使用。回應
+    一併回傳該筆投票的 ``id``——前端組
+    ``PATCH /api/events/{id}/responses/{responseId}`` 的 URL 需要這個值,
+    換裝置或清除本地儲存後,``verify`` 是前端唯一能重新拿到它的來源(見
+    design.md D18)。查無此暱稱、或暱稱存在但手機末三碼不符,皆回同一個 401
     ``IDENTITY_VERIFICATION_FAILED``(design.md D3),不讓回應內容洩漏兩者的
     差異——因此這裡刻意不呼叫 ``get_object_or_404`` 之類會分岔出不同錯誤訊息
     的寫法,兩個失敗分支共用同一段 ``raise``。
@@ -321,6 +324,7 @@ class ParticipantResponseVerifyView(APIView):
             {
                 "accessToken": plaintext_token,
                 "expiresAt": expires_at,
+                "id": participant_response.id,
                 "nickname": participant_response.nickname,
                 "email": participant_response.email,
                 "slotAvailabilities": [

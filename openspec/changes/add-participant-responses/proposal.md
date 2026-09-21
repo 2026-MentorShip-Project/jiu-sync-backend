@@ -39,4 +39,5 @@
 - **code-review 發現並修復**（design.md D15）：squash migration 後本地 dev DB 因舊 migration 記錄殘留而未真正套用新 schema（缺 through table、留孤兒表），已手動修復並重跑完整驗證套件確認無殘留影響
 - **commit 後追加，回應內容擴大**（design.md D16）：`POST .../responses`／`PATCH .../responses/{responseId}` 回應從極簡的 `{id}`／`{id, slotAvailabilities}` 改成跟 `GET /api/events/{id}` 完全一樣的完整活動內容，前端送出投票後可直接渲染，不用再打一次 `GET`；`GET` 的 `responses` 彙整正式加入 `comment` 欄位（反轉 D12「本次不做顯示」的決定）。`verify` 端點維持現狀，經 grill-me 確認不需要一併改。
 - **commit 後追加，新增票數統計**（design.md D17）：新增頂層 `slotSummary` 欄位（每個候選時段的三態票數，`available`/`if_needed`/`unavailable` 各自整數），`GET`/`POST .../responses`/`PATCH .../responses/{responseId}` 三個回傳完整活動內容的端點皆包含；`_event_with_responses_queryset()` 一併把 `slots` 加入 prefetch，避免此欄位造成額外 N+1
+- **使用者提問時發現並修復**（design.md D18）：`POST .../responses/verify` 回應補上該筆投票的 `id`——原本沒有這個值，前端拿到 `accessToken` 卻無法組出後續 `PATCH .../responses/{responseId}` 的 URL（換裝置、清除本地儲存後，`verify` 是唯一還能重新拿到這個 id 的來源）
 - ⚠️ **待辦**：Swagger artifact（`https://claude.ai/artifact/FgVxgLaS7L8Pf2MNEz92Vf`）尚未同步這次三態改動（仍是 task 1-6 commit 時同步的二元複選版本），需要另一輪更新

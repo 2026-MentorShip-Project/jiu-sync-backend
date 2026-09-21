@@ -127,6 +127,10 @@ commit 後使用者追加要求：前端需要「不同時段的票數」讓使�
 
 實作：`EventDetailSerializer.get_slotSummary()` 用已經 `prefetch_related("slots", "responses__slot_availabilities")`（`_event_with_responses_queryset()`，本次一併把 `slots` 也加進 prefetch，避免這個新欄位跟既有 `slots` 欄位各自對 `event.slots.all()` 下一次查詢）過的資料在 Python 端累加計數，不對 DB 另下 `COUNT`/`GROUP BY` query。
 
+### D18. `POST .../verify` 回應補上該筆投票的 `id`（前端組 PATCH URL 需要）
+
+使用者提問時發現的真實缺口，非設計取捨、直接修：`PATCH /api/events/{id}/responses/{responseId}` 的 URL 需要 `responseId`。首次投票（`POST .../responses`）成功後，回應是完整活動內容（D16），前端可以從 `responses[]` 用自己剛送出的 `nickname` 找到那筆的 `id`，存下來（例如 localStorage）給同一裝置未來直接用；但換裝置、或本地儲存被清除後，`verify` 端點是前端唯一能重新取得這個 `id` 的來源——而 `verify` 原本的回應只有 `accessToken`/`expiresAt`/`nickname`/`email`/`slotAvailabilities`，沒有 `id`，前端拿到 token 卻沒有東西可以拼下一次 `PATCH` 的 URL。修法：`ParticipantResponseVerifyView.post()` 回應加上 `"id": participant_response.id`。
+
 ## Risks / Trade-offs
 
 - **[風險] 手機末三碼可被暴力窮舉冒用身分改票（D1）** → 已與使用者確認為本次刻意接受的風險，不在 scope 內處理。緩解方向留給未來 change：失敗次數鎖定、或核對 API 加 IP／裝置層級的 rate limit。

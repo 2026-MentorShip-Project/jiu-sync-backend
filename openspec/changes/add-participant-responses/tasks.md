@@ -104,3 +104,13 @@
   `test_participant_can_submit_first_vote_successfully` 的完整回應格式斷言
   三處，確認 FAIL 後才實作 — (auto) `pytest`（全套 161 passed）、
   `ruff check`、`manage.py check`、`makemigrations --check --dry-run` 皆乾淨
+- [x] 7.5 使用者詢問「responseId 前端要從哪裡拿」時發現的真實缺口（design.md
+  D18，非新設計取捨，直接修）：`POST .../responses/verify` 回應補上該筆
+  投票的 `id`——原本只有 `accessToken`/`expiresAt`/`nickname`/`email`/
+  `slotAvailabilities`，前端拿到 token 卻沒有東西可以拼下一次
+  `PATCH .../responses/{responseId}` 的 URL。RED 先在
+  `test_participant_verify_identity_success_returns_access_token_and_vote_content`
+  補上 `"id"` 到預期 key set 與 `body["id"] == participant_response.id`
+  的斷言，確認 FAIL 後才在 view 補回應欄位 — (auto) `pytest`（全套 161
+  passed）、`ruff check`、`manage.py check`、`makemigrations --check
+  --dry-run` 皆乾淨
