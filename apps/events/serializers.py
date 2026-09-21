@@ -430,15 +430,18 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         return event.host_email
 
     def get_responses(self, event):
-        # D8:只回傳 nickname/slotAvailabilities,刻意不含 phoneLastThree(含雜湊)
-        # /email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。三態表態
-        # 見 design.md D4/D8(2026-09-21 修訂)。view 端(_event_with_responses_queryset())
-        # 已 prefetch_related("responses__slot_availabilities"),這裡用 .all()
+        # D8:回傳 nickname/slotAvailabilities/comment,刻意不含 phoneLastThree
+        # (含雜湊)/email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。
+        # comment 原本(D12)只接受並儲存、不做顯示,使用者事後確認要在此彙整
+        # 一併顯示,見 D12 2026-09-21 修訂。三態表態見 design.md D4/D8。view 端
+        # (_event_with_responses_queryset())已
+        # prefetch_related("responses__slot_availabilities"),這裡用 .all()
         # 走的是 prefetch cache,不會額外觸發 query。
         return [
             {
                 "id": participant_response.id,
                 "nickname": participant_response.nickname,
+                "comment": participant_response.comment,
                 "slotAvailabilities": [
                     {
                         "slotId": str(availability.slot_id),

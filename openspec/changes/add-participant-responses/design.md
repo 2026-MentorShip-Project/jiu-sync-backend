@@ -87,6 +87,8 @@ commit 後使用者追加要求：初次投票時，暱稱除了不可與既有�
 
 commit 後使用者追加要求：初次投票時可附上一段選填留言，供未來另一支「顯示所有人留言」的 API 使用——**本次 scope 明確只到「接受並儲存」**，不做顯示/彙整 API（那是未來 change 的範圍）。長度上限比照 `Event.final_note`（200 字），沒有格式驗證（純自由文字）。刻意讓空字串（`""`）視為「沒有留言」而非驗證錯誤（`allow_blank=True`，正規化成 `None` 存入 DB）——這跟 `email` 欄位空字串視為無效（`PARTICIPANT_EMAIL_INVALID`）不同，因為 email 有「格式對不對」的概念、comment 沒有。`GET /api/events/{id}` 的 `responses` 欄位（D8）刻意不含 `comment`——D8 的彙整頁範圍是「誰投了什麼時段」，留言顯示是明確排除在本次 scope 外的獨立功能。
 
+> **修訂記錄（2026-09-21）**：使用者確認要反轉「不做顯示」的決定，`responses` 彙整正式加入 `comment` 欄位（未留言為 `null`）。理由：使用者本來就是為了讓前端能「立即渲染該活動的投票情況跟留言情況」才提出這次追加，見 D16。
+
 ### D13. `PATCH .../responses/{responseId}` 的一次性 token 消費，compare-and-swap 需一併重新核對到期時間
 
 Codex 二次審查抓到：`patch()` 開頭的早期檢查（token 是否存在／已用過／過期／對得上 `responseId` 與活動）用的是請求一開始取得的 `now`，但真正保證一次性消費的 compare-and-swap（`UPDATE ... WHERE used_at IS NULL`）發生在共用前置條件檢查、slot 驗證之後——這中間有真實的時間間隔。原本的 CAS 只檢查 `used_at IS NULL`，沒有重新檢查 `expires_at`：若 token 剛好在早期檢查通過之後、CAS 執行之前的空檔到期，仍會成功消費、修改投票，跟 spec「憑有效、未過期 token」的要求有落差（這跟 D9/token 的一次性消費 race 是同一類「用舊資料判斷、忘了在真正寫入的瞬間重新核對」的錯誤，只是這次是「到期時間」而非「是否已使用」）。
@@ -102,6 +104,16 @@ Codex 二次審查抓到：`patch()` 開頭的早期檢查（token 是否存在�
 三態改版把 task 1-6 已 commit 的 4 個 migration（0003-0006）刪除重建成單一乾淨 0003（見 D4a）。code-review 抓到：Django migration 的套用記錄（`django_migrations` 表）只認檔名，不認內容。本地開發用的 Postgres 在改版前已經跑過舊版 `0003_participantresponse`／`0004_participantresponseaccesstoken`，`migrate` 因此不會重跑新內容的 0003，導致實際 schema 停留在舊版（缺 `ParticipantResponseSlotAvailability` through table、缺 `comment` 欄位），且留下孤兒表 `events_participantresponse_slots`（舊版 plain M2M 自動產生的中介表）。
 
 已實測確認本地 dev DB 確實中招（`\dt events_*` 只看到舊表、無 through table）。修法：手動 `DROP TABLE` 孤兒表與內容不符的舊表，並從 `django_migrations` 刪除對應的 `0003_participantresponse`／`0004_participantresponseaccesstoken` 記錄，重跑 `migrate events` 讓新版 migration 真正套用；修復後重新跑過完整測試套件（161 個測試全綠，`ruff`/`manage.py check`/`makemigrations --check` 皆乾淨）確認無殘留影響。pytest 用的 test DB 每次從 migration 檔案全新建立，不受影響，只有已存在的持久化資料庫（本地 dev）會中招。因為此分支尚未合併到 main/develop、也沒有其他協作者已 pull 這個 squash 前的版本，影響範圍僅限這台機器的本地 dev DB，不需要額外的遷移腳本或文件通知其他人。
+
+### D16. `POST .../responses`／`PATCH .../responses/{responseId}` 回應改回傳完整活動內容，`GET` 的 `responses` 彙整正式加入 `comment`
+
+commit 後使用者追加要求：兩支端點原本只回傳極簡的 `{"id": ...}`（create）／`{"id", "slotAvailabilities"}`（patch），使用者指出前端需要「立即渲染」該活動最新的投票與留言情況，不該再逼前端多打一次 `GET /api/events/{id}`。涉及回應格式這種對外契約的改動，先走 `grill-me` 確認三個問題：
+
+1. **回應要多完整**：確認為直接回傳跟 `GET /api/events/{id}` 完全一樣的 `EventDetailSerializer` 輸出（含活動基本欄位＋完整 `responses` 彙整），不是只回傳 `responses` 陣列本身。
+2. **comment 要不要正式顯示**：確認要，等於反轉 D12「本次不做顯示」的決定（見 D12 修訂記錄）。
+3. **verify 端點要不要一併改**：確認不改——`verify` 語意是核對身分＋核發 token，還沒有真正的資料異動，維持現狀的 `accessToken`/`nickname`/`email`/`slotAvailabilities` 已足夠支援前端帶入編輯表單，不需要整包活動資料。
+
+實作：`ParticipantResponseCreateView.post()`／`ParticipantResponseDetailView.patch()` 寫入完成後，重新用 `_event_with_responses_queryset()`（既有的 `prefetch_related("responses__slot_availabilities")` queryset，避免 N+1）查一次 `event`，序列化成 `EventDetailSerializer` 回傳，跟 `EventDetailView.get()`/`.patch()` 的既有寫法一致。`EventDetailSerializer.get_responses()` 加上 `comment` 欄位（D8/D12 同步修訂）。
 
 ## Risks / Trade-offs
 

@@ -78,3 +78,14 @@
   導致測試偶發真正選到兩個「不同名字、相同 id」的 slot（重複 id 被新的
   exhaustiveness 檢查攔下）——改成在新增第二個 slot 之前先取值 — (auto)
   `pytest`（全套 161 passed）皆乾淨
+- [x] 7.3 commit 後再追加需求（design.md D16）：`POST .../responses`／
+  `PATCH .../responses/{responseId}` 回應改回傳完整 `GET /api/events/{id}`
+  格式（不再是極簡的 `{id}`／`{id, slotAvailabilities}`），寫入完成後重新以
+  `_event_with_responses_queryset()` 查一次事件並用 `EventDetailSerializer`
+  序列化；`GET` 的 `responses` 彙整正式加入 `comment`（反轉 D12「本次不做
+  顯示」的決定）。事涉對外回應契約，先走 grill-me 確認三個問題（回應要多
+  完整／comment 要不要顯示／verify 端點要不要一併改），使用者三題皆選
+  Recommended：完整 GET 格式、加入 comment、verify 維持現狀不改。同步更新
+  受影響測試（`test_participant_can_submit_first_vote_successfully` 等）—
+  (auto) `pytest`（全套 161 passed）、`ruff check`、`manage.py check`、
+  `makemigrations --check --dry-run` 皆乾淨

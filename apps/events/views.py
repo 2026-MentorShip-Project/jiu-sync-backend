@@ -229,6 +229,13 @@ class ParticipantResponseCreateView(APIView):
     """``POST /api/events/{id}/responses`` — 任何人(含未登入)透過活動分享連結
     提交初次投票。完全公開,不需要登入,不採用任何身分驗證(即使帶了
     Authorization header 也不解析)。
+
+    回應改回傳完整活動內容(跟 ``GET /api/events/{id}`` 同一份
+    ``EventDetailSerializer`` 輸出),不是只回傳新建 response 的 ``id``——
+    使用者要求前端送出投票後能立即拿到最新彙整結果直接渲染,不用另外再打一次
+    ``GET``(design.md D16)。寫入完成後重新查一次
+    ``_event_with_responses_queryset()``,用 prefetch 過的 queryset 序列化,
+    避免 N+1。
     """
 
     permission_classes = [AllowAny]
@@ -242,11 +249,11 @@ class ParticipantResponseCreateView(APIView):
             data=request.data, context={"event": event}
         )
         serializer.is_valid(raise_exception=True)
-        participant_response = serializer.save()
+        serializer.save()
 
-        return Response(
-            {"id": str(participant_response.id)}, status=status.HTTP_201_CREATED
-        )
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
 
 def _hash_participant_access_token(token_value):
@@ -335,6 +342,10 @@ class ParticipantResponseDetailView(APIView):
 
     ``accessToken`` 刻意不放進 ``ParticipantResponsePatchSerializer`` 宣告
     (見該類別 docstring),這裡直接從 ``request.data`` 取值、比對雜湊。
+
+    回應同 ``ParticipantResponseCreateView``,改回傳完整活動內容(跟
+    ``GET /api/events/{id}`` 同一份 ``EventDetailSerializer`` 輸出),見
+    design.md D16。
     """
 
     permission_classes = [AllowAny]
@@ -422,13 +433,6 @@ class ParticipantResponseDetailView(APIView):
                 ]
             )
 
-        return Response(
-            {
-                "id": str(participant_response.id),
-                "slotAvailabilities": [
-                    {"slotId": str(item["slotId"]), "availability": item["availability"]}
-                    for item in availabilities
-                ],
-            },
-            status=status.HTTP_200_OK,
-        )
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_200_OK)

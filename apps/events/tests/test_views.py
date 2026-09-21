@@ -596,7 +596,10 @@ def test_event_detail_responses_field_contains_real_votes():
     slot_1 = event.slots.first()
     slot_2 = Slot.objects.create(event=event, date="2026-10-02")
     response_1 = _create_participant_response(
-        event, "小華", {slot_1: "available", slot_2: "if_needed"}
+        event,
+        "小華",
+        {slot_1: "available", slot_2: "if_needed"},
+        comment="19:00才能到",
     )
     response_2 = _create_participant_response(
         event, "小美", {slot_1: "unavailable", slot_2: "available"}
@@ -611,11 +614,13 @@ def test_event_detail_responses_field_contains_real_votes():
     by_id = {item["id"]: item for item in body["responses"]}
     assert set(by_id.keys()) == {response_1.id, response_2.id}
     assert by_id[response_1.id]["nickname"] == "小華"
+    assert by_id[response_1.id]["comment"] == "19:00才能到"
     assert {
         (item["slotId"], item["availability"])
         for item in by_id[response_1.id]["slotAvailabilities"]
     } == {(str(slot_1.id), "available"), (str(slot_2.id), "if_needed")}
     assert by_id[response_2.id]["nickname"] == "小美"
+    assert by_id[response_2.id]["comment"] is None
     assert {
         (item["slotId"], item["availability"])
         for item in by_id[response_2.id]["slotAvailabilities"]
@@ -636,7 +641,7 @@ def test_event_detail_responses_field_does_not_leak_phone_or_email():
     body = response.json()
     assert len(body["responses"]) == 1
     item = body["responses"][0]
-    assert set(item.keys()) == {"id", "nickname", "slotAvailabilities"}
+    assert set(item.keys()) == {"id", "nickname", "comment", "slotAvailabilities"}
     assert "phoneLastThree" not in item
     assert "email" not in item
 
@@ -1081,12 +1086,31 @@ def test_participant_can_submit_first_vote_successfully():
 
     assert response.status_code == status.HTTP_201_CREATED
     body = response.json()
-    assert set(body.keys()) == {"id"}
-    assert RESPONSE_SHORT_ID_RE.match(body["id"])
+    # 使用者要求:回應改成跟 GET /api/events/{id} 完全一樣的完整活動格式,前端
+    # 可直接拿來渲染,不用另外再打一次 GET(design.md D16)。
+    assert set(body.keys()) == {
+        "id",
+        "title",
+        "hostNickname",
+        "hostEmail",
+        "mode",
+        "responseDeadline",
+        "location",
+        "description",
+        "status",
+        "displayStatus",
+        "isOwner",
+        "slots",
+        "responses",
+    }
+    assert body["id"] == str(event.id)
+    assert len(body["responses"]) == 1
+    new_response_body = body["responses"][0]
+    assert RESPONSE_SHORT_ID_RE.match(new_response_body["id"])
 
     assert ParticipantResponse.objects.count() == 1
     participant_response = ParticipantResponse.objects.get()
-    assert str(participant_response.id) == body["id"]
+    assert str(participant_response.id) == new_response_body["id"]
     assert participant_response.nickname == "小華"
     assert participant_response.phone_last_three_hash != "123"
     assert check_password("123", participant_response.phone_last_three_hash)
@@ -1636,7 +1660,7 @@ def test_participant_response_id_collision_retries_and_still_succeeds(monkeypatc
         format="json",
     )
     assert first_response.status_code == status.HTTP_201_CREATED
-    existing_id = first_response.json()["id"]
+    existing_id = ParticipantResponse.objects.get(nickname="小美").id
     real_generate = generate_short_id
     calls = {"n": 0}
 
@@ -1656,7 +1680,8 @@ def test_participant_response_id_collision_retries_and_still_succeeds(monkeypatc
 
     assert response.status_code == status.HTTP_201_CREATED
     assert calls["n"] >= 2
-    assert response.json()["id"] != existing_id
+    new_id = ParticipantResponse.objects.get(nickname="小華").id
+    assert new_id != existing_id
     assert ParticipantResponse.objects.count() == 2
 
 
@@ -1908,6 +1933,17 @@ def test_participant_patch_with_valid_token_updates_slots_only():
     )
 
     assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    # 同 create 端點:回應改成完整 GET /api/events/{id} 格式(design.md D16)。
+    assert body["id"] == str(event.id)
+    response_item = next(
+        item for item in body["responses"] if item["id"] == participant_response.id
+    )
+    assert {
+        (item["slotId"], item["availability"])
+        for item in response_item["slotAvailabilities"]
+    } == {(str(slot_1.id), "unavailable"), (str(slot_2.id), "available")}
+
     participant_response.refresh_from_db()
     assert set(
         str(s) for s in participant_response.slots.values_list("id", flat=True)
