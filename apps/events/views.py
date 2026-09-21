@@ -44,12 +44,12 @@ def _get_event_or_404(id, queryset=None):
     資料時拋 ``EVENT_NOT_FOUND``(404)。不用 ``get_object_or_404``——那樣拿到的
     是 DRF 泛用的 ``NotFound``,只有粗粒度的 ``"NOT_FOUND"`` code。
 
-    ``queryset`` 預設 ``None`` 時用最小的 ``select_related``——三支參與者端點
-    都不會用 ``EventDetailSerializer`` 序列化整筆活動,不需要 ``responses``。
-    ``EventDetailView`` 的 ``GET``/``PATCH`` 都會回傳含 ``responses`` 欄位的
-    ``EventDetailSerializer`` 結果,兩者都傳入客製化的
-    ``prefetch_related("responses__slot_availabilities")`` queryset 換掉預設值
-    (見 ``EventDetailSerializer.get_responses()``),避免 N+1;不影響其他呼叫端。
+    ``queryset`` 預設 ``None`` 時用最小的 ``select_related``——前置條件檢查、
+    token 驗證這類不需要序列化整筆活動的呼叫點不用背負額外的 prefetch。
+    ``EventDetailView`` 的 ``GET``/``PATCH``,以及 ``ParticipantResponseCreateView``/
+    ``ParticipantResponseDetailView``(D16,寫入後改回傳完整活動內容)都會回傳
+    ``EventDetailSerializer`` 結果,皆傳入 ``_event_with_responses_queryset()``
+    換掉預設值,避免 N+1;不影響其他呼叫端。
     """
     if queryset is None:
         queryset = Event.objects.select_related("owner", "final_slot")
@@ -62,14 +62,15 @@ def _get_event_or_404(id, queryset=None):
 
 
 def _event_with_responses_queryset():
-    """``EventDetailView`` 的 ``GET``/``PATCH`` 共用——兩者都回傳含
-    ``responses`` 欄位的 ``EventDetailSerializer`` 結果,都需要
-    ``prefetch_related("responses__slot_availabilities")`` 避免 N+1(見
-    ``EventDetailSerializer.get_responses()``),抽成共用函式避免兩處各自重複
-    一次一模一樣的 queryset 組合。
+    """所有會回傳完整 ``EventDetailSerializer`` 結果的 view 共用
+    (``EventDetailView`` 的 ``GET``/``PATCH``,以及三態投票寫入後的
+    ``ParticipantResponseCreateView``/``ParticipantResponseDetailView``,見
+    D16)。``prefetch_related("slots", "responses__slot_availabilities")``
+    避免 ``get_responses()``/``get_slotSummary()``(D17)各自造成 N+1,抽成
+    共用函式避免多處重複一次一模一樣的 queryset 組合。
     """
     return Event.objects.select_related("owner", "final_slot").prefetch_related(
-        "responses__slot_availabilities"
+        "slots", "responses__slot_availabilities"
     )
 
 

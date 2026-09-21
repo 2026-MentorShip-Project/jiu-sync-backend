@@ -539,15 +539,21 @@ def test_expired_bearer_token_can_still_view_event_detail_anonymously():
 
 
 def test_event_detail_responses_field_is_empty_list_when_no_votes():
-    """② 活動無任何投票 → responses 為空陣列(既有行為維持)。"""
+    """② 活動無任何投票 → responses 為空陣列(既有行為維持),slotSummary 每個
+    時段三態皆為 0(新增,design.md D17)。"""
     owner = _create_user()
     event = _create_event(owner)
+    slot = event.slots.first()
     client = APIClient()
 
     response = client.get(_detail_url(event.id))
 
     assert response.status_code == status.HTTP_200_OK
-    assert response.json()["responses"] == []
+    body = response.json()
+    assert body["responses"] == []
+    assert body["slotSummary"] == [
+        {"slotId": str(slot.id), "available": 0, "if_needed": 0, "unavailable": 0}
+    ]
 
 
 def _create_participant_response(event, nickname, availabilities, **overrides):
@@ -625,6 +631,22 @@ def test_event_detail_responses_field_contains_real_votes():
         (item["slotId"], item["availability"])
         for item in by_id[response_2.id]["slotAvailabilities"]
     } == {(str(slot_1.id), "unavailable"), (str(slot_2.id), "available")}
+
+    # slotSummary（design.md D17）：slot_1 一票 available（小華）、一票
+    # unavailable（小美）；slot_2 一票 if_needed（小華）、一票 available（小美）。
+    summary_by_slot_id = {item["slotId"]: item for item in body["slotSummary"]}
+    assert summary_by_slot_id[str(slot_1.id)] == {
+        "slotId": str(slot_1.id),
+        "available": 1,
+        "if_needed": 0,
+        "unavailable": 1,
+    }
+    assert summary_by_slot_id[str(slot_2.id)] == {
+        "slotId": str(slot_2.id),
+        "available": 1,
+        "if_needed": 1,
+        "unavailable": 0,
+    }
 
 
 def test_event_detail_responses_field_does_not_leak_phone_or_email():
@@ -1101,12 +1123,22 @@ def test_participant_can_submit_first_vote_successfully():
         "displayStatus",
         "isOwner",
         "slots",
+        "slotSummary",
         "responses",
     }
     assert body["id"] == str(event.id)
     assert len(body["responses"]) == 1
     new_response_body = body["responses"][0]
     assert RESPONSE_SHORT_ID_RE.match(new_response_body["id"])
+    summary_by_slot_id = {item["slotId"]: item for item in body["slotSummary"]}
+    assert set(summary_by_slot_id.keys()) == set(slot_ids)
+    for item in summary_by_slot_id.values():
+        assert item == {
+            "slotId": item["slotId"],
+            "available": 1,
+            "if_needed": 0,
+            "unavailable": 0,
+        }
 
     assert ParticipantResponse.objects.count() == 1
     participant_response = ParticipantResponse.objects.get()

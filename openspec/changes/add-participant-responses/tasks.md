@@ -89,3 +89,18 @@
   受影響測試（`test_participant_can_submit_first_vote_successfully` 等）—
   (auto) `pytest`（全套 161 passed）、`ruff check`、`manage.py check`、
   `makemigrations --check --dry-run` 皆乾淨
+- [x] 7.4 commit 後再追加需求（design.md D17）：新增頂層 `slotSummary`
+  欄位，回傳每個候選時段的三態票數（`available`/`if_needed`/`unavailable`
+  各自整數），供前端呈現「這個時段幾個人可以」，之後才做「誰投了哪個時段」
+  （既有的 `responses[].slotAvailabilities` 已涵蓋，不需要另外設計）。事涉
+  新增對外回應欄位，先走 grill-me 確認三個問題（放哪裡／算什麼／key
+  命名），使用者三題皆選 Recommended：獨立頂層陣列（不塞進 `slots[]`）、只拆
+  三態原始票數（不額外算合計）、key 直接沿用 `available`/`if_needed`/
+  `unavailable`（不另外設計 camelCase 命名）。`EventDetailSerializer.
+  get_slotSummary()` 用已 prefetch 的資料在 Python 端累加，不下額外 query；
+  `_event_with_responses_queryset()` 補上 `slots` 的 prefetch。RED 先補
+  `test_event_detail_responses_field_is_empty_list_when_no_votes`（全為 0）、
+  `test_event_detail_responses_field_contains_real_votes`（混合三態票數）、
+  `test_participant_can_submit_first_vote_successfully` 的完整回應格式斷言
+  三處，確認 FAIL 後才實作 — (auto) `pytest`（全套 161 passed）、
+  `ruff check`、`manage.py check`、`makemigrations --check --dry-run` 皆乾淨

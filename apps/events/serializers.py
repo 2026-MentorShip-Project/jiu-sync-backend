@@ -404,6 +404,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
     displayStatus = serializers.SerializerMethodField()
     isOwner = serializers.SerializerMethodField()
     slots = SlotSerializer(many=True, read_only=True)
+    slotSummary = serializers.SerializerMethodField()
     responses = serializers.SerializerMethodField()
 
     class Meta:
@@ -421,6 +422,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "displayStatus",
             "isOwner",
             "slots",
+            "slotSummary",
             "responses",
         ]
 
@@ -428,6 +430,24 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         if not self._is_owner(event):
             return None
         return event.host_email
+
+    def get_slotSummary(self, event):
+        # design.md D17:前端要「不同時段的三態票數」,不用自己 reduce
+        # responses 陣列。key 沿用 availability 的 enum 值本身
+        # (available/if_needed/unavailable),不另外設計一套命名。用已經
+        # prefetch 過的 event.responses.all()/slot_availabilities.all()
+        # 累加計數,不對 DB 另外下 COUNT/GROUP BY query。
+        counts = {
+            slot.id: {"available": 0, "if_needed": 0, "unavailable": 0}
+            for slot in event.slots.all()
+        }
+        for participant_response in event.responses.all():
+            for availability in participant_response.slot_availabilities.all():
+                if availability.slot_id in counts:
+                    counts[availability.slot_id][availability.availability] += 1
+        return [
+            {"slotId": str(slot.id), **counts[slot.id]} for slot in event.slots.all()
+        ]
 
     def get_responses(self, event):
         # D8:回傳 nickname/slotAvailabilities/comment,刻意不含 phoneLastThree

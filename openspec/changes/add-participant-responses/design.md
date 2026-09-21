@@ -115,6 +115,18 @@ commit 後使用者追加要求：兩支端點原本只回傳極簡的 `{"id": .
 
 實作：`ParticipantResponseCreateView.post()`／`ParticipantResponseDetailView.patch()` 寫入完成後，重新用 `_event_with_responses_queryset()`（既有的 `prefetch_related("responses__slot_availabilities")` queryset，避免 N+1）查一次 `event`，序列化成 `EventDetailSerializer` 回傳，跟 `EventDetailView.get()`/`.patch()` 的既有寫法一致。`EventDetailSerializer.get_responses()` 加上 `comment` 欄位（D8/D12 同步修訂）。
 
+### D17. 新增頂層 `slotSummary`：每個候選時段的三態票數統計
+
+commit 後使用者追加要求：前端需要「不同時段的票數」讓使用者一眼看出哪個時段比較多人可以，之後才會再做「誰投了哪個時段」的細節（那個既有的 `responses[].slotAvailabilities` 已經涵蓋，不需要另外設計）。事涉新增對外回應欄位，先走 grill-me 確認三個問題：
+
+1. **放哪裡**：確認新增獨立的頂層陣列欄位 `slotSummary`（跟 `slots` 對稱，每個元素對應一個候選時段），不是塞進 `slots[]` 每個元素裡——不更動既有 `SlotSerializer` 的輸出格式。
+2. **算什麼**：確認只拆三態原始票數（`available`/`if_needed`/`unavailable` 三個整數），不額外算「可出席合計」之類的衍生值——前端需要的話自己加，避免後端替前端做決定。
+3. **key 命名**：確認三個計數欄位直接沿用既有 `availability` enum 值本身當 key（`available`/`if_needed`/`unavailable`，snake_case），不是另外設計一套 `availableCount` 這種 camelCase 命名——避免同一個概念在 API 裡有兩套字串。
+
+每個元素格式：`{"slotId": <候選時段識別碼>, "available": <int>, "if_needed": <int>, "unavailable": <int>}`，陣列順序跟 `slots` 一致（皆為 `event.slots.all()` 的順序）。`GET /api/events/{id}`、`POST .../responses`、`PATCH .../responses/{responseId}` 三個回傳完整活動內容的端點皆包含此欄位（`EventDetailSerializer` 統一序列化，見 D16）。
+
+實作：`EventDetailSerializer.get_slotSummary()` 用已經 `prefetch_related("slots", "responses__slot_availabilities")`（`_event_with_responses_queryset()`，本次一併把 `slots` 也加進 prefetch，避免這個新欄位跟既有 `slots` 欄位各自對 `event.slots.all()` 下一次查詢）過的資料在 Python 端累加計數，不對 DB 另下 `COUNT`/`GROUP BY` query。
+
 ## Risks / Trade-offs
 
 - **[風險] 手機末三碼可被暴力窮舉冒用身分改票（D1）** → 已與使用者確認為本次刻意接受的風險，不在 scope 內處理。緩解方向留給未來 change：失敗次數鎖定、或核對 API 加 IP／裝置層級的 rate limit。
