@@ -28,6 +28,8 @@
 
 跟參與者投票目前也沒有刪除權限一致。已與使用者確認（grill-me）——若未來需要，屬於獨立的後續 change。
 
+> **修訂記錄（2026-09-22）**：使用者追加要求「主揪可以刪除留言」，反轉本決定的「不支援刪除」部分——新增 `DELETE`，見 D9。仍不支援修改（edit）。
+
 ### D4. 不分頁，一次回傳全部；內容上限 200 字
 
 已與使用者確認（grill-me）：現階段預期單一活動的留言量不會大到需要分頁（同一批參與小型聚會的人），故不先設計分頁機制。內容長度上限比照 `ParticipantResponse.comment`（`add-participant-responses` D12）同款 200 字，維持全站留言類欄位長度上限一致。
@@ -50,6 +52,18 @@
 
 > **code-review 補充（2026-09-21）**：兩個非阻斷性小問題，皆已修正——① `GET` 端點的 `_display_status_or_410` 410 分支原本只有 `POST` 那條測試涵蓋，補上 `test_comment_list_link_expired_returns_410`；② `CommentListCreateView.get()` 原本手動 `event.comments.order_by("created_at")`，重複了 `Comment.Meta.ordering`（D8）已經定義的預設排序，簡化為 `event.comments.all()`。
 
+### D9. `DELETE /api/events/{id}/comments/{commentId}`：限主揪、軟刪除、`204 No Content`
+
+commit 後使用者追加要求：主揪（活動擁有者）可以刪除留言。已與使用者確認（grill-me）三點：
+
+1. **身分驗證**：比照 `PATCH /api/events/{id}` 既有模式——`IsAuthenticated`＋全域預設的 `JWTAuthentication`，比對 `request.user == event.owner`，不符回 403 `Forbidden`。這點只有一個合理做法（留言板依附在活動上，刪除權限自然跟編輯活動的擁有者權限一致），沒有分歧，未特別詢問即採用。
+2. **刪除方式**：軟刪除（`Comment` 新增 `deleted_at`，nullable `DateTimeField`），不是物理刪除——保留刪除紀錄，非本次要求但屬合理預期用途：日後若需要追查「這則留言曾經存在過、被誰刪除」（例如主揪濫刪爭議）留有資料可查，物理刪除做不到。
+3. **回應**：`204 No Content`，空 body，符合 REST 慣例。
+
+`GET /api/events/{id}/comments` SHALL 排除已軟刪除的留言（`deleted_at__isnull=True`）——對查詢者而言，已刪除的留言就是不存在，不會在列表裡看到。`DELETE` 對象若該留言不存在、已經被刪除過、或屬於另一場活動（URL 的 `id` 跟該留言的 `event_id` 不匹配），一律回 404 `COMMENT_NOT_FOUND`，不細分原因——外部行為一致（都是「你要刪的東西不在」），這是自然結果，不是本次刻意設計的側通道防禦。
+
+> **code-review 補充**：`CommentDetailView.delete()` 初版用「先 `SELECT ... WHERE deleted_at IS NULL` 確認存在，再 `.save()`」的寫法，跟先前 `ParticipantResponseDetailView.patch()` 的 token 消費犯過同一種 TOCTOU 錯誤——兩個並發請求對著同一則留言同時通過 `SELECT` 檢查，都會成功寫入 `deleted_at`、都回 204，跟本節「已刪除過的留言再次刪除回 404」的規則矛盾。修法比照該次的既有修法：改成 compare-and-swap（`Comment.objects.filter(pk=..., deleted_at__isnull=True).update(deleted_at=now)`），用 `UPDATE` 影響的 row 數判斷輸贏，不靠 Python 物件裡讀到的舊值。已用真實併發測試驗證（兩個 thread 各自獨立 DB connection 同時 DELETE 同一則留言），修正前 FAIL（兩個都回 204）、修正後 PASS（一個 204、一個 404）。
+
 ## Risks / Trade-offs
 
 - **[風險] 無防灌水／rate limit 機制** → 跟手機末三碼暴力風險（`add-participant-responses` D1）同類的「本次刻意接受」風險，任何人都能無限次留言。緩解方向留給未來 change：IP／裝置層級 rate limit，或要求先核對身分。
@@ -58,3 +72,5 @@
 ## Migration Plan
 
 新增 migration：`Comment`（FK `Event`，`related_name="comments"`）。純新增資料表，不修改既有 `Event`/`Slot`/`ParticipantResponse` schema，回滾只需 reverse migration，不影響既有端點。
+
+D9（刪除功能）追加一個小 migration：`Comment.deleted_at`（nullable `DateTimeField`）。**不**比照 `add-participant-responses` D15 的做法把它併回原本的 `Comment` migration——D15 那次是被 Django 限制強迫的（plain M2M 不能直接 `AlterField` 成帶 through model 的 M2M，沒有別的選擇），單純新增一個 nullable 欄位沒有這個限制，`AddField` 本身就是安全、可疊加的操作。既然沒有技術上的必要，就不重演squash 那套「刪掉已套用的 migration、手動修復本地 DB 記錄」的麻煩與風險，直接新增一個小 migration（`0005_comment_deleted_at.py`）即可。

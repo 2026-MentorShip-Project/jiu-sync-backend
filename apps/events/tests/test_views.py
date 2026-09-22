@@ -2717,3 +2717,163 @@ def test_comment_list_nonexistent_event_returns_404():
 
     assert response.status_code == status.HTTP_404_NOT_FOUND
     assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/events/{id}/comments/{commentId} (add-event-comments D9)
+# ---------------------------------------------------------------------------
+
+
+def _comment_delete_url(event_id, comment_id):
+    return f"/api/events/{event_id}/comments/{comment_id}/"
+
+
+def test_comment_owner_can_delete_own_event_comment():
+    """① 主揪本人刪除存在且未刪除的留言 → 204,空 body,該留言之後不再出現在
+    GET 列表。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    comment = Comment.objects.create(event=event, nickname="小華", message="哈囉")
+    client = _auth_client(owner)
+
+    response = client.delete(_comment_delete_url(event.id, comment.id))
+
+    assert response.status_code == status.HTTP_204_NO_CONTENT
+    assert response.data is None
+    comment.refresh_from_db()
+    assert comment.deleted_at is not None
+
+    list_response = APIClient().get(_comments_url(event.id))
+    assert list_response.json() == []
+
+
+def test_comment_delete_by_non_owner_returns_403():
+    """② 已登入但非擁有者刪除 → 403 FORBIDDEN,留言不受影響(比照
+    test_non_owner_authenticated_user_cannot_patch_event 同款寫法)。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(owner)
+    comment = Comment.objects.create(event=event, nickname="小華", message="哈囉")
+    client = _auth_client(other_user)
+
+    response = client.delete(_comment_delete_url(event.id, comment.id))
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
+    comment.refresh_from_db()
+    assert comment.deleted_at is None
+
+
+def test_comment_delete_unauthenticated_returns_401():
+    """②之二 未登入(不帶 token)刪除 → 401,留言不受影響(比照
+    test_unauthenticated_user_cannot_patch_event 同款寫法)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    comment = Comment.objects.create(event=event, nickname="小華", message="哈囉")
+    client = APIClient()
+
+    response = client.delete(_comment_delete_url(event.id, comment.id))
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    comment.refresh_from_db()
+    assert comment.deleted_at is None
+
+
+def test_comment_delete_nonexistent_comment_returns_404():
+    """③ 刪除不存在的留言 id → 404 COMMENT_NOT_FOUND。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+
+    response = client.delete(_comment_delete_url(event.id, generate_short_id()))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "COMMENT_NOT_FOUND"
+
+
+def test_comment_delete_already_deleted_returns_404():
+    """④ 對已刪除過的留言再次刪除 → 404 COMMENT_NOT_FOUND,不重複標記。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    comment = Comment.objects.create(
+        event=event, nickname="小華", message="哈囉", deleted_at=timezone.now()
+    )
+    client = _auth_client(owner)
+
+    response = client.delete(_comment_delete_url(event.id, comment.id))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "COMMENT_NOT_FOUND"
+
+
+def test_comment_delete_comment_belonging_to_another_event_returns_404():
+    """⑤ 用另一場活動的 id 搭配這場活動的留言 id → 404 COMMENT_NOT_FOUND。"""
+    owner = _create_user()
+    event_a = _create_event(owner)
+    event_b = _create_event(owner, title="另一場活動")
+    comment = Comment.objects.create(event=event_b, nickname="小華", message="哈囉")
+    client = _auth_client(owner)
+
+    response = client.delete(_comment_delete_url(event_a.id, comment.id))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "COMMENT_NOT_FOUND"
+    comment.refresh_from_db()
+    assert comment.deleted_at is None
+
+
+def test_comment_list_excludes_deleted_comments():
+    """⑥ 活動有 2 則留言、其中 1 則已刪除 → 列表只回未刪除的那 1 則。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    visible = Comment.objects.create(event=event, nickname="小華", message="還在")
+    Comment.objects.create(
+        event=event, nickname="小美", message="被刪了", deleted_at=timezone.now()
+    )
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert [item["id"] for item in body] == [visible.id]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_comment_delete_concurrent_requests_only_one_succeeds():
+    """code-review 補充:兩個請求幾乎同時對同一則留言送出 DELETE,DB 層級的
+    compare-and-swap(``UPDATE ... WHERE deleted_at IS NULL``)必須保證只有一個
+    真的成功——不能只靠 Python 物件裡讀到的舊值判斷(同款問題先前已在
+    ParticipantResponseDetailView.patch() 的 token 消費修過一次,見 design.md
+    D9)。用 ``transaction=True`` 讓兩個執行緒各自拿到真正獨立的 DB
+    connection,才測得出真實的併發行為。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+    comment = Comment.objects.create(event=event, nickname="小華", message="哈囉")
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_delete():
+        start_barrier.wait()
+        client = _auth_client(owner)
+        try:
+            response = client.delete(_comment_delete_url(event.id, comment.id))
+            status_codes.append(response.status_code)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=send_delete) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_204_NO_CONTENT,
+        status.HTTP_404_NOT_FOUND,
+    ]
+    comment.refresh_from_db()
+    assert comment.deleted_at is not None

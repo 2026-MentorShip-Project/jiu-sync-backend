@@ -144,6 +144,10 @@ class Comment(models.Model):
     不要求同一活動內暱稱唯一（同一人可留多則留言，見 D6）——因此沒有
     ``unique_together``，短 id 碰撞重試邏輯不需要像 ``ParticipantResponse``
     那樣先查暱稱區分成因，``IntegrityError`` 一律視為 id 碰撞（見 D7）。
+
+    ``deleted_at`` 為軟刪除標記（見 D9）——只有活動擁有者可以刪除留言，刪除
+    不做實體刪除，保留紀錄；非 null 即代表已被刪除，``CommentListCreateView.get()``
+    查詢時會排除這些留言。
     """
 
     id = models.CharField(
@@ -153,6 +157,7 @@ class Comment(models.Model):
     nickname = models.CharField(max_length=40)
     message = models.CharField(max_length=200)
     created_at = models.DateTimeField(auto_now_add=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["created_at"]
