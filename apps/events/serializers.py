@@ -26,7 +26,8 @@ def _validate_host_nickname_weighted_length(value):
     if _weighted_length(value) > HOST_NICKNAME_MAX_WEIGHTED_LENGTH:
         raise serializers.ValidationError(
             f"主揪暱稱加權長度(CJK 字元計 2、其餘計 1)不得超過"
-            f" {HOST_NICKNAME_MAX_WEIGHTED_LENGTH}"
+            f" {HOST_NICKNAME_MAX_WEIGHTED_LENGTH}",
+            code="HOST_NICKNAME_TOO_LONG",
         )
     return value
 
@@ -34,7 +35,9 @@ def _validate_host_nickname_weighted_length(value):
 def _validate_response_deadline_in_future(value):
     """`responseDeadline` 須晚於當下驗證,`EventCreateSerializer`/`EventPatchSerializer` 共用。"""
     if value <= timezone.now():
-        raise serializers.ValidationError("投票截止時間必須晚於目前時間")
+        raise serializers.ValidationError(
+            "投票截止時間必須晚於目前時間", code="DEADLINE_IN_PAST"
+        )
     return value
 
 
@@ -45,7 +48,12 @@ class SlotCreateSerializer(serializers.Serializer):
     這個值會被自動忽略,建立時一律由 ``Slot`` model 的 UUID 預設值產生。
     """
 
-    date = serializers.DateField()
+    # DRF DateField 格式錯誤的內建翻譯剛好沒收錄 zh-hant(同欄位的 TimeField
+    # 卻有中文翻譯，屬於第三方翻譯檔覆蓋不全),手動覆寫成中文，不讓英文原文
+    # 穿透到回應內容。
+    date = serializers.DateField(
+        error_messages={"invalid": "日期格式錯誤，請用 YYYY-MM-DD 格式"}
+    )
     time = serializers.TimeField(required=False, allow_null=True)
     # max_length 對齊 Slot.label 的 varchar(100)——plain Serializer 不會像
     # ModelSerializer 一樣自動從 model 繼承欄位限制,若不宣告,超長 label 要到
@@ -87,9 +95,13 @@ class EventCreateSerializer(serializers.ModelSerializer):
         return _validate_response_deadline_in_future(value)
 
     def validate_slots(self, value):
-        if not (MIN_SLOTS <= len(value) <= MAX_SLOTS):
+        if len(value) < MIN_SLOTS:
             raise serializers.ValidationError(
-                f"候選時段筆數須介於 {MIN_SLOTS} 至 {MAX_SLOTS} 之間"
+                f"候選時段至少須有 {MIN_SLOTS} 筆", code="SLOTS_REQUIRED"
+            )
+        if len(value) > MAX_SLOTS:
+            raise serializers.ValidationError(
+                f"候選時段最多 {MAX_SLOTS} 個", code="TOO_MANY_SLOTS"
             )
         return value
 
@@ -176,6 +188,13 @@ class _OwnerAndDisplayStatusMixin:
         return self._is_owner(event)
 
     def get_displayStatus(self, event):
+        # EventDetailView.get() 為了判斷要不要回 410 LINK_EXPIRED,已經算過一次
+        # displayStatus,算好的值會放進 context 直接複用,不用重算(同一個純函式、
+        # 同一組參數,沒有理由算兩次)。其他呼叫端(例如清單頁)沒有預先算過,
+        # 正常呼叫這個純函式即可。
+        precomputed = self.context.get("display_status")
+        if precomputed is not None:
+            return precomputed
         return compute_display_status(
             event.status,
             event.response_deadline,

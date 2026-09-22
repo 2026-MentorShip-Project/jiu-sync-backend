@@ -30,6 +30,18 @@ def _base_claims(**overrides):
     return claims
 
 
+def test_missing_id_token_returns_400_with_id_token_required_code():
+    """新增:請求 body 沒帶 idToken → 400,code 為 "ID_TOKEN_REQUIRED"(依
+    config/exceptions.py 的 FIELD_CODE_OVERRIDES 把 DRF 原始的 "required" code
+    換成語意化字串,見 add-error-code-table 的修訂記錄)。"""
+    client = APIClient()
+
+    response = client.post(GOOGLE_LOGIN_URL, {}, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "ID_TOKEN_REQUIRED"
+
+
 @patch("apps.accounts.views.verify_google_id_token")
 def test_valid_id_token_returns_200_with_access_and_user_but_not_refresh_in_body(mock_verify):
     """① 合法 idToken → 200，body 只含 access/user（不含 refresh），且資料庫多一筆 User。

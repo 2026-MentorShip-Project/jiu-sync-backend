@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -7,7 +7,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
+from config.exceptions import ApiError, Gone
+
 from .authentication import OptionalJWTAuthentication
+from .lifecycle import compute_display_status
 from .models import Event
 from .serializers import (
     EventCreateSerializer,
@@ -15,6 +18,19 @@ from .serializers import (
     EventPatchSerializer,
     EventSummarySerializer,
 )
+
+
+def _get_event_or_404(id):
+    """``GET``/``PATCH /api/events/{id}`` 共用的活動查找,查無資料時拋
+    ``EVENT_NOT_FOUND``(404)。不用 ``get_object_or_404``——那樣拿到的是 DRF
+    泛用的 ``NotFound``,只有粗粒度的 ``"NOT_FOUND"`` code。
+    """
+    event = Event.objects.select_related("owner", "final_slot").filter(pk=id).first()
+    if event is None:
+        raise ApiError(
+            "找不到此活動，可能已被刪除或網址錯誤", code="EVENT_NOT_FOUND", status_code=404
+        )
+    return event
 
 
 class EventListView(APIView):
@@ -35,7 +51,7 @@ class EventListView(APIView):
     def get(self, request):
         if request.query_params.get("owner") != "me":
             raise serializers.ValidationError(
-                {"owner": "缺少必要查詢參數 owner=me"}
+                {"owner": "缺少必要查詢參數 owner=me"}, code="OWNER_PARAM_REQUIRED"
             )
         events = Event.objects.filter(owner=request.user).select_related(
             "owner", "final_slot"
@@ -76,10 +92,16 @@ class EventDetailView(APIView):
     """``GET /api/events/{id}`` — 任何人(含未登入)可查詢活動完整資料。
     ``PATCH /api/events/{id}`` — 已登入擁有者編輯活動六個基本欄位。
 
-    查無資料時 ``get_object_or_404`` 拋出的 ``Http404``,會被 DRF 預設的
-    ``exception_handler`` 攔截轉成 ``NotFound``,再經
-    ``config.exceptions.custom_exception_handler`` 統一包成 ``{message, code}``
-    形狀,不需要額外接線。
+    查無資料時拋 ``ApiError(..., code="EVENT_NOT_FOUND", status_code=404)``(不用
+    ``get_object_or_404``,那樣拿到的是 DRF 泛用的 ``NotFound``,只有粗粒度的
+    ``"NOT_FOUND"`` code,前端要的是活動專屬的 ``EVENT_NOT_FOUND``)。
+
+    ``GET`` 額外處理連結失效:算出來的 ``displayStatus`` 是 ``"link_expired"``
+    時(活動已定案/取消超過 7 天,見 ``lifecycle.compute_display_status``)回
+    410 ``Gone``,不是 200——不用手動判斷 finalize/cancel 邏輯,直接複用既有的
+    純函式。目前系統還沒有 finalize/cancel 端點,這個分支現在測不到真實觸發
+    路徑,只能靠直接建立測試資料驗證(跟 ``compute_display_status`` 本身的其他
+    分支一樣)。
 
     ``get_permissions()``/``get_authenticators()`` 依 ``self.request.method``
     分派——``GET`` 沿用 ``AllowAny`` + ``OptionalJWTAuthentication``(見該類別
@@ -99,20 +121,30 @@ class EventDetailView(APIView):
         return [OptionalJWTAuthentication()]
 
     def get(self, request, id):
-        event = get_object_or_404(
-            Event.objects.select_related("owner", "final_slot"), pk=id
+        event = _get_event_or_404(id)
+        display_status = compute_display_status(
+            event.status,
+            event.response_deadline,
+            event.finalized_at,
+            event.cancelled_at,
+            event.final_slot.date if event.final_slot else None,
+            timezone.now(),
         )
-        serializer = EventDetailSerializer(event, context={"request": request})
+        if display_status == "link_expired":
+            raise Gone("此活動連結已失效（活動結束超過7天）", code="LINK_EXPIRED")
+        serializer = EventDetailSerializer(
+            event, context={"request": request, "display_status": display_status}
+        )
         return Response(serializer.data)
 
     def patch(self, request, id):
-        event = get_object_or_404(
-            Event.objects.select_related("owner", "final_slot"), pk=id
-        )
+        event = _get_event_or_404(id)
         if request.user != event.owner:
             raise PermissionDenied("僅活動擁有者可編輯此活動")
         if event.status != Event.Status.ACTIVE:
-            raise serializers.ValidationError("僅進行中的活動可編輯")
+            raise ApiError(
+                "活動已定案或取消，無法編輯", code="EVENT_NOT_ACTIVE", status_code=409
+            )
 
         serializer = EventPatchSerializer(event, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)

@@ -91,7 +91,12 @@ def test_unauthenticated_user_cannot_create_event():
 
 
 def test_response_deadline_equal_to_or_earlier_than_now_returns_400():
-    """③ responseDeadline 等於或早於送出當下時間 → 400,不建立任何資料。"""
+    """③ responseDeadline 等於或早於送出當下時間 → 400,code 為 "DEADLINE_IN_PAST",
+    不建立任何資料。
+
+    新增 code 斷言:後續 change 追加的刻意行為變更(400 驗證錯誤改回每條規則配
+    專屬 code,見 add-error-code-table 的修訂記錄),不是遷就實作結果。
+    """
     user = _create_user()
     client = _auth_client(user)
     now = timezone.now()
@@ -101,31 +106,74 @@ def test_response_deadline_equal_to_or_earlier_than_now_returns_400():
             EVENTS_URL, _valid_payload(responseDeadline=deadline.isoformat()), format="json"
         )
         assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["code"] == "DEADLINE_IN_PAST"
 
     assert Event.objects.count() == 0
 
 
 def test_slots_count_zero_or_over_20_returns_400():
-    """④ slots 為 0 筆或超過 20 筆 → 400,不建立任何資料。"""
+    """④ slots 0 筆 → 400,code 為 "SLOTS_REQUIRED";超過 20 筆 → 400,code 為
+    "TOO_MANY_SLOTS"。不建立任何資料。
+
+    新增 code 斷言,理由同上(add-error-code-table 修訂記錄)。
+    """
     user = _create_user()
     client = _auth_client(user)
     too_many_slots = [{"date": f"2026-10-{day:02d}"} for day in range(1, 22)]
 
-    for slots in ([], too_many_slots):
-        response = client.post(EVENTS_URL, _valid_payload(slots=slots), format="json")
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+    response = client.post(EVENTS_URL, _valid_payload(slots=[]), format="json")
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOTS_REQUIRED"
+
+    response = client.post(EVENTS_URL, _valid_payload(slots=too_many_slots), format="json")
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "TOO_MANY_SLOTS"
 
     assert Event.objects.count() == 0
 
 
 def test_title_over_30_chars_returns_400():
-    """⑤ title 超過 30 字元 → 400。"""
+    """⑤ title 超過 30 字元 → 400,code 為 "TITLE_TOO_LONG"。
+
+    新增 code 斷言,理由同上(add-error-code-table 修訂記錄)。
+    """
     user = _create_user()
     client = _auth_client(user)
 
     response = client.post(EVENTS_URL, _valid_payload(title="揪" * 31), format="json")
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "TITLE_TOO_LONG"
+    assert Event.objects.count() == 0
+
+
+def test_field_code_overrides_for_required_and_invalid_choice_and_max_length():
+    """新增:補齊 FIELD_CODE_OVERRIDES 剩下沒被其他測試覆蓋到的對照表項目——
+    title/hostNickname 未填(required)、mode 不合法(invalid_choice)、
+    location/description 超過長度上限(max_length),各自的 code 是否真的對得上
+    對照表(而不是漏配、退回 DRF 原始的 "required"/"max_length" 等泛用字串)。"""
+    user = _create_user()
+    client = _auth_client(user)
+
+    payload_without_title = _valid_payload()
+    del payload_without_title["title"]
+    response = client.post(EVENTS_URL, payload_without_title, format="json")
+    assert response.json()["code"] == "TITLE_REQUIRED"
+
+    payload_without_nickname = _valid_payload()
+    del payload_without_nickname["hostNickname"]
+    response = client.post(EVENTS_URL, payload_without_nickname, format="json")
+    assert response.json()["code"] == "HOST_NICKNAME_REQUIRED"
+
+    response = client.post(EVENTS_URL, _valid_payload(mode="not-a-real-mode"), format="json")
+    assert response.json()["code"] == "MODE_INVALID"
+
+    response = client.post(EVENTS_URL, _valid_payload(location="l" * 201), format="json")
+    assert response.json()["code"] == "LOCATION_TOO_LONG"
+
+    response = client.post(EVENTS_URL, _valid_payload(description="d" * 51), format="json")
+    assert response.json()["code"] == "DESCRIPTION_TOO_LONG"
+
     assert Event.objects.count() == 0
 
 
@@ -141,7 +189,8 @@ def test_host_nickname_weighted_length_exactly_40_is_allowed():
 
 
 def test_host_nickname_weighted_length_over_40_returns_400():
-    """⑥ hostNickname 加權長度超過 40(CJK 字元計 2、其餘計 1)→ 400。"""
+    """⑥ hostNickname 加權長度超過 40(CJK 字元計 2、其餘計 1)→ 400,code 為
+    "HOST_NICKNAME_TOO_LONG"。"""
     user = _create_user()
     client = _auth_client(user)
     nickname = "揪" * 21  # 21 CJK chars * weight 2 = 42
@@ -149,6 +198,7 @@ def test_host_nickname_weighted_length_over_40_returns_400():
     response = client.post(EVENTS_URL, _valid_payload(hostNickname=nickname), format="json")
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "HOST_NICKNAME_TOO_LONG"
     assert Event.objects.count() == 0
 
 
@@ -222,6 +272,61 @@ def test_slot_label_over_100_chars_returns_400():
     response = client.post(EVENTS_URL, payload, format="json")
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert Event.objects.count() == 0
+
+
+def test_slot_date_wrong_format_returns_chinese_message_not_english():
+    """新增:slots[].date 格式錯誤 → code 為 "SLOT_DATE_INVALID",message 是中文,
+    不是 DRF DateField 內建的英文原文("Date has wrong format...")。
+
+    DRF 對 DateField 格式錯誤的內建翻譯剛好沒收錄 zh-hant(同欄位的 TimeField
+    卻有中文翻譯),屬於第三方翻譯檔覆蓋不全,不是我們自己程式碼的問題。這裡
+    直接在欄位宣告用 error_messages 覆寫,不影響 code(仍走
+    NESTED_SUBFIELD_CODE_OVERRIDES 對照表)。
+    """
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(slots=[{"date": "not-a-date"}])
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    assert body["code"] == "SLOT_DATE_INVALID"
+    assert body["errors"] == [
+        {
+            "field": "slots[0].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
+    assert "Date has wrong format" not in body["message"]
+    assert Event.objects.count() == 0
+
+
+def test_slot_date_wrong_format_uses_correct_index_when_multiple_slots():
+    """新增:多筆 slots 裡只有其中一筆(索引 1)日期格式錯誤 → errors 陣列的
+    field 正確標出 "slots[1].date"(不是 "slots[0].date"),證明巢狀索引路徑
+    對「只有部分索引失敗」的真實情境也正確——這正是先前落差沒被抓到的情境
+    (DRF 對這種情況回傳的是只含失敗索引的 dict,不是補滿通過索引的完整 list)。
+    """
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(
+        slots=[{"date": "2026-10-01"}, {"date": "not-a-date"}, {"date": "2026-10-03"}]
+    )
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    assert body["errors"] == [
+        {
+            "field": "slots[1].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
     assert Event.objects.count() == 0
 
 
@@ -361,14 +466,19 @@ def test_non_owner_authenticated_user_cannot_see_host_email():
     assert body["hostEmail"] is None
 
 
-def test_nonexistent_event_id_returns_404_with_api_error_shape():
-    """④ 請求不存在的 id → 404,body 符合 api-error-format 的 {message, code} 形狀。
+def test_nonexistent_event_id_returns_404_with_event_not_found_code():
+    """④ 請求不存在的 id → 404,body 符合 api-error-format 的 {message, code} 形狀,
+    code 為活動專屬的 "EVENT_NOT_FOUND"(不是泛用的 "NOT_FOUND")。
 
     刻意用「形狀合法、但沒有對應資料」的短 id(而非隨機格式錯誤的字串)——這
     樣不管 URL 路由層用的是 `<str:id>` 還是自訂的 8 碼 base62 converter,都能
-    確保請求真的會走到 view 層的 `get_object_or_404`,測的是 API 層級的 404
-    (`custom_exception_handler` 包裝的 {message, code} 形狀),而不是路由層級
-    比對不到路徑的 404(那個不會經過同一個 exception handler)。
+    確保請求真的會走到 view 層(`custom_exception_handler` 包裝的
+    {message, code} 形狀),而不是路由層級比對不到路徑的 404(那個不會經過同一
+    個 exception handler)。
+
+    code 從泛用 "NOT_FOUND" 改成專屬 "EVENT_NOT_FOUND":這是後續 change 追加的
+    刻意行為變更(前端要求活動查無資料要有專屬 code,見 add-error-code-table
+    的修訂記錄),不是遷就實作結果而放寬測試。
     """
     client = APIClient()
 
@@ -377,6 +487,30 @@ def test_nonexistent_event_id_returns_404_with_api_error_shape():
     assert response.status_code == status.HTTP_404_NOT_FOUND
     body = response.json()
     assert set(body.keys()) == {"message", "code"}
+    assert body["code"] == "EVENT_NOT_FOUND"
+
+
+def test_event_detail_link_expired_returns_410_with_link_expired_code():
+    """新增:displayStatus 算出 "link_expired" 時(活動已定案/取消超過 7 天)→
+    410 Gone,不是 200,code 為 "LINK_EXPIRED"。
+
+    目前系統沒有 finalize/cancel 端點,無法透過任何 API 真的把活動變成這個
+    狀態,直接用 Event.objects.create(..., status=..., cancelled_at=...) 建立
+    測試資料驗證,不透過任何 API。
+    """
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = APIClient()
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_410_GONE
+    body = response.json()
+    assert body["code"] == "LINK_EXPIRED"
 
 
 def test_event_detail_display_status_reflects_expired_deadline():
@@ -484,14 +618,16 @@ def test_unauthenticated_user_cannot_list_own_events():
 
 
 def test_missing_owner_me_query_param_returns_400():
-    """④ 缺少 owner=me 查詢參數 → 400 驗證錯誤(專案慣例:走
-    serializers.ValidationError,由 custom_exception_handler 統一包裝)。"""
+    """④ 缺少 owner=me 查詢參數 → 400 驗證錯誤,code 為 "OWNER_PARAM_REQUIRED"
+    (專案慣例:走 serializers.ValidationError,由 custom_exception_handler
+    統一包裝)。"""
     user = _create_user()
     client = _auth_client(user)
 
     response = client.get(EVENTS_URL)
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "OWNER_PARAM_REQUIRED"
 
 
 def _patch_payload(**overrides):
@@ -599,7 +735,10 @@ def test_owner_patch_ignores_fields_outside_the_six():
 
 
 def test_non_owner_authenticated_user_cannot_patch_event():
-    """⑤ 已登入但非擁有者送出編輯 → 403,資料庫該筆活動完全未變動。"""
+    """⑤ 已登入但非擁有者送出編輯 → 403,code 為通用的 "FORBIDDEN"(刻意不配專屬
+    code,見 grill-me 決策:PATCH 非擁有者這類新情況一律用通用 code,不像
+    apps.accounts 既有的 REFRESH_TOKEN_NOT_YOURS 那樣配專屬字串),資料庫該筆
+    活動完全未變動。"""
     owner = _create_user(email="host@example.com", google_sub="sub-1")
     other_user = _create_user(email="other@example.com", google_sub="sub-2")
     event = _create_event(owner)
@@ -609,6 +748,7 @@ def test_non_owner_authenticated_user_cannot_patch_event():
     response = client.patch(_detail_url(event.id), {"title": "偷改標題"}, format="json")
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
     event.refresh_from_db()
     assert event.title == original_title
 
@@ -627,9 +767,15 @@ def test_unauthenticated_user_cannot_patch_event():
     assert event.title == original_title
 
 
-def test_patch_finalized_or_cancelled_event_returns_400():
-    """⑦ status="finalized"/"cancelled" 的活動編輯 → 400,資料庫未變動。直接用
-    Event.objects.create(..., status=...) 建立測試資料,不透過任何 API。"""
+def test_patch_finalized_or_cancelled_event_returns_409_with_event_not_active_code():
+    """⑦ status="finalized"/"cancelled" 的活動編輯 → 409(不是 400),code 為
+    "EVENT_NOT_ACTIVE",資料庫未變動。直接用 Event.objects.create(..., status=...)
+    建立測試資料,不透過任何 API。
+
+    狀態碼從 400 改成 409、並加上專屬 code:這是後續 change 追加的刻意行為變更
+    (前端明確要求活動狀態衝突用 409 Conflict,見 add-error-code-table 的修訂
+    記錄),不是遷就實作結果而放寬測試。
+    """
     owner = _create_user()
     client = _auth_client(owner)
 
@@ -641,13 +787,15 @@ def test_patch_finalized_or_cancelled_event_returns_400():
             _detail_url(event.id), {"title": "偷改標題"}, format="json"
         )
 
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.json()["code"] == "EVENT_NOT_ACTIVE"
         event.refresh_from_db()
         assert event.title == original_title
 
 
 def test_patch_response_deadline_equal_to_or_earlier_than_now_returns_400():
-    """⑧ responseDeadline 等於或早於送出當下時間 → 400,資料庫未變動。"""
+    """⑧ responseDeadline 等於或早於送出當下時間 → 400,code 為 "DEADLINE_IN_PAST",
+    資料庫未變動。"""
     owner = _create_user()
     event = _create_event(owner)
     client = _auth_client(owner)
@@ -661,9 +809,28 @@ def test_patch_response_deadline_equal_to_or_earlier_than_now_returns_400():
             format="json",
         )
         assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["code"] == "DEADLINE_IN_PAST"
 
     event.refresh_from_db()
     assert event.response_deadline == original_deadline
+
+
+def test_patch_host_email_invalid_format_returns_400_with_host_email_invalid_code():
+    """新增:hostEmail 格式不合法 → 400,code 為 "HOST_EMAIL_INVALID"(依
+    config/exceptions.py 的 FIELD_CODE_OVERRIDES 把 DRF EmailField 原始的
+    "invalid" code 換成語意化字串)。"""
+    owner = _create_user()
+    event = _create_event(owner, host_email="original@example.com")
+    client = _auth_client(owner)
+
+    response = client.patch(
+        _detail_url(event.id), {"hostEmail": "not-an-email"}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "HOST_EMAIL_INVALID"
+    event.refresh_from_db()
+    assert event.host_email == "original@example.com"
 
 
 def test_patch_host_email_can_differ_from_account_email():
@@ -688,9 +855,9 @@ def test_patch_host_email_can_differ_from_account_email():
     assert event.host_email != owner.email
 
 
-def test_patch_nonexistent_event_id_returns_404_with_api_error_shape():
+def test_patch_nonexistent_event_id_returns_404_with_event_not_found_code():
     """⑩ 對不存在的活動 id 送出編輯 → 404,body 符合 api-error-format 的
-    {message, code} 形狀。"""
+    {message, code} 形狀,code 為活動專屬的 "EVENT_NOT_FOUND"。"""
     user = _create_user()
     client = _auth_client(user)
 
@@ -701,10 +868,12 @@ def test_patch_nonexistent_event_id_returns_404_with_api_error_shape():
     assert response.status_code == status.HTTP_404_NOT_FOUND
     body = response.json()
     assert set(body.keys()) == {"message", "code"}
+    assert body["code"] == "EVENT_NOT_FOUND"
 
 
 def test_patch_title_over_30_chars_returns_400():
-    """⑪ title 超過 30 字元 → 400(確認沿用既有長度驗證邏輯有正確接上)。"""
+    """⑪ title 超過 30 字元 → 400,code 為 "TITLE_TOO_LONG"(確認沿用既有長度
+    驗證邏輯有正確接上)。"""
     owner = _create_user()
     event = _create_event(owner)
     client = _auth_client(owner)
@@ -715,5 +884,6 @@ def test_patch_title_over_30_chars_returns_400():
     )
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "TITLE_TOO_LONG"
     event.refresh_from_db()
     assert event.title == original_title
