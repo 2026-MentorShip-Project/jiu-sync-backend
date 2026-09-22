@@ -78,14 +78,26 @@ FIELD_CODE_OVERRIDES = {
     ("hostEmail", "invalid"): "HOST_EMAIL_INVALID",
     ("idToken", "required"): "ID_TOKEN_REQUIRED",
     ("idToken", "blank"): "ID_TOKEN_REQUIRED",
+    ("nickname", "required"): "NICKNAME_REQUIRED",
+    ("nickname", "blank"): "NICKNAME_REQUIRED",
+    ("phoneLastThree", "required"): "PHONE_LAST_THREE_REQUIRED",
+    ("phoneLastThree", "blank"): "PHONE_LAST_THREE_REQUIRED",
+    ("phoneLastThree", "invalid"): "PHONE_LAST_THREE_INVALID",
+    ("slotAvailabilities", "required"): "SLOT_AVAILABILITIES_REQUIRED",
+    ("email", "invalid"): "PARTICIPANT_EMAIL_INVALID",
+    ("email", "blank"): "PARTICIPANT_EMAIL_INVALID",
+    ("comment", "max_length"): "COMMENT_TOO_LONG",
 }
 
-# 巢狀陣列欄位（目前只有 `slots[].<subfield>`）的 code 對照——用子欄位名比對,
-# 不分是 DRF 的 required 還是 invalid，這個巢狀層級前端只要求一個 code。
+# 巢狀陣列欄位（`slots[].<subfield>`、`slotAvailabilities[].<subfield>`）的
+# code 對照——用子欄位名比對, 不分是 DRF 的 required 還是 invalid，這個巢狀
+# 層級前端只要求一個 code。
 NESTED_SUBFIELD_CODE_OVERRIDES = {
     "date": "SLOT_DATE_INVALID",
     "time": "SLOT_TIME_INVALID",
     "label": "SLOT_LABEL_TOO_LONG",
+    "slotId": "SLOT_ID_INVALID",
+    "availability": "AVAILABILITY_INVALID",
 }
 
 

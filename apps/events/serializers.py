@@ -1,16 +1,74 @@
+import re
 import unicodedata
 
+from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import serializers
 
+from config.exceptions import ApiError
+
 from .lifecycle import compute_display_status
-from .models import Event, Slot
+from .models import Event, ParticipantResponse, ParticipantResponseSlotAvailability, Slot
 
 HOST_NICKNAME_MAX_WEIGHTED_LENGTH = 40
 MIN_SLOTS = 1
 MAX_SLOTS = 20
 EVENT_ID_COLLISION_MAX_ATTEMPTS = 3
+PARTICIPANT_RESPONSE_ID_COLLISION_MAX_ATTEMPTS = 3
+
+# re.ASCII:\d 預設是 Unicode-aware,會放行全形／阿拉伯數字等非 ASCII 數字字元
+# ——這裡刻意收斂成純 ASCII 0-9,否則同一支手機末三碼日後可能用不同輸入法
+# 打出兩種「看起來一樣」但雜湊不同的字串,導致合法使用者被鎖在自己的投票外
+# (code-review 抓到,見 add-participant-responses 的 code-review 紀錄)。
+PHONE_LAST_THREE_RE = re.compile(r"^\d{3}$", re.ASCII)
+
+
+class SlotAvailabilityInputSerializer(serializers.Serializer):
+    """``slotAvailabilities`` 陣列裡單筆表態:``{slotId, availability}``。
+    ``ParticipantResponseCreateSerializer``/``ParticipantResponsePatchSerializer``
+    共用同一份巢狀格式(見 design.md D4 2026-09-21 修訂)。"""
+
+    slotId = serializers.UUIDField()
+    availability = serializers.ChoiceField(
+        choices=ParticipantResponseSlotAvailability.Availability.values
+    )
+
+
+def _validate_slot_availabilities(value, event):
+    """驗證 ``slotAvailabilities``:每個 ``slotId`` 皆屬於指定活動、且該活動
+    全部候選時段都必須恰好出現一次(不可缺漏、不可重複)——已與使用者確認
+    每次送出都是該活動候選時段的完整表態,不是部分更新(design.md D4 2026-09-21
+    修訂③)。``ParticipantResponseCreateSerializer``/
+    ``ParticipantResponsePatchSerializer`` 的 ``validate_slotAvailabilities``
+    共用同一份檢查邏輯,避免兩處各寫一次容易不一致。"""
+    event_slot_ids = set(event.slots.values_list("id", flat=True))
+    submitted_slot_ids = [item["slotId"] for item in value]
+    submitted_slot_id_set = set(submitted_slot_ids)
+
+    if not submitted_slot_id_set.issubset(event_slot_ids):
+        raise serializers.ValidationError(
+            "候選時段不存在於此活動", code="SLOT_NOT_FOUND"
+        )
+    if (
+        submitted_slot_id_set != event_slot_ids
+        or len(submitted_slot_ids) != len(event_slot_ids)
+    ):
+        raise serializers.ValidationError(
+            "每個候選時段都必須表態，且不可重複",
+            code="SLOT_AVAILABILITY_INCOMPLETE",
+        )
+    return value
+
+
+def _validate_phone_last_three_format(value):
+    """`phoneLastThree` 3 位數字格式驗證,`ParticipantResponseCreateSerializer`/
+    `ParticipantResponseVerifySerializer` 共用。"""
+    if not PHONE_LAST_THREE_RE.match(value):
+        raise serializers.ValidationError(
+            "手機末三碼須為 3 位數字", code="PHONE_LAST_THREE_INVALID"
+        )
+    return value
 
 
 def _weighted_length(value):
@@ -164,6 +222,138 @@ class EventPatchSerializer(serializers.ModelSerializer):
         return _validate_response_deadline_in_future(value)
 
 
+class ParticipantResponseCreateSerializer(serializers.Serializer):
+    """``POST /api/events/{id}/responses`` 請求 body — 參與者初次投票。
+
+    Plain ``Serializer``(不是 ``ModelSerializer``)——``phoneLastThree`` 需要
+    先雜湊才能寫入 ``ParticipantResponse.phone_last_three_hash``,
+    ``slotAvailabilities`` 對應的是帶額外欄位的 M2M 關聯而非單一 model 欄位,
+    兩者都不適合用 ``source=`` 直接映射。View 呼叫時須帶入
+    ``context={"event": event}``,``validate_slotAvailabilities`` 用來確認
+    候選時段確實屬於該活動、且每個時段都恰好表態一次。
+    """
+
+    nickname = serializers.CharField(max_length=40)
+    phoneLastThree = serializers.CharField()
+    email = serializers.EmailField(required=False, allow_null=True, default=None)
+    # comment 是自由文字留言,不像 email 有「格式對不對」的概念——空字串就是
+    # 「沒有留言」,沒有理由當成錯誤拒絕,所以刻意 allow_blank=True(跟 email
+    # 的 blank 視為無效是不同的決策,見 config/exceptions.py 的對照)。
+    comment = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True, max_length=200, default=None
+    )
+    # ``ChildSerializer(many=True)``——實測 DRF 對這種寫法的巢狀驗證錯誤形狀是
+    # 「以索引為 key 的 dict」(``{0: {"slotId": [...]}}``),不是原本以為的
+    # list。``config/exceptions.py`` 的 ``_build_errors`` 已對照這個真實形狀
+    # 展開成 ``slotAvailabilities[0].slotId`` 這種巢狀欄位路徑,沿用
+    # ``EventCreateSerializer.slots`` 同一種寫法(見 add-participant-responses
+    # 的 code-review 紀錄——這個形狀誤解連帶修正了 slots[] 既有的同款 bug)。
+    slotAvailabilities = SlotAvailabilityInputSerializer(many=True)
+
+    def validate_nickname(self, value):
+        trimmed = value.strip()
+        event = self.context["event"]
+        if trimmed == event.host_nickname:
+            raise serializers.ValidationError(
+                "此暱稱與主揪暱稱相同，請改用其他暱稱",
+                code="NICKNAME_CONFLICTS_WITH_HOST",
+            )
+        return trimmed
+
+    def validate_phoneLastThree(self, value):
+        return _validate_phone_last_three_format(value)
+
+    def validate_slotAvailabilities(self, value):
+        return _validate_slot_availabilities(value, self.context["event"])
+
+    def create(self, validated_data):
+        event = self.context["event"]
+        nickname = validated_data["nickname"]
+        availabilities = validated_data["slotAvailabilities"]
+        phone_last_three_hash = make_password(validated_data["phoneLastThree"])
+        comment = validated_data.get("comment") or None
+
+        # ParticipantResponse.id 短 id 碰撞、與 unique_together (event,
+        # nickname) 暱稱重複,是同一個 create() 呼叫下兩個獨立來源都可能觸發
+        # 的 IntegrityError——捕獲後先查暱稱是否已存在來區分成因,見
+        # openspec/changes/add-participant-responses/design.md D9。
+        for attempt in range(PARTICIPANT_RESPONSE_ID_COLLISION_MAX_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    response = ParticipantResponse.objects.create(
+                        event=event,
+                        nickname=nickname,
+                        phone_last_three_hash=phone_last_three_hash,
+                        email=validated_data.get("email"),
+                        comment=comment,
+                    )
+                    ParticipantResponseSlotAvailability.objects.bulk_create(
+                        [
+                            ParticipantResponseSlotAvailability(
+                                response=response,
+                                slot_id=item["slotId"],
+                                availability=item["availability"],
+                            )
+                            for item in availabilities
+                        ]
+                    )
+                return response
+            except IntegrityError:
+                if ParticipantResponse.objects.filter(
+                    event=event, nickname=nickname
+                ).exists():
+                    raise ApiError(
+                        "此暱稱已被使用，請改用「更新投票」",
+                        code="NICKNAME_TAKEN",
+                        status_code=400,
+                    ) from None
+                if attempt == PARTICIPANT_RESPONSE_ID_COLLISION_MAX_ATTEMPTS - 1:
+                    raise
+
+
+class ParticipantResponseVerifySerializer(serializers.Serializer):
+    """``POST /api/events/{id}/responses/verify`` 請求 body — 參與者核對身分。
+
+    只做欄位格式驗證(暱稱 trim、手機末三碼格式)——是否真的核對成功(查無此
+    暱稱、或暱稱存在但手機末三碼雜湊不符)刻意留給 view 處理並統一回應同一種
+    401 `IDENTITY_VERIFICATION_FAILED`(D3),不在 serializer 層拆成兩種錯誤,
+    避免回應差異變成「暱稱是否存在」的 side channel。
+    """
+
+    nickname = serializers.CharField(max_length=40)
+    phoneLastThree = serializers.CharField()
+
+    def validate_nickname(self, value):
+        return value.strip()
+
+    def validate_phoneLastThree(self, value):
+        return _validate_phone_last_three_format(value)
+
+
+class ParticipantResponsePatchSerializer(serializers.Serializer):
+    """``PATCH /api/events/{id}/responses/{responseId}`` 請求 body — 參與者
+    更新投票的候選時段。
+
+    只宣告 ``slotAvailabilities``——``nickname``/``email``/``phoneLastThree`` 刻意
+    不宣告,即使請求 body 帶了這些 key,DRF 只讀取已宣告欄位,不會被採信,沿用
+    專案既有「未宣告欄位自動被忽略」慣例(見 ``EventPatchSerializer`` 同款寫
+    法)。``accessToken`` 也不在這裡宣告——存取憑證的驗證屬於認證/授權範疇
+    (比對 token_hash、效期、是否已使用、關聯的 response 是否對得上 URL 的
+    ``responseId``),不是『這次要改成什麼』的資料驗證,兩者關注點不同,改由
+    view 層(``ParticipantResponseDetailView.patch()``)直接讀 ``request.data``
+    處理。View 呼叫時須帶入 ``context={"event": event}``,供
+    ``validate_slotAvailabilities`` 確認候選時段確實屬於該活動、且每個時段
+    都恰好表態一次(每次更新都是完整覆蓋,見 design.md D4 2026-09-21 修訂③)。
+    """
+
+    # 見 ParticipantResponseCreateSerializer 對應欄位的說明——``many=True`` 的
+    # 巢狀驗證錯誤形狀是「以索引為 key 的 dict」，被 `_build_errors` 正確展開。
+    slotAvailabilities = SlotAvailabilityInputSerializer(many=True)
+
+    def validate_slotAvailabilities(self, value):
+        return _validate_slot_availabilities(value, self.context["event"])
+
+
 class SlotSerializer(serializers.ModelSerializer):
     """``GET /api/events/{id}`` 回應裡巢狀的候選時段。"""
 
@@ -219,6 +409,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
     displayStatus = serializers.SerializerMethodField()
     isOwner = serializers.SerializerMethodField()
     slots = SlotSerializer(many=True, read_only=True)
+    slotSummary = serializers.SerializerMethodField()
     responses = serializers.SerializerMethodField()
 
     class Meta:
@@ -236,6 +427,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "displayStatus",
             "isOwner",
             "slots",
+            "slotSummary",
             "responses",
         ]
 
@@ -244,9 +436,47 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             return None
         return event.host_email
 
+    def get_slotSummary(self, event):
+        # design.md D17:前端要「不同時段的三態票數」,不用自己 reduce
+        # responses 陣列。key 沿用 availability 的 enum 值本身
+        # (available/if_needed/unavailable),不另外設計一套命名。用已經
+        # prefetch 過的 event.responses.all()/slot_availabilities.all()
+        # 累加計數,不對 DB 另外下 COUNT/GROUP BY query。
+        counts = {
+            slot.id: {"available": 0, "if_needed": 0, "unavailable": 0}
+            for slot in event.slots.all()
+        }
+        for participant_response in event.responses.all():
+            for availability in participant_response.slot_availabilities.all():
+                if availability.slot_id in counts:
+                    counts[availability.slot_id][availability.availability] += 1
+        return [
+            {"slotId": str(slot.id), **counts[slot.id]} for slot in event.slots.all()
+        ]
+
     def get_responses(self, event):
-        # ParticipantResponse model 尚未建立,固定回傳空陣列。
-        return []
+        # D8:回傳 nickname/slotAvailabilities/comment,刻意不含 phoneLastThree
+        # (含雜湊)/email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。
+        # comment 原本(D12)只接受並儲存、不做顯示,使用者事後確認要在此彙整
+        # 一併顯示,見 D12 2026-09-21 修訂。三態表態見 design.md D4/D8。view 端
+        # (_event_with_responses_queryset())已
+        # prefetch_related("responses__slot_availabilities"),這裡用 .all()
+        # 走的是 prefetch cache,不會額外觸發 query。
+        return [
+            {
+                "id": participant_response.id,
+                "nickname": participant_response.nickname,
+                "comment": participant_response.comment,
+                "slotAvailabilities": [
+                    {
+                        "slotId": str(availability.slot_id),
+                        "availability": availability.availability,
+                    }
+                    for availability in participant_response.slot_availabilities.all()
+                ],
+            }
+            for participant_response in event.responses.all()
+        ]
 
 
 class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerializer):

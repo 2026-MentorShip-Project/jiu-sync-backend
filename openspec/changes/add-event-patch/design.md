@@ -37,6 +37,8 @@
 ### D6. 僅 `status=active` 可編輯,提前立邊界
 `add-events-api` 範圍內沒有 finalize/cancel 端點,正常路徑不可能產生 `finalized`/`cancelled` 的活動,這條檢查目前不會被真實資料觸發。提前寫上是因為:等未來 finalize/cancel change 做出來時,這條防護已經就位,不需要回頭在那次 change 裡才補這個邊界(那時候反而容易漏掉,因為焦點會在 finalize 邏輯本身)。
 
+> **修訂記錄(2026-09-21)**:原本 D6 只涵蓋 model `status` 欄位(`active`/`finalized`/`cancelled`),沒有討論 `displayStatus == "voting_closed_pending"`(`status` 仍是 `active`,但 `response_deadline` 已過、尚未 finalize)這個中間態能不能編輯——grill-me 當時漏問這條分支。回頭確認:**維持允許編輯**,不額外檢查 `response_deadline`。理由:主揪可能就是想在投票截止後延長 `responseDeadline` 重開投票、或修正內容,PATCH 不該把這條路堵死。這跟參與者端點(`_check_participation_preconditions` 檢查 `now >= response_deadline` → `VOTING_CLOSED` 409)不對稱是刻意的——參與者投票跟主揪編輯活動是不同語意的操作,前者需要一個明確的「投票截止」邊界,後者不需要。維持現況程式碼不變,僅補記錄此為刻意決策,非缺口。
+
 ### D7. 驗證失敗整包拒絕,不部分套用
 沿用 DRF serializer 標準行為與既有 `config/exceptions.py` 錯誤格式——這不是新機制,只是重申既有慣例延續適用於 PATCH。
 

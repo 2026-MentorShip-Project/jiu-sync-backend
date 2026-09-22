@@ -205,7 +205,7 @@ def test_handler_builds_errors_array_for_nested_list_shape_validation_error():
     真實 HTTP 請求驗證的才是實際形狀）——保留這則測試是因為不確定其他 DRF 版本
     或手動構造的 ValidationError 會不會用這種形狀,兩種都認得成本很低。
     """
-    exc = ValidationError({"slots": [{}, {"date": ["此為必需欄位。"]}]})
+    exc = ValidationError({"slots": {1: {"date": ["此為必需欄位。"]}}})
 
     response = custom_exception_handler(exc, {})
 
