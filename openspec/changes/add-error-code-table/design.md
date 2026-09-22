@@ -24,7 +24,11 @@
 > **修訂記錄(2026-09-20)**:`errors` 每筆原本只有 `field`/`message`,前端進一步確認需求後追加 `code`,見 D7。頂層 `code` 原本固定 `null`,現在比照 `message` 改成「第一筆的值」。
 
 ### D2. 巢狀陣列欄位用 `<欄位>[<索引>].<子欄位>` 路徑命名
-DRF 對巢狀 `many=True` serializer(例如 `slots`)驗證失敗時,`response.data["slots"]` 會是一個 list,只有失敗的索引位置是非空 dict(例如 `[{}, {"date": ["此為必需欄位。"]}]` 代表第 0 筆沒問題、第 1 筆的 `date` 有問題)。展開邏輯:偵測到值是 list 時,逐一走訪索引,對每個非空 dict 元素,再取它裡面每個 key,組成 `"slots[<index>].<key>"` 當作 `field`。只處理一層巢狀(`slots[].<field>`),不處理更深的巢狀——目前 `apps.events`/`apps.accounts` 沒有更深的巢狀結構,不需要提前設計。
+展開邏輯:偵測到值是「巢狀陣列欄位錯誤形狀」時,逐一走訪索引,對每個非空 dict 元素,再取它裡面每個 key,組成 `"slots[<index>].<key>"` 當作 `field`。只處理一層巢狀(`slots[].<field>`),不處理更深的巢狀——目前 `apps.events`/`apps.accounts` 沒有更深的巢狀結構,不需要提前設計。
+
+> **修訂記錄(2026-09-20)**:「巢狀陣列欄位錯誤形狀」原本只認得一種:`response.data["slots"]` 是補滿通過索引的完整 list(例如 `[{}, {"date": [...]}]`)。這個假設從沒被真實 HTTP 請求驗證過(唯一的測試是手動構造 `ValidationError`),之後補上端對端測試才發現:DRF 3.18 對 `many=True` 巢狀 serializer 驗證失敗時,實際回傳的是**只包含失敗索引**的 dict(例如兩筆 slots、只有索引 1 錯 → `{1: {"date": [...]}}`),不是那種完整 list——導致 `slots[0].date` 這種路徑命名對真實請求從未生效過,`field` 會停在 `"slots"`、`code` 也拿不到 `NESTED_SUBFIELD_CODE_OVERRIDES` 的對照,退回 DRF 原始的 `"invalid"`。
+
+新增 `_nested_indexed_items(value)` 統一偵測兩種形狀:dict 形式(`{index: {...}}`,DRF 3.18 實際行為,優先判斷)與 list 形式(`[{}, {...}]`,防禦性 fallback,保留是因為不確定未來 DRF 版本或手動構造的輸入會不會用這種形狀,兩種都認得成本很低)。`_build_errors` 改呼叫這個共用函式,不再各自直接判斷 `isinstance(value, list)`。
 
 ### D3. 401/403/404/500 的預設 code 用「狀態碼 → 固定字串」對照表
 在 `custom_exception_handler` 裡,只有當 `code` 還是 `None` 時,才依 `response.status_code` 查表補上:`{400: None, 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 500: "SERVER_ERROR"}`。
@@ -64,6 +68,7 @@ D3 的狀態碼查表只補了 `code`,「detail」形狀分支(DRF/simplejwt 內
 - **[風險] `FIELD_CODE_OVERRIDES`/`NESTED_SUBFIELD_CODE_OVERRIDES` 是全域、扁平的對照表,耦合了 `exceptions.py`(共用基礎設施)跟各 app 的欄位語意** → 緩解:目前專案規模小,欄位名跨 serializer 沒有衝突風險;若未來規模變大、欄位名開始碰撞,再考慮把對照表拆到各 app 自己維護、`custom_exception_handler` 改成可註冊擴充點,現在做這個抽象是過度工程。
 - **[風險] `GET /api/events/{id}` 的 410/`LINK_EXPIRED` 分支目前系統沒有 finalize/cancel 端點,無法透過任何真實 API 流程觸發** → 緩解:直接建立測試資料(`Event.objects.create(status=..., cancelled_at=...)`)驗證,不依賴真的走過 finalize/cancel 流程產生資料——這是刻意的決定(見 proposal.md 修訂記錄),換取這個分支提前就位,之後 finalize/cancel 端點做出來時不用回頭補。
 - **[已修正的風險] `_find_leaf_detail` 原本假設 dict/list 一定有內容,遇到空容器(`{"field": []}`/`{"field": {}}`)會直接拋 `IndexError`/`StopIteration`,讓一個原本該回 400 的驗證錯誤,因為錯誤格式化程式自己出包變成 500** → 2026-09-20 code review 抓到並修正:`_find_leaf_detail` 對空容器回傳 `None`,`_build_errors` 遇到 `None` 直接略過該欄位,不硬湊假訊息,也不影響其他正常欄位。DRF 自己的驗證邏輯不會產生這種形狀,但 `custom_exception_handler` 是全站共用基礎設施,不能假設所有呼叫端(未來的自訂 validator、第三方套件)都只會傳入「合法」輸入。
+- **[已修正的風險] `slots[0].date` 巢狀路徑命名對真實請求從未生效過** → 見上方 D2 修訂記錄。根因是「巢狀陣列欄位錯誤形狀」的假設只驗證過手動構造的假資料,沒有透過真實 HTTP 請求驗證,直到補上端對端測試(`test_slot_date_wrong_format_uses_correct_index_when_multiple_slots`)才發現 DRF 3.18 實際回傳的形狀不同。教訓:凡是「模擬某個函式庫的輸出形狀」的單元測試,至少要有一則對應的端對端測試驗證這個形狀假設本身是對的,不能只測「假設成立後,我們的程式碼處理得對不對」。
 
 ## Migration Plan
 

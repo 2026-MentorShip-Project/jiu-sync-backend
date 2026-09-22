@@ -287,24 +287,59 @@ def test_slot_label_over_100_chars_returns_400():
     assert Event.objects.count() == 0
 
 
-def test_slot_label_over_100_chars_error_has_nested_semantic_code():
-    """code-review 補充:確認上一則測試的 400 回應,`errors[]` 裡巢狀欄位
-    `slots[0].label` 的 code 真的是語意化的 SLOT_LABEL_TOO_LONG,不是未對照的
-    DRF 原始碼——`config/exceptions.py::_build_errors` 原本誤判
-    `ChildSerializer(many=True)` 的巢狀驗證錯誤形狀是 list,實際是以索引為
-    key 的 dict,這條巢狀 code 對照從未真的生效過(add-participant-responses
-    的 code-review 修正)。"""
+def test_slot_date_wrong_format_returns_chinese_message_not_english():
+    """新增:slots[].date 格式錯誤 → code 為 "SLOT_DATE_INVALID",message 是中文,
+    不是 DRF DateField 內建的英文原文("Date has wrong format...")。
+
+    DRF 對 DateField 格式錯誤的內建翻譯剛好沒收錄 zh-hant(同欄位的 TimeField
+    卻有中文翻譯),屬於第三方翻譯檔覆蓋不全,不是我們自己程式碼的問題。這裡
+    直接在欄位宣告用 error_messages 覆寫,不影響 code(仍走
+    NESTED_SUBFIELD_CODE_OVERRIDES 對照表)。
+    """
     user = _create_user()
     client = _auth_client(user)
-    payload = _valid_payload(slots=[{"date": "2026-10-01", "label": "a" * 101}])
+    payload = _valid_payload(slots=[{"date": "not-a-date"}])
 
     response = client.post(EVENTS_URL, payload, format="json")
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     body = response.json()
-    matching = [e for e in body["errors"] if e["field"] == "slots[0].label"]
-    assert len(matching) == 1
-    assert matching[0]["code"] == "SLOT_LABEL_TOO_LONG"
+    assert body["code"] == "SLOT_DATE_INVALID"
+    assert body["errors"] == [
+        {
+            "field": "slots[0].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
+    assert "Date has wrong format" not in body["message"]
+    assert Event.objects.count() == 0
+
+
+def test_slot_date_wrong_format_uses_correct_index_when_multiple_slots():
+    """新增:多筆 slots 裡只有其中一筆(索引 1)日期格式錯誤 → errors 陣列的
+    field 正確標出 "slots[1].date"(不是 "slots[0].date"),證明巢狀索引路徑
+    對「只有部分索引失敗」的真實情境也正確——這正是先前落差沒被抓到的情境
+    (DRF 對這種情況回傳的是只含失敗索引的 dict,不是補滿通過索引的完整 list)。
+    """
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(
+        slots=[{"date": "2026-10-01"}, {"date": "not-a-date"}, {"date": "2026-10-03"}]
+    )
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    assert body["errors"] == [
+        {
+            "field": "slots[1].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
+    assert Event.objects.count() == 0
 
 
 @override_settings(FRONTEND_BASE_URL="https://example.com/")
