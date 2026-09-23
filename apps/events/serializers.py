@@ -586,3 +586,15 @@ class EventFinalizeSerializer(serializers.Serializer):
                 "所選的最終時段不存在於此活動候選時段", code="SLOT_NOT_FOUND"
             )
         return value
+
+
+class EventReopenSerializer(serializers.Serializer):
+    """``POST /api/events/{id}/reopen`` 請求 body — 主揪重新開放投票
+    （design.md D2，`add-event-reopen`）。原本的截止時間多半已經過了，重新
+    開放時沒有合理的自動延後預設值，必須由主揪明確指定新的未來時間。
+    """
+
+    responseDeadline = serializers.DateTimeField()
+
+    def validate_responseDeadline(self, value):
+        return _validate_response_deadline_in_future(value)

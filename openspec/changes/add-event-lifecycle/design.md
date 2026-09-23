@@ -84,6 +84,8 @@ CAS 成功後，序列化用的 `event` 物件需要反映寫入後的最新狀�
 >
 > **接受的技術債（非阻斷性，不在本次處理）**：`EventFinalizeView`/`EventCancelView`/`CommentDetailView.delete()`/`ParticipantResponseDetailView.patch()` 現在有四份幾乎一樣的「compare-and-swap `UPDATE` → 檢查 `affected==0` → 回 409/404」手刻邏輯，沒有共用的抽象。code-review 建議抽成共用 helper，避免未來第五個端點（例如真的做 `reopen` 時）又手刻一次同款的併發安全問題。這次評估後選擇先不做：抽象需要涵蓋四種不同的 model／欄位組合，設計一個好用的泛型 helper 本身有不小成本，跟「先讓四個端點各自正確」比起來優先度較低，留給日後真的要新增第五個同類端點時再一併處理。
 
+> **後續 change 補充修正（2026-09-24，見 `add-event-reopen` design.md code-review 補充）**：`add-event-reopen` 開發 `EventReopenView` 時，code-review 抓到 `EventCancelView`（本 change）也有同款真實 bug——`cancel` 的可執行前提狀態包含 `finalized`，一筆已定案超過 7 天的活動 `displayStatus` 會被算成 `link_expired`，導致 `_display_status_or_410` 檢查（本節 D8）永遠先擋下請求，主揪無法取消一筆「已經定案一段時間、但聚會可能還沒發生」的活動。`EventCancelView`（以及本 change 的 `EventFinalizeView`，理由同上但那支本來就不會真的觸發）已拿掉 `_display_status_or_410` 呼叫，詳見 `add-event-reopen` design.md。D8 原本「擁有者檢查優先於連結失效檢查」的決策現在對這兩支端點來說已經沒有意義——因為連結失效檢查整個拿掉了，不再有順序問題。
+
 ## Risks / Trade-offs
 
 - **[風險] `ParticipantResponse` 軟刪除後，`unique_together (event, nickname)` 仍然生效** → 若未來加回 `reopen`、允許同一活動重新投票，同暱稱的舊（已軟刪除）紀錄仍會擋掉新投票的 `nickname` 唯一性——這次沒有 `reopen`，不影響本次範圍，留給未來若真的要做 `reopen` 時一併處理（可能需要把 `unique_together` 改成只在 `deleted_at IS NULL` 時生效的 partial unique index）。

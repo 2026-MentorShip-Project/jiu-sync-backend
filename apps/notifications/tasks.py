@@ -94,3 +94,28 @@ def send_event_cancelled_email(event_id):
         settings.DEFAULT_FROM_EMAIL,
         recipients,
     )
+
+
+@shared_task
+def send_event_reopened_email(event_id):
+    """主揪重新開放投票後通知留過 Email 的參與者與主揪本人（design.md D4，
+    `add-event-reopen`）。"""
+    event = Event.objects.filter(pk=event_id).first()
+    if event is None or event.status != Event.Status.ACTIVE:
+        # 同 send_event_finalized_email 的理由——task 執行當下重新核對狀態。
+        return
+    recipients = _notification_recipients(event)
+    if not recipients:
+        return
+
+    body = (
+        f"主揪已經重新開放活動「{event.title}」的投票。\n"
+        f"新的投票截止時間：{event.response_deadline}\n"
+        f"活動詳情：{_event_share_url(event)}"
+    )
+    send_mail(
+        f"「{event.title}」已重新開放投票",
+        body,
+        settings.DEFAULT_FROM_EMAIL,
+        recipients,
+    )

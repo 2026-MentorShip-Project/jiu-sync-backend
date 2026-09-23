@@ -7,6 +7,7 @@ from .views import (
     EventCreateView,
     EventDetailView,
     EventFinalizeView,
+    EventReopenView,
     ParticipantResponseCreateView,
     ParticipantResponseDetailView,
     ParticipantResponseVerifyView,
@@ -70,5 +71,10 @@ urlpatterns = [
         "<shortid:id>/cancel/",
         EventCancelView.as_view(),
         name="event-cancel",
+    ),
+    path(
+        "<shortid:id>/reopen/",
+        EventReopenView.as_view(),
+        name="event-reopen",
     ),
 ]
