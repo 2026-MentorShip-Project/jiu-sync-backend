@@ -186,6 +186,10 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
+# 正式環境需要真的部署一個 Celery worker 程序消費佇列，預設 False（真非同步）。
+# dev.py 覆寫成 True——本機/測試沒有另外跑 worker，.delay() 同步在原地執行完，
+# 見 openspec/changes/add-event-lifecycle/design.md D2。
+CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 
 
 # Google SSO — host login only (see apps.accounts). Backend verifies the

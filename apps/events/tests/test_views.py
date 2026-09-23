@@ -1126,8 +1126,12 @@ def test_participant_can_submit_first_vote_successfully():
         "slots",
         "slotSummary",
         "responses",
+        "finalSlotId",
+        "finalNote",
     }
     assert body["id"] == str(event.id)
+    assert body["finalSlotId"] is None
+    assert body["finalNote"] is None
     assert len(body["responses"]) == 1
     new_response_body = body["responses"][0]
     assert RESPONSE_SHORT_ID_RE.match(new_response_body["id"])
@@ -2877,3 +2881,498 @@ def test_comment_delete_concurrent_requests_only_one_succeeds():
     ]
     comment.refresh_from_db()
     assert comment.deleted_at is not None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/finalize (add-event-lifecycle)
+# ---------------------------------------------------------------------------
+
+
+def _finalize_url(event_id):
+    return f"/api/events/{event_id}/finalize/"
+
+
+def test_owner_can_finalize_active_event():
+    """① 合法 finalSlotId(＋選填 finalNote)→ 200,回應為完整活動格式,
+    status="finalized",DB 該活動的 finalized_at/final_slot/final_note 正確
+    寫入。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id),
+        {"finalSlotId": str(slot.id), "finalNote": "記得帶睡袋"},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["status"] == "finalized"
+    assert body["finalSlotId"] == str(slot.id)
+    assert body["finalNote"] == "記得帶睡袋"
+    event.refresh_from_db()
+    assert event.status == Event.Status.FINALIZED
+    assert event.final_slot_id == slot.id
+    assert event.final_note == "記得帶睡袋"
+    assert event.finalized_at is not None
+
+
+def test_owner_can_finalize_without_final_note():
+    """finalNote 選填,不帶時 final_note 為 None。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["finalNote"] is None
+    event.refresh_from_db()
+    assert event.final_note is None
+
+
+def test_finalize_by_non_owner_returns_403():
+    """② 已登入但非擁有者 → 403 FORBIDDEN,活動不受影響。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(other_user)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+def test_finalize_unauthenticated_returns_401():
+    """③ 未登入 → 401。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = APIClient()
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+def test_finalize_slot_not_belonging_to_event_returns_400():
+    """④ finalSlotId 不屬於該活動 → 400 SLOT_NOT_FOUND。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    other_event = _create_event(owner, title="另一場活動")
+    other_slot = other_event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(other_slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "SLOT_NOT_FOUND"
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+def test_finalize_missing_final_slot_id_returns_400():
+    """⑤ finalSlotId 缺漏 → 400。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+
+    response = client.post(_finalize_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_finalize_note_over_200_chars_returns_400():
+    """⑥ finalNote 超過 200 字 → 400。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id),
+        {"finalSlotId": str(slot.id), "finalNote": "a" * 201},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def test_finalize_already_finalized_event_returns_409():
+    """⑦ 活動已經是 finalized → 409 EVENT_ALREADY_FINALIZED。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    now = timezone.now()
+    event.status = Event.Status.FINALIZED
+    event.final_slot = slot
+    event.finalized_at = now
+    event.save()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_ALREADY_FINALIZED"
+
+
+def test_finalize_cancelled_event_returns_409_already_cancelled():
+    """⑧ 活動已經是 cancelled → 409 EVENT_ALREADY_CANCELLED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner, status=Event.Status.CANCELLED, cancelled_at=timezone.now()
+    )
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_ALREADY_CANCELLED"
+
+
+def test_finalize_link_expired_returns_410():
+    """⑨ 活動連結已失效 → 410 LINK_EXPIRED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+
+
+def test_finalize_nonexistent_event_returns_404():
+    """⑩ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    owner = _create_user()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(generate_short_id()),
+        {"finalSlotId": str(uuid.uuid4())},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_finalize_sends_email_to_participants_with_email_and_host(
+    django_capture_on_commit_callbacks, mailoutbox
+):
+    """⑪ 定案成功後,留 Email 的參與者與主揪本人各收到一封通知信,沒留 Email
+    的參與者不會收到。"""
+    owner = _create_user(email="host@example.com")
+    event = _create_event(owner, host_email="host@example.com")
+    slot = event.slots.first()
+    _create_participant_response(
+        event, "小華", [slot], email="voter@example.com"
+    )
+    _create_participant_response(event, "小美", [slot], email=None)
+    client = _auth_client(owner)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(
+            _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    recipients = {addr for mail in mailoutbox for addr in mail.to}
+    assert recipients == {"voter@example.com", "host@example.com"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/cancel (add-event-lifecycle)
+# ---------------------------------------------------------------------------
+
+
+def _cancel_url(event_id):
+    return f"/api/events/{event_id}/cancel/"
+
+
+def test_owner_can_cancel_active_event_with_votes():
+    """① 主揪成功取消進行中且已有投票的活動 → 200,status="cancelled",DB
+    該活動全部 ParticipantResponse.deleted_at 皆非空,GET /api/events/{id}
+    的 responses/slotSummary 反映為空/全 0。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot], email="voter@example.com")
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["status"] == "cancelled"
+    assert body["responses"] == []
+    assert body["slotSummary"] == [
+        {"slotId": str(slot.id), "available": 0, "if_needed": 0, "unavailable": 0}
+    ]
+    event.refresh_from_db()
+    assert event.status == Event.Status.CANCELLED
+    assert event.cancelled_at is not None
+    responses = ParticipantResponse.objects.filter(event=event)
+    assert responses.count() == 1
+    assert all(r.deleted_at is not None for r in responses)
+
+
+def test_owner_can_cancel_finalized_event():
+    """② 主揪成功取消已定案的活動 → 200。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    event.status = Event.Status.FINALIZED
+    event.final_slot = slot
+    event.finalized_at = timezone.now()
+    event.save()
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["status"] == "cancelled"
+
+
+def test_cancel_by_non_owner_returns_403():
+    """③ 非擁有者(已登入)→ 403 FORBIDDEN。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(owner)
+    client = _auth_client(other_user)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+def test_cancel_unauthenticated_returns_401():
+    """④ 未登入 → 401。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+def test_cancel_already_cancelled_event_returns_409():
+    """⑤ 活動已經是 cancelled → 409 EVENT_ALREADY_CANCELLED,投票資料不受
+    影響(deleted_at 維持原狀,不重複標記)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    participant_response = _create_participant_response(event, "小華", [slot])
+    original_deleted_at = timezone.now() - timedelta(days=1)
+    ParticipantResponse.objects.filter(pk=participant_response.pk).update(
+        deleted_at=original_deleted_at
+    )
+    event.status = Event.Status.CANCELLED
+    event.cancelled_at = timezone.now()
+    event.save()
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_ALREADY_CANCELLED"
+    participant_response.refresh_from_db()
+    assert participant_response.deleted_at == original_deleted_at
+
+
+def test_cancel_link_expired_returns_410():
+    """⑥ 活動連結已失效 → 410 LINK_EXPIRED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+
+
+def test_cancel_nonexistent_event_returns_404():
+    """⑦ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    owner = _create_user()
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(generate_short_id()), format="json")
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_cancel_does_not_affect_existing_comments():
+    """⑧ 取消不影響既有留言(GET /api/events/{id}/comments 仍看得到)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    Comment.objects.create(event=event, nickname="小美", message="還在")
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    comments_response = APIClient().get(_comments_url(event.id))
+    assert len(comments_response.json()) == 1
+
+
+def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(
+    django_capture_on_commit_callbacks, mailoutbox
+):
+    """⑨ 取消成功後,原本留 Email 的參與者(即使投票已被軟刪除)與主揪本人各
+    收到一封取消通知信。"""
+    owner = _create_user(email="host@example.com")
+    event = _create_event(owner, host_email="host@example.com")
+    slot = event.slots.first()
+    _create_participant_response(
+        event, "小華", [slot], email="voter@example.com"
+    )
+    client = _auth_client(owner)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    recipients = {addr for mail in mailoutbox for addr in mail.to}
+    assert recipients == {"voter@example.com", "host@example.com"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cancel_concurrent_requests_only_one_succeeds():
+    """⑩ 兩個並發取消請求同一活動,只有一個成功(200),另一個 409(比照
+    ParticipantResponseDetailView.patch()/CommentDetailView.delete() 的既有
+    併發測試寫法,design.md D7)。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_cancel():
+        start_barrier.wait()
+        client = _auth_client(owner)
+        try:
+            response = client.post(_cancel_url(event.id), format="json")
+            status_codes.append(response.status_code)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=send_cancel) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_200_OK,
+        status.HTTP_409_CONFLICT,
+    ]
+    event.refresh_from_db()
+    assert event.status == Event.Status.CANCELLED
+
+
+def test_cancel_finalized_event_clears_final_fields():
+    """code-review 補充:取消一筆已定案的活動,final_slot/final_note/
+    finalized_at 都要清空,不能留著跟 status="cancelled" 矛盾的舊定案資訊。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    event.status = Event.Status.FINALIZED
+    event.final_slot = slot
+    event.final_note = "記得帶睡袋"
+    event.finalized_at = timezone.now()
+    event.save()
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["finalSlotId"] is None
+    assert body["finalNote"] is None
+    event.refresh_from_db()
+    assert event.final_slot_id is None
+    assert event.final_note is None
+    assert event.finalized_at is None
+
+
+def test_finalize_by_non_owner_on_link_expired_event_returns_403_not_410():
+    """code-review 補充:非擁有者對一筆連結已失效的活動送出定案請求,應該先
+    擋在擁有者權限檢查(403),不該先回 410——比照 EventDetailView.patch()
+    擁有者檢查優先的既有慣例(design.md D8)。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    slot = event.slots.first()
+    client = _auth_client(other_user)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
+
+
+def test_cancel_by_non_owner_on_link_expired_event_returns_403_not_410():
+    """code-review 補充:非擁有者對一筆連結已失效的活動送出取消請求,應該先
+    擋在擁有者權限檢查(403),不該先回 410。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = _auth_client(other_user)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"

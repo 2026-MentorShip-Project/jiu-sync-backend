@@ -90,6 +90,9 @@ FIELD_CODE_OVERRIDES = {
     ("message", "required"): "MESSAGE_REQUIRED",
     ("message", "blank"): "MESSAGE_REQUIRED",
     ("message", "max_length"): "MESSAGE_TOO_LONG",
+    ("finalSlotId", "required"): "FINAL_SLOT_ID_REQUIRED",
+    ("finalSlotId", "invalid"): "FINAL_SLOT_ID_INVALID",
+    ("finalNote", "max_length"): "FINAL_NOTE_TOO_LONG",
 }
 
 # 巢狀陣列欄位（`slots[].<subfield>`、`slotAvailabilities[].<subfield>`）的

@@ -3,8 +3,10 @@ from django.urls import path, register_converter
 from .views import (
     CommentDetailView,
     CommentListCreateView,
+    EventCancelView,
     EventCreateView,
     EventDetailView,
+    EventFinalizeView,
     ParticipantResponseCreateView,
     ParticipantResponseDetailView,
     ParticipantResponseVerifyView,
@@ -58,5 +60,15 @@ urlpatterns = [
         "<shortid:id>/comments/<shortid:commentId>/",
         CommentDetailView.as_view(),
         name="comment-detail",
+    ),
+    path(
+        "<shortid:id>/finalize/",
+        EventFinalizeView.as_view(),
+        name="event-finalize",
+    ),
+    path(
+        "<shortid:id>/cancel/",
+        EventCancelView.as_view(),
+        name="event-cancel",
     ),
 ]
