@@ -90,6 +90,8 @@ CAS 成功後，序列化用的 `event` 物件需要反映寫入後的最新狀�
 - **[風險] Celery `CELERY_TASK_ALWAYS_EAGER=True` 只在 `dev`/測試環境，正式環境部署 worker 是否確實運作不在本次驗證範圍** → 本地測試只能證明「task 邏輯本身正確」，不能證明「prod 真的有 worker 在消費佇列」，這是部署面的既有落差（比照 `add-participant-responses` 對 Swagger/前端同步的處理方式：本次不處理，記錄下來）。
 - **[風險] Email 寄送失敗（收件人地址無效、SMTP 逾時等）不會讓 API 請求本身失敗**（`on_commit` 之後才排入佇列，跟請求回應完全脫鉤）→ 這是刻意的設計（定案/取消動作本身的成功不應該被一封信寄不寄得出去卡住），但代表寄信失敗目前沒有任何重試或告警機制，非本次 scope。
 
+> **使用者實測發現（2026-09-23）**：上面這條「刻意的設計」原本只是文字描述，實際上沒有真的做防護——使用者在本機測試 `finalize` 時，`.env` 尚未設定 `EMAIL_BACKEND`（仍是預設的 `console.EmailBackend`），但已經填了 `EMAIL_HOST`/`EMAIL_HOST_USER` 等 SMTP 專用 `OPTIONS`，`console` backend 不吃這些參數，`send_mail()` 直接拋 `InvalidMailer`。因為本機 `CELERY_TASK_ALWAYS_EAGER=True`，`transaction.on_commit()` 的 callback 在 commit 之後同步執行，這個例外直接炸穿整個 view，變成 500 回給使用者——**但用 `dbshell` 實測確認 `Event` 的 `status`/`final_slot`/`final_note`/`finalized_at` 都已經正確寫入 DB，定案本身完全成功，只是使用者看到的 500 讓他誤以為整個請求失敗、該被回滾**。修法：新增 `_schedule_notification(task, event_id)` 包住 `task.delay(event_id)`，用 `try/except` 吞掉例外並 `logger.exception(...)` 記錄，不讓它往上炸穿 view；`EventFinalizeView`/`EventCancelView` 都改用這個共用函式排入通知信，不直接呼叫 `transaction.on_commit(lambda: ...)`。已補回歸測試（`monkeypatch` 讓 `.delay()` 拋例外，斷言 API 仍回 200 且狀態正確轉換），RED→GREEN 驗證過。
+
 ## Migration Plan
 
 新增 migration：`ParticipantResponse.deleted_at`（nullable `DateTimeField`，單純 `AddField`，不需要像 `add-participant-responses` D15 那樣處理已套用 migration 的本地 DB 修復問題——這次的分支是全新開的，尚未在任何地方跑過 migrate）。不修改既有 `Event`/`Slot`/`Comment` schema。

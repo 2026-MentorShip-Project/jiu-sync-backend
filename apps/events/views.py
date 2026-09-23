@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 from datetime import timedelta
 
@@ -48,6 +49,36 @@ PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
 # 側錄暱稱是否存在(code-review 抓到)。模組載入時算一次即可,不用每次請求
 # 重新雜湊。
 _DUMMY_PHONE_HASH_FOR_TIMING = make_password("000")
+
+logger = logging.getLogger(__name__)
+
+
+def _schedule_notification(task, event_id):
+    """把通知信 task 排進 ``transaction.on_commit()``，並且吞掉排入/執行當下
+    拋出的例外，只記 log，不讓它往上炸穿整個 view。
+
+    使用者實測發現:本機 ``CELERY_TASK_ALWAYS_EAGER=True`` 時，
+    ``.delay()`` 在 ``on_commit`` 觸發當下同步執行，若寄信失敗（例如 email
+    backend 設定錯誤），例外會直接讓這次 API 回應變成 500——即使真正的
+    狀態轉換（``EventFinalizeView``/``EventCancelView`` 的 CAS ``UPDATE``）
+    早在 ``on_commit`` 觸發前就已經 commit 成功。通知信寄送失敗不該讓一個
+    已經成功的動作看起來像失敗（design.md Risks 原本就講明這是刻意的設計
+    意圖，只是先前沒有真的做防護）。正式環境用真的 Celery worker 時，這層
+    防護仍然有意義：``.delay()`` 本身（把訊息放進 Redis 佇列）理論上也可能
+    因為 broker 連線問題丟例外，同樣不該讓 API 回應失敗。
+    """
+
+    def _run():
+        try:
+            task.delay(event_id)
+        except Exception:
+            logger.exception(
+                "Failed to schedule notification task %s for event %s",
+                task.name,
+                event_id,
+            )
+
+    transaction.on_commit(_run)
 
 
 def _get_event_or_404(id, queryset=None):
@@ -588,7 +619,7 @@ class EventFinalizeView(APIView):
             )
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
-        transaction.on_commit(lambda: send_event_finalized_email.delay(event.id))
+        _schedule_notification(send_event_finalized_email, event.id)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
@@ -639,7 +670,7 @@ class EventCancelView(APIView):
             ).update(deleted_at=claimed_at)
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
-        transaction.on_commit(lambda: send_event_cancelled_email.delay(event.id))
+        _schedule_notification(send_event_cancelled_email, event.id)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)

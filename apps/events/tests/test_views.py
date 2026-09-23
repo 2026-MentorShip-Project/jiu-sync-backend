@@ -3110,6 +3110,37 @@ def test_finalize_sends_email_to_participants_with_email_and_host(
     assert recipients == {"voter@example.com", "host@example.com"}
 
 
+def test_finalize_succeeds_even_if_notification_dispatch_raises(
+    django_capture_on_commit_callbacks, monkeypatch
+):
+    """使用者實測發現:本機 CELERY_TASK_ALWAYS_EAGER=True 時,
+    send_event_finalized_email.delay() 若在 on_commit 執行當下拋例外(例如
+    email backend 設定錯誤),整個 view 會被拖累成 500——即使定案本身（DB
+    寫入）已經在 on_commit 觸發前就 commit 成功。通知信失敗不該讓一個已經
+    成功的動作看起來像失敗，見 design.md Risks「Email 寄送失敗不會讓 API
+    請求本身失敗」的既有設計意圖。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("email backend misconfigured")
+
+    monkeypatch.setattr(
+        "apps.events.views.send_event_finalized_email.delay", _raise
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(
+            _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    event.refresh_from_db()
+    assert event.status == Event.Status.FINALIZED
+
+
 # ---------------------------------------------------------------------------
 # POST /api/events/{id}/cancel (add-event-lifecycle)
 # ---------------------------------------------------------------------------
@@ -3275,6 +3306,27 @@ def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(
     assert response.status_code == status.HTTP_200_OK
     recipients = {addr for mail in mailoutbox for addr in mail.to}
     assert recipients == {"voter@example.com", "host@example.com"}
+
+
+def test_cancel_succeeds_even_if_notification_dispatch_raises(
+    django_capture_on_commit_callbacks, monkeypatch
+):
+    """同 finalize 版本，使用者實測發現的同款問題。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("email backend misconfigured")
+
+    monkeypatch.setattr("apps.events.views.send_event_cancelled_email.delay", _raise)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    event.refresh_from_db()
+    assert event.status == Event.Status.CANCELLED
 
 
 @pytest.mark.django_db(transaction=True)

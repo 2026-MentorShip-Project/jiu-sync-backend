@@ -28,4 +28,16 @@
   執行當下重新核對活動狀態；兩個 view 寫入前檢查用了不必要的重量
   queryset），一個記成接受的技術債（四處重複的 CAS 手刻邏輯，不抽共用
   helper），一個是過時註解一併訂正。詳見 design.md code-review 補充
-- [ ] 3.3 回傳完整的錯誤代碼對照給使用者（本輪新增 `EVENT_ALREADY_FINALIZED`/`EVENT_ALREADY_CANCELLED`/`SLOT_NOT_FOUND`(沿用)/`finalSlotId`,`finalNote` 相關 code），比照本 session 先前 `add-participant-responses` 階段做過的同款輸出 — (manual，僅是聊天室輸出，不是文件變更)
+- [x] 3.3 回傳完整的錯誤代碼對照給使用者（本輪新增 `EVENT_ALREADY_FINALIZED`/`EVENT_ALREADY_CANCELLED`/`SLOT_NOT_FOUND`(沿用)/`finalSlotId`,`finalNote` 相關 code），比照本 session 先前 `add-participant-responses` 階段做過的同款輸出 — (manual，僅是聊天室輸出，不是文件變更)
+- [x] 3.4 使用者實機測試 `finalize` 時發現：`.env` 未設定 `EMAIL_BACKEND`
+  導致 `send_mail()` 對 console backend 傳入不認得的 SMTP `OPTIONS`，拋
+  `InvalidMailer`；本機 `CELERY_TASK_ALWAYS_EAGER=True` 讓這個例外同步炸穿
+  `EventFinalizeView`，回應變成 500——但用 `dbshell` 實測確認定案本身（DB
+  寫入）已經 commit 成功，不是原子性問題，是通知信失敗被誤當成整個請求失
+  敗。新增 `_schedule_notification()` 包住 `on_commit` callback 的例外
+  （`try/except` + `logger.exception`），`EventFinalizeView`/
+  `EventCancelView` 改用這個共用函式；補回歸測試（`monkeypatch` 讓
+  `.delay()` 拋例外，斷言 API 仍回 200 且狀態正確轉換），RED→GREEN 驗證
+  過。見 design.md Risks 段落 2026-09-23 修訂記錄、incident-log 同日條目
+  — (auto) `pytest -q`（全套 210 passed）、`ruff check .`、`manage.py
+  check` 皆乾淨
