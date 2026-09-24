@@ -2000,6 +2000,34 @@ def test_participant_patch_with_valid_token_updates_slots_only():
     assert participant_response.phone_last_three_hash == original_phone_hash
 
 
+def test_participant_patch_bumps_updated_at_for_polling():
+    """add-event-poll:成功改票後 updated_at 要比改票前新，供 /poll 端點的
+    latestResponseAt 偵測「有投票被修改」（不是只偵測到「新投票」）。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    original_updated_at = participant_response.updated_at
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    response = client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    participant_response.refresh_from_db()
+    assert participant_response.updated_at > original_updated_at
+
+
 def test_participant_patch_token_already_used_returns_401():
     """② token 使用後再次帶同一個 token 送出 → 401 ACCESS_TOKEN_INVALID(一次性
     驗證),第二次請求不再變動資料。"""
@@ -3870,3 +3898,213 @@ def test_reopen_concurrent_requests_only_one_succeeds():
     ]
     event.refresh_from_db()
     assert event.status == Event.Status.ACTIVE
+
+
+def _poll_url(event_id):
+    return f"/api/events/{event_id}/poll/"
+
+
+def test_poll_returns_counts_and_latest_timestamps_for_responses_and_comments():
+    """① 有投票與留言的活動 → 200，responseCount/commentCount/latestResponseAt/
+    latestCommentAt 正確反映真實資料。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot])
+    _create_participant_response(event, "小美", [slot])
+    Comment.objects.create(event=event, nickname="小明", message="哈囉")
+    latest_comment = Comment.objects.create(event=event, nickname="小李", message="期待")
+    client = APIClient()
+
+    response = client.get(_poll_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert set(body.keys()) == {
+        "status",
+        "displayStatus",
+        "responseCount",
+        "latestResponseAt",
+        "commentCount",
+        "latestCommentAt",
+    }
+    assert body["status"] == "active"
+    assert body["displayStatus"] == "voting_open"
+    assert body["responseCount"] == 2
+    assert body["commentCount"] == 2
+    assert body["latestResponseAt"] is not None
+    assert body["latestCommentAt"] is not None
+    latest_comment.refresh_from_db()
+    assert body["latestCommentAt"] == latest_comment.created_at.isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def test_poll_returns_zero_counts_and_null_timestamps_when_empty():
+    """② 完全沒有投票也沒有留言 → count 皆 0，時間皆 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient()
+
+    response = client.get(_poll_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["responseCount"] == 0
+    assert body["commentCount"] == 0
+    assert body["latestResponseAt"] is None
+    assert body["latestCommentAt"] is None
+
+
+def test_poll_reflects_edited_response_without_changing_count():
+    """③ 改票後 latestResponseAt 更新、responseCount 不變（依賴 Seam 1 的
+    updated_at）。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    participant_response = _create_participant_response(event, "小華", [slot_1])
+    token = _issue_access_token(participant_response)
+    client = APIClient()
+
+    before = client.get(_poll_url(event.id)).json()
+
+    client.patch(
+        _patch_response_url(event.id, participant_response.id),
+        {
+            "accessToken": token,
+            "slotAvailabilities": _slot_availabilities(
+                available=[slot_2.id], unavailable=[slot_1.id]
+            ),
+        },
+        format="json",
+    )
+    after = client.get(_poll_url(event.id)).json()
+
+    assert after["responseCount"] == before["responseCount"] == 1
+    assert after["latestResponseAt"] != before["latestResponseAt"]
+
+
+def test_poll_excludes_soft_deleted_responses_and_reflects_cancelled_status():
+    """④ 已取消的活動（既有投票軟刪除）：responseCount 排除被軟刪除的投票，
+    status/displayStatus 反映 cancelled。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+    _create_participant_response(event, "小華", [slot])
+
+    response = client.post(f"/api/events/{event.id}/cancel/", {}, format="json")
+    assert response.status_code == status.HTTP_200_OK
+
+    poll_response = APIClient().get(_poll_url(event.id))
+
+    assert poll_response.status_code == status.HTTP_200_OK
+    body = poll_response.json()
+    assert body["status"] == "cancelled"
+    assert body["displayStatus"] == "cancelled"
+    assert body["responseCount"] == 0
+    assert body["latestResponseAt"] is None
+
+
+def test_poll_excludes_soft_deleted_comments():
+    """⑤ 留言被軟刪除後 commentCount 排除、latestCommentAt 不算入該則。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    Comment.objects.create(
+        event=event, nickname="小華", message="哈囉", deleted_at=timezone.now()
+    )
+    client = APIClient()
+
+    response = client.get(_poll_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["commentCount"] == 0
+    assert body["latestCommentAt"] is None
+
+
+def test_poll_reflects_finalized_status():
+    """⑥ 定案後 status/displayStatus 正確反映。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        f"/api/events/{event.id}/finalize/",
+        {"finalSlotId": str(slot.id)},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    poll_response = APIClient().get(_poll_url(event.id))
+
+    assert poll_response.status_code == status.HTTP_200_OK
+    body = poll_response.json()
+    assert body["status"] == "finalized"
+    assert body["displayStatus"] == "finalized_upcoming"
+
+
+def test_poll_reflects_reopened_status():
+    """⑥b 重新開放後 status/displayStatus 正確反映回 active/voting_open。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.FINALIZED,
+        finalized_at=timezone.now(),
+    )
+    slot = event.slots.first()
+    event.final_slot = slot
+    event.save(update_fields=["final_slot"])
+    client = _auth_client(owner)
+
+    response = client.post(
+        f"/api/events/{event.id}/reopen/",
+        {"responseDeadline": (timezone.now() + timedelta(days=3)).isoformat()},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    poll_response = APIClient().get(_poll_url(event.id))
+
+    assert poll_response.status_code == status.HTTP_200_OK
+    body = poll_response.json()
+    assert body["status"] == "active"
+    assert body["displayStatus"] == "voting_open"
+
+
+def test_poll_link_expired_returns_410():
+    """⑦ 連結已失效（取消超過 7 天）→ 410 LINK_EXPIRED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = APIClient()
+
+    response = client.get(_poll_url(event.id))
+
+    assert response.status_code == status.HTTP_410_GONE
+    assert response.json()["code"] == "LINK_EXPIRED"
+
+
+def test_poll_nonexistent_event_returns_404():
+    """⑧ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    client = APIClient()
+
+    response = client.get(_poll_url(generate_short_id()))
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_poll_does_not_require_authentication():
+    """⑨ 未登入（不帶 token）也能成功查詢（公開端點）。"""
+    owner = _create_user()
+    event = _create_event(owner)
+
+    response = APIClient().get(_poll_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
