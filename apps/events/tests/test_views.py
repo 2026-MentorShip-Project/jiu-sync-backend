@@ -3923,6 +3923,7 @@ def test_poll_returns_counts_and_latest_timestamps_for_responses_and_comments():
     assert set(body.keys()) == {
         "status",
         "displayStatus",
+        "eventUpdatedAt",
         "responseCount",
         "latestResponseAt",
         "commentCount",
@@ -4072,6 +4073,80 @@ def test_poll_reflects_reopened_status():
     body = poll_response.json()
     assert body["status"] == "active"
     assert body["displayStatus"] == "voting_open"
+
+
+def test_poll_event_updated_at_changes_on_finalize_cancel_reopen():
+    """⑥c code-review 抓到:finalize/cancel/reopen 都是走 CAS `.update()`,
+    不是 `.save()`,`auto_now` 對 `.update()` 不生效——若沒有明確蓋章,
+    `eventUpdatedAt` 在這三個動作後都不會變,輪詢端點就偵測不到活動本身
+    (非投票/留言)的變化。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    before_finalize = APIClient().get(_poll_url(event.id)).json()["eventUpdatedAt"]
+
+    finalize_response = client.post(
+        f"/api/events/{event.id}/finalize/",
+        {"finalSlotId": str(slot.id)},
+        format="json",
+    )
+    assert finalize_response.status_code == status.HTTP_200_OK
+    after_finalize = APIClient().get(_poll_url(event.id)).json()["eventUpdatedAt"]
+    assert after_finalize != before_finalize
+
+    reopen_response = client.post(
+        f"/api/events/{event.id}/reopen/",
+        {"responseDeadline": (timezone.now() + timedelta(days=3)).isoformat()},
+        format="json",
+    )
+    assert reopen_response.status_code == status.HTTP_200_OK
+    after_reopen = APIClient().get(_poll_url(event.id)).json()["eventUpdatedAt"]
+    assert after_reopen != after_finalize
+
+    cancel_response = client.post(f"/api/events/{event.id}/cancel/", {}, format="json")
+    assert cancel_response.status_code == status.HTTP_200_OK
+    after_cancel = APIClient().get(_poll_url(event.id)).json()["eventUpdatedAt"]
+    assert after_cancel != after_reopen
+
+
+def test_poll_event_updated_at_detects_reopen_then_refinalize_with_unchanged_counts():
+    """⑥d codex review finding:前端輪詢期間主揪 reopen 後又重新 finalize、
+    改選另一個最終時段,若 responseCount/commentCount/status/displayStatus
+    跟上一輪完全相同(沒有新投票也沒有新留言),沒有 eventUpdatedAt 的話前端
+    會誤判「沒有變化」而不去重新取得完整活動內容,继续顯示舊的
+    finalSlotId。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_1 = event.slots.first()
+    slot_2 = _add_slot(event, date="2026-10-03")
+    client = _auth_client(owner)
+
+    client.post(
+        f"/api/events/{event.id}/finalize/",
+        {"finalSlotId": str(slot_1.id)},
+        format="json",
+    )
+    first_poll = APIClient().get(_poll_url(event.id)).json()
+
+    client.post(
+        f"/api/events/{event.id}/reopen/",
+        {"responseDeadline": (timezone.now() + timedelta(days=3)).isoformat()},
+        format="json",
+    )
+    client.post(
+        f"/api/events/{event.id}/finalize/",
+        {"finalSlotId": str(slot_2.id)},
+        format="json",
+    )
+    second_poll = APIClient().get(_poll_url(event.id)).json()
+
+    assert second_poll["status"] == first_poll["status"] == "finalized"
+    assert second_poll["displayStatus"] == first_poll["displayStatus"]
+    assert second_poll["responseCount"] == first_poll["responseCount"] == 0
+    assert second_poll["commentCount"] == first_poll["commentCount"] == 0
+    assert second_poll["eventUpdatedAt"] != first_poll["eventUpdatedAt"]
 
 
 def test_poll_link_expired_returns_410():

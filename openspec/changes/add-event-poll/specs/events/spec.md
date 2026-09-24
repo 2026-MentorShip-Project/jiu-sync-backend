@@ -2,7 +2,7 @@
 
 ### Requirement: 輕量輪詢端點
 
-系統 SHALL 提供一個公開（不需登入）的輕量輪詢端點，讓前端能以固定頻率（例如每 10 秒）查詢一筆活動「有沒有變化」，不需要每次都取得完整投票/留言明細。回應 SHALL 包含：活動狀態 `status`、顯示狀態 `displayStatus`、未軟刪除的投票筆數 `responseCount`、最後一次投票異動時間 `latestResponseAt`（含新投票與修改既有投票，無投票時為 `null`）、未軟刪除的留言筆數 `commentCount`、最新一則留言時間 `latestCommentAt`（無留言時為 `null`）。回應 SHALL NOT 包含個別參與者或留言的明細內容（暱稱、留言文字、候選時段選擇等）。
+系統 SHALL 提供一個公開（不需登入）的輕量輪詢端點，讓前端能以固定頻率（例如每 10 秒）查詢一筆活動「有沒有變化」，不需要每次都取得完整投票/留言明細。回應 SHALL 包含：活動狀態 `status`、顯示狀態 `displayStatus`、活動本身最後異動時間 `eventUpdatedAt`（活動欄位被修改、或經歷 finalize/cancel/reopen 任一狀態轉換時更新）、未軟刪除的投票筆數 `responseCount`、最後一次投票異動時間 `latestResponseAt`（含新投票與修改既有投票，無投票時為 `null`）、未軟刪除的留言筆數 `commentCount`、最新一則留言時間 `latestCommentAt`（無留言時為 `null`）。回應 SHALL NOT 包含個別參與者或留言的明細內容（暱稱、留言文字、候選時段選擇等）。
 
 活動連結已失效（顯示狀態計算為 `link_expired`）時系統 SHALL 拒絕請求，回傳 410，錯誤代碼為 `LINK_EXPIRED`，跟 `GET /api/events/{id}` 的既有連結失效規則一致。查無對應活動時系統 SHALL 回傳 404，錯誤代碼為 `EVENT_NOT_FOUND`。
 
@@ -30,6 +30,11 @@
 
 - **WHEN** 活動被定案、取消或重新開放投票
 - **THEN** 之後查詢輪詢端點，`status`/`displayStatus` 反映最新狀態
+
+#### Scenario: 定案後重新開放、又再次定案，即使投票留言數不變也能偵測到活動變化
+
+- **WHEN** 一筆活動被定案（`finalSlotId` 為 A），之後被重新開放投票、再次定案為另一個候選時段（`finalSlotId` 為 B），期間沒有新的投票或留言
+- **THEN** 兩次定案後查詢輪詢端點，即使 `responseCount`/`commentCount`/`status`/`displayStatus` 前後相同（皆為 `finalized`），`eventUpdatedAt` 仍不同，讓前端能判斷出活動本身已經變化、需要重新取得完整內容
 
 #### Scenario: 活動連結已失效時拒絕輪詢
 

@@ -626,6 +626,7 @@ class EventFinalizeView(APIView):
             final_slot_id=serializer.validated_data["finalSlotId"],
             final_note=serializer.validated_data.get("finalNote") or None,
             finalized_at=claimed_at,
+            updated_at=claimed_at,
         )
         if affected == 0:
             current_status = Event.objects.values_list("status", flat=True).get(
@@ -685,6 +686,7 @@ class EventCancelView(APIView):
                 final_slot=None,
                 final_note=None,
                 finalized_at=None,
+                updated_at=claimed_at,
             )
             if affected == 0:
                 raise ApiError(
@@ -740,6 +742,7 @@ class EventReopenView(APIView):
             final_slot=None,
             final_note=None,
             finalized_at=None,
+            updated_at=timezone.now(),
         )
         if affected == 0:
             raise ApiError(
@@ -793,6 +796,7 @@ class EventPollView(APIView):
             {
                 "status": event.status,
                 "displayStatus": display_status,
+                "eventUpdatedAt": event.updated_at,
                 "responseCount": response_agg["count"],
                 "latestResponseAt": response_agg["latest"],
                 "commentCount": comment_agg["count"],

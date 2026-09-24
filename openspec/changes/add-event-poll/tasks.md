@@ -25,3 +25,11 @@
 
 - [x] 3.1 全套驗證：`pytest -q`、`ruff check .`、`manage.py check`、`makemigrations --check --dry-run` 皆乾淨；`spectra validate add-event-poll --strict` 通過 — (auto)
 - [x] 3.2 `/code-review`：跑一次自審，處理發現的真實問題（若有）— (auto)
+
+## 4. Seam: `Event.updated_at`（PR #20 review finding 補修，對應 spec 需求：定案後重新開放、又再次定案時偵測活動變化）
+
+> Codex 對 PR #20 的 code-review 抓到：`responseCount`/`commentCount`/`latestResponseAt`/`latestCommentAt` 只能反映投票留言的變化，偵測不到活動本身的變化（例如 reopen 後重新 finalize、改選另一個 `finalSlotId`）。根因跟 Seam 1 同款：`Event.updated_at`（`auto_now=True`）已存在，但 `EventFinalizeView`/`EventCancelView`/`EventReopenView` 都走 CAS `.update()`，`auto_now` 對 `.update()` 不生效。詳細取捨見 design.md D5（已比較並排除 revision 遞增版本號方案）。
+
+- [x] 4.1 [RED] 補測試：① `finalize`/`reopen`/`cancel` 各自完成後查詢輪詢端點，`eventUpdatedAt` 都比前一次新；② 重現 codex 指出的情境：定案（slot A）→ 重新開放 → 再次定案（slot B），期間無新投票/留言，`responseCount`/`commentCount`/`status`/`displayStatus` 前後相同，但 `eventUpdatedAt` 不同。確認這組測試現在因為 `eventUpdatedAt` 這個 key 不存在而 FAIL — (auto) `pytest` 顯示 FAIL（`KeyError: 'eventUpdatedAt'`）
+- [x] 4.2 [GREEN] 實作：`EventFinalizeView`/`EventCancelView`/`EventReopenView` 既有的 `.update()` 呼叫各自補上 `updated_at=claimed_at`（沿用同一個已算好的時間戳記）；`EventPollView` response 新增 `"eventUpdatedAt": event.updated_at`。讓 4.1 全部轉綠 — (auto) `pytest apps/events/tests/test_views.py` 該檔全綠
+- [x] 4.3 全套驗證：`pytest -q`（243 passed）、`ruff check .`、`manage.py check`、`makemigrations --check --dry-run`（無需新 migration，欄位本來就存在）皆乾淨 — (auto)
