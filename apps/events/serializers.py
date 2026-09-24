@@ -9,13 +9,20 @@ from rest_framework import serializers
 from config.exceptions import ApiError
 
 from .lifecycle import compute_display_status
-from .models import Event, ParticipantResponse, ParticipantResponseSlotAvailability, Slot
+from .models import (
+    Comment,
+    Event,
+    ParticipantResponse,
+    ParticipantResponseSlotAvailability,
+    Slot,
+)
 
 HOST_NICKNAME_MAX_WEIGHTED_LENGTH = 40
 MIN_SLOTS = 1
 MAX_SLOTS = 20
 EVENT_ID_COLLISION_MAX_ATTEMPTS = 3
 PARTICIPANT_RESPONSE_ID_COLLISION_MAX_ATTEMPTS = 3
+COMMENT_ID_COLLISION_MAX_ATTEMPTS = 3
 
 # re.ASCII:\d 預設是 Unicode-aware,會放行全形／阿拉伯數字等非 ASCII 數字字元
 # ——這裡刻意收斂成純 ASCII 0-9,否則同一支手機末三碼日後可能用不同輸入法
@@ -511,3 +518,39 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
     def get_responseCount(self, event):
         # ParticipantResponse model 尚未建立,固定回傳 0。
         return 0
+
+
+class CommentCreateSerializer(serializers.Serializer):
+    """``POST /api/events/{id}/comments`` 請求 body — 任何人（含未登入）對活動
+    留言。完全獨立於 ``ParticipantResponse``（design.md D2），``nickname`` 不
+    要求活動內唯一，同一人可留多則留言（design.md D6）。
+    """
+
+    nickname = serializers.CharField(max_length=40)
+    message = serializers.CharField(max_length=200)
+
+    def validate_nickname(self, value):
+        return value.strip()
+
+    def create(self, validated_data):
+        event = self.context["event"]
+        # 沒有 unique_together，IntegrityError 只可能是短 id 碰撞，直接重試
+        # 即可，不需要像 ParticipantResponse.create() 那樣先查成因
+        # （design.md D7）。
+        for attempt in range(COMMENT_ID_COLLISION_MAX_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    return Comment.objects.create(event=event, **validated_data)
+            except IntegrityError:
+                if attempt == COMMENT_ID_COLLISION_MAX_ATTEMPTS - 1:
+                    raise
+
+
+class CommentSerializer(serializers.ModelSerializer):
+    """``GET``/``POST /api/events/{id}/comments`` 回應 — 單筆留言。"""
+
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = ["id", "nickname", "message", "createdAt"]

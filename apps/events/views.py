@@ -17,8 +17,15 @@ from config.exceptions import ApiError, Gone
 
 from .authentication import OptionalJWTAuthentication
 from .lifecycle import compute_display_status
-from .models import Event, ParticipantResponseAccessToken, ParticipantResponseSlotAvailability
+from .models import (
+    Comment,
+    Event,
+    ParticipantResponseAccessToken,
+    ParticipantResponseSlotAvailability,
+)
 from .serializers import (
+    CommentCreateSerializer,
+    CommentSerializer,
     EventCreateSerializer,
     EventDetailSerializer,
     EventPatchSerializer,
@@ -441,3 +448,75 @@ class ParticipantResponseDetailView(APIView):
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class CommentListCreateView(APIView):
+    """``GET``/``POST /api/events/{id}/comments`` — 活動留言板，任何人（含未
+    登入）皆可查詢、留言。完全公開，不需要登入，不採用任何身分驗證，同三支
+    參與者端點；且完全獨立於 ``ParticipantResponse``（design.md D2），不需要
+    先投票或核對身分。
+
+    前提條件刻意只檢查「連結未失效」（``_display_status_or_410``），不呼叫
+    ``_check_participation_preconditions``——活動狀態（進行中／已定案／已
+    取消）與投票截止時間皆不影響能否留言，這點跟參與者投票三支端點明確不同
+    （design.md D5）。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, id):
+        event = _get_event_or_404(id)
+        _display_status_or_410(event)
+        # Comment.Meta.ordering 已定義 created_at 遞增,.all() 就是這個順序,
+        # 不需要重複 order_by(code-review 抓到)。已軟刪除的留言(design.md
+        # D9)排除在外——對查詢者而言就是不存在。
+        comments = event.comments.filter(deleted_at__isnull=True)
+        serializer = CommentSerializer(comments, many=True)
+        return Response(serializer.data)
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        _display_status_or_410(event)
+
+        serializer = CommentCreateSerializer(data=request.data, context={"event": event})
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.save()
+
+        response_serializer = CommentSerializer(comment)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CommentDetailView(APIView):
+    """``DELETE /api/events/{id}/comments/{commentId}`` — 已登入且為該活動擁
+    有者（主揪）可刪除一則留言（design.md D9）。比照 ``EventDetailView.patch()``
+    的擁有者權限檢查模式：``IsAuthenticated`` + 全域預設的 ``JWTAuthentication``，
+    非擁有者一律 403 ``Forbidden``。
+
+    軟刪除，不做實體刪除——寫入 ``deleted_at``，資料庫紀錄保留。查無該留言、
+    已被刪除過、或不屬於 URL 指定的活動，皆回 404 ``COMMENT_NOT_FOUND``，不
+    細分原因（這是自然結果，不是刻意的側通道防禦，見 design.md D9）。
+    """
+
+    def delete(self, request, id, commentId):
+        event = _get_event_or_404(id)
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可刪除留言")
+
+        # Compare-and-swap:UPDATE ... WHERE deleted_at IS NULL 才是真正保證
+        # 「已刪除的留言不能再被刪一次」的地方——純 .save() 沒有 WHERE 條件,
+        # 兩個並發請求對著同一則留言的 SELECT 都會通過 deleted_at__isnull=True
+        # 的檢查,都會成功寫入,都回 204(code-review 抓到,同款問題先前已在
+        # ParticipantResponseDetailView.patch() 的 token 消費修過一次,見
+        # design.md D9)。affected 用來判斷這次請求是否真的是「贏家」。
+        affected = Comment.objects.filter(
+            pk=commentId, event=event, deleted_at__isnull=True
+        ).update(deleted_at=timezone.now())
+        if affected == 0:
+            raise ApiError(
+                "找不到此留言，可能已被刪除或不存在",
+                code="COMMENT_NOT_FOUND",
+                status_code=404,
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
