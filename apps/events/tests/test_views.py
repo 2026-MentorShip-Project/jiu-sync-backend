@@ -704,6 +704,61 @@ def test_owner_list_items_are_summary_format_without_responses_or_host_email():
     assert item["responseCount"] == 0
 
 
+def test_owner_list_response_count_reflects_real_votes_excluding_soft_deleted():
+    """⑤ responseCount 反映真實投票數,軟刪除(cancel 後)的投票不計入。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot])
+    _create_participant_response(event, "小美", [slot])
+    _create_participant_response(
+        event, "小李", [slot], deleted_at=timezone.now()
+    )
+    client = _auth_client(owner)
+
+    response = client.get(EVENTS_URL, {"owner": "me"})
+
+    assert response.status_code == status.HTTP_200_OK
+    item = response.json()[0]
+    assert item["responseCount"] == 2
+
+
+def test_owner_list_items_include_slots_final_slot_id_and_final_note():
+    """⑥ 每筆回應含 slots 陣列與 finalSlotId/finalNote(定案後非 null)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    finalized_event = _create_event(owner, status="finalized")
+    finalized_slot = finalized_event.slots.first()
+    finalized_event.final_slot = finalized_slot
+    finalized_event.final_note = "集合地點另外通知"
+    finalized_event.finalized_at = timezone.now()
+    finalized_event.save()
+    client = _auth_client(owner)
+
+    response = client.get(EVENTS_URL, {"owner": "me"})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    plain_item = next(item for item in body if item["id"] == str(event.id))
+    assert plain_item["slots"] == [
+        {
+            "id": str(slot.id),
+            "date": "2026-10-01",
+            "time": None,
+            "label": None,
+        }
+    ]
+    assert plain_item["finalSlotId"] is None
+    assert plain_item["finalNote"] is None
+
+    finalized_item = next(
+        item for item in body if item["id"] == str(finalized_event.id)
+    )
+    assert finalized_item["finalSlotId"] == str(finalized_slot.id)
+    assert finalized_item["finalNote"] == "集合地點另外通知"
+
+
 def test_unauthenticated_user_cannot_list_own_events():
     """③ 未登入(不帶 token)查詢 → 401。"""
     client = APIClient()

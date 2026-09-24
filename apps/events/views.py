@@ -154,8 +154,16 @@ class EventListView(APIView):
             raise serializers.ValidationError(
                 {"owner": "缺少必要查詢參數 owner=me"}, code="OWNER_PARAM_REQUIRED"
             )
-        events = Event.objects.filter(owner=request.user).select_related(
-            "owner", "final_slot"
+        events = (
+            Event.objects.filter(owner=request.user)
+            .select_related("owner", "final_slot")
+            .prefetch_related(
+                "slots",
+                Prefetch(
+                    "responses",
+                    queryset=ParticipantResponse.objects.filter(deleted_at__isnull=True),
+                ),
+            )
         )
         serializer = EventSummarySerializer(
             events, many=True, context={"request": request}

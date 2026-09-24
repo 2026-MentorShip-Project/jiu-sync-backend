@@ -497,7 +497,7 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
     """``GET /api/events?owner=me`` 回應裡的精簡格式活動清單項目。
 
     刻意不宣告 ``responses``/``hostEmail`` 欄位——清單頁不含個別參與者投票明細與
-    主揪 Email。
+    主揪 Email,只需要 ``responseCount``、以及定案後的 ``finalSlotId``/``finalNote``。
     """
 
     hostNickname = serializers.CharField(source="host_nickname")
@@ -505,6 +505,9 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
     displayStatus = serializers.SerializerMethodField()
     isOwner = serializers.SerializerMethodField()
     responseCount = serializers.SerializerMethodField()
+    slots = SlotSerializer(many=True, read_only=True)
+    finalSlotId = serializers.SerializerMethodField()
+    finalNote = serializers.CharField(source="final_note", read_only=True)
 
     class Meta:
         model = Event
@@ -519,12 +522,20 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
             "status",
             "displayStatus",
             "isOwner",
+            "slots",
             "responseCount",
+            "finalSlotId",
+            "finalNote",
         ]
 
     def get_responseCount(self, event):
-        # ParticipantResponse model 尚未建立,固定回傳 0。
-        return 0
+        # 依賴 view 端用 Prefetch 帶入已過濾 deleted_at 的 responses,這裡用
+        # `.all()` 才會吃到 prefetch cache(呼叫 `.filter()` 一律繞過 cache 重新查
+        # 詢,見 EventListView.get 的 Prefetch 設定)。
+        return len(event.responses.all())
+
+    def get_finalSlotId(self, event):
+        return str(event.final_slot_id) if event.final_slot_id else None
 
 
 class CommentCreateSerializer(serializers.Serializer):
