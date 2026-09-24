@@ -1110,7 +1110,8 @@ def test_participant_can_submit_first_vote_successfully():
     assert response.status_code == status.HTTP_201_CREATED
     body = response.json()
     # 使用者要求:回應改成跟 GET /api/events/{id} 完全一樣的完整活動格式,前端
-    # 可直接拿來渲染,不用另外再打一次 GET(design.md D16)。
+    # 可直接拿來渲染,不用另外再打一次 GET(design.md D16)。finalAttendees 是
+    # 後續追加的欄位(D9,2026-09-24),此處活動未定案應為空陣列。
     assert set(body.keys()) == {
         "id",
         "title",
@@ -1128,6 +1129,7 @@ def test_participant_can_submit_first_vote_successfully():
         "responses",
         "finalSlotId",
         "finalNote",
+        "finalAttendees",
     }
     assert body["id"] == str(event.id)
     assert body["finalSlotId"] is None
@@ -2917,6 +2919,58 @@ def test_owner_can_finalize_active_event():
     assert event.final_slot_id == slot.id
     assert event.final_note == "記得帶睡袋"
     assert event.finalized_at is not None
+
+
+def test_finalized_event_finalAttendees_only_lists_available_for_final_slot():
+    """D9(2026-09-24):活動定案後,GET 回應新增 finalAttendees 欄位,只列出對
+    「定案時段」表態 available 的人(嚴格定義,if_needed 不算)——前端不用自己
+    拿 finalSlotId 比對 responses[].slotAvailabilities。不影響 responses 本身
+    的既有完整格式。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot_a = event.slots.first()
+    slot_b = Slot.objects.create(event=event, date="2026-10-02")
+
+    available_for_a = _create_participant_response(
+        event, "小美", {slot_a: "available", slot_b: "unavailable"}
+    )
+    if_needed_for_a = _create_participant_response(
+        event, "小華", {slot_a: "if_needed", slot_b: "available"}
+    )
+    available_for_b_only = _create_participant_response(
+        event, "阿明", {slot_a: "unavailable", slot_b: "available"}
+    )
+
+    client = _auth_client(owner)
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot_a.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["finalSlotId"] == str(slot_a.id)
+    attendee_ids = {attendee["id"] for attendee in body["finalAttendees"]}
+    assert attendee_ids == {available_for_a.id}
+    assert if_needed_for_a.id not in attendee_ids
+    assert available_for_b_only.id not in attendee_ids
+    attendee = body["finalAttendees"][0]
+    assert set(attendee.keys()) == {"id", "nickname", "comment"}
+    assert attendee["nickname"] == "小美"
+
+
+def test_active_event_finalAttendees_is_empty_list():
+    """未定案(status=active,final_slot 為 None)時,finalAttendees 回傳空陣列,
+    不是 null——欄位型別一致,前端不用多判斷 null 分支。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小美", {slot: "available"})
+    client = _auth_client(owner)
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["finalAttendees"] == []
 
 
 def test_owner_can_finalize_without_final_note():

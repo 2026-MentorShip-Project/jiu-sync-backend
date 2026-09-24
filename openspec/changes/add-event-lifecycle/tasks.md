@@ -41,3 +41,23 @@
   過。見 design.md Risks 段落 2026-09-23 修訂記錄、incident-log 同日條目
   — (auto) `pytest -q`（全套 210 passed）、`ruff check .`、`manage.py
   check` 皆乾淨
+
+## 4. `finalAttendees` 欄位（D9，2026-09-24 追加，使用者實測發現前端需求）
+
+- [x] 4.1 [RED] `apps/events/tests/test_views.py` 補
+  `test_finalized_event_finalAttendees_only_lists_available_for_final_slot`
+  （3 位參與者，1 位對定案時段表態 available、1 位 if_needed、1 位只對另一
+  時段 available，斷言 `finalAttendees` 只含第一位，欄位為
+  `{id, nickname, comment}`）與
+  `test_active_event_finalAttendees_is_empty_list`（未定案時為 `[]`，不是
+  `null`）；同步更新既有 D16 完整欄位集合斷言加入 `finalAttendees` — (auto)
+  `pytest -k finalAttendees` 顯示 FAIL（`KeyError: 'finalAttendees'`）
+- [x] 4.2 [GREEN] `apps/events/serializers.py` 的 `EventDetailSerializer`
+  新增 `finalAttendees = serializers.SerializerMethodField()`，
+  `get_finalAttendees()` 在 `event.final_slot_id` 為空時回傳 `[]`，否則走
+  已 prefetch 的 `event.responses.all()`/`slot_availabilities.all()`
+  過濾出對定案時段表態 `available` 的參與者 — (auto)
+  `pytest -k finalAttendees` 全綠，`pytest apps/events/ -q`（169 passed）
+- [x] 4.3 `openspec/changes/add-event-lifecycle/specs/events/spec.md` 的
+  「查詢單一活動完整資料」Requirement 加修訂記錄 + 2 個 Scenario；
+  design.md 補 D9 — (auto) `openspec validate add-event-lifecycle --strict`

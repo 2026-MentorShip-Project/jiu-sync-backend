@@ -94,3 +94,15 @@
 
 - **WHEN** 任何請求者查詢一筆已被主揪取消、且取消前已有參與者投票的活動
 - **THEN** 回應中的 `responses` 為空陣列，`slotSummary` 每個候選時段的三態票數皆為 0
+
+> **修訂記錄（2026-09-24）**：回應內容 SHALL 額外包含 `finalAttendees`——僅當活動已定案時，列出對定案時段表態為「可出席」（`available`，嚴格定義，`if_needed` 不算）的參與者；活動未定案時 `finalAttendees` SHALL 為空陣列，不得為空值。此欄位不影響 `responses` 既有格式，見 design.md D9。
+
+#### Scenario: 已定案活動的 finalAttendees 只含定案時段可出席者
+
+- **WHEN** 任何請求者查詢一筆已定案的活動，其中部分參與者對定案時段表態為 `available`、部分為 `if_needed` 或 `unavailable`
+- **THEN** 回應中的 `finalAttendees` 只包含表態 `available` 的參與者，`if_needed`/`unavailable` 的參與者不在其中
+
+#### Scenario: 未定案活動的 finalAttendees 為空陣列
+
+- **WHEN** 任何請求者查詢一筆尚未定案的活動
+- **THEN** 回應中的 `finalAttendees` 為空陣列 `[]`

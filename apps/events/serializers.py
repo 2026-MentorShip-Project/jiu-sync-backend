@@ -415,6 +415,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
     responses = serializers.SerializerMethodField()
     finalSlotId = serializers.SerializerMethodField()
     finalNote = serializers.CharField(source="final_note", read_only=True)
+    finalAttendees = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
@@ -435,6 +436,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "responses",
             "finalSlotId",
             "finalNote",
+            "finalAttendees",
         ]
 
     def get_hostEmail(self, event):
@@ -490,6 +492,27 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
                 ],
             }
             for participant_response in event.responses.all()
+        ]
+
+    def get_finalAttendees(self, event):
+        # D9(2026-09-24):只在已定案時計算,「可出席」嚴格定義為 available
+        # (if_needed 不算)。走已經 prefetch 過的 event.responses.all()/
+        # slot_availabilities.all(),不額外下 query,寫法比照 get_slotSummary。
+        if not event.final_slot_id:
+            return []
+        return [
+            {
+                "id": participant_response.id,
+                "nickname": participant_response.nickname,
+                "comment": participant_response.comment,
+            }
+            for participant_response in event.responses.all()
+            if any(
+                availability.slot_id == event.final_slot_id
+                and availability.availability
+                == ParticipantResponseSlotAvailability.Availability.AVAILABLE
+                for availability in participant_response.slot_availabilities.all()
+            )
         ]
 
 

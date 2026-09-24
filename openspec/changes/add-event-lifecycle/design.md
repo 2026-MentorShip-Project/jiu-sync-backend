@@ -86,6 +86,16 @@ CAS 成功後，序列化用的 `event` 物件需要反映寫入後的最新狀�
 
 > **後續 change 補充修正（2026-09-24，見 `add-event-reopen` design.md code-review 補充）**：`add-event-reopen` 開發 `EventReopenView` 時，code-review 抓到 `EventCancelView`（本 change）也有同款真實 bug——`cancel` 的可執行前提狀態包含 `finalized`，一筆已定案超過 7 天的活動 `displayStatus` 會被算成 `link_expired`，導致 `_display_status_or_410` 檢查（本節 D8）永遠先擋下請求，主揪無法取消一筆「已經定案一段時間、但聚會可能還沒發生」的活動。`EventCancelView`（以及本 change 的 `EventFinalizeView`，理由同上但那支本來就不會真的觸發）已拿掉 `_display_status_or_410` 呼叫，詳見 `add-event-reopen` design.md。D8 原本「擁有者檢查優先於連結失效檢查」的決策現在對這兩支端點來說已經沒有意義——因為連結失效檢查整個拿掉了，不再有順序問題。
 
+### D9. `finalized` 時 `EventDetailSerializer` 新增 `finalAttendees` 欄位（2026-09-24 追加）
+
+`responses` 陣列現有格式（`nickname`/`comment`/`slotAvailabilities`，見本檔上方 D-系列與 `serializers.py:get_responses`）要求前端自己拿 `finalSlotId` 去比對每筆 `slotAvailabilities` 才能算出「這個定案時段誰能出席」——使用者實際串接時發現這件事該由後端做掉。grill-me 確認三點：
+
+1. **僅 `status="finalized"` 時計算**：`voting_open`/`active`（尚未定案）時 `final_slot` 是 `None`，過濾條件不成立，`finalAttendees` 回傳空陣列 `[]`（不是 `null`，維持欄位型別一致，前端不用多判斷 `null` 分支）。
+2. **「可出席」嚴格定義為 `availability == "available"`**：`if_needed` 不算——使用者明確選嚴格版，不是「available + if_needed」的寬鬆版。
+3. **新增欄位，不改動既有 `responses` 格式**：避免破壞性變更，`responses` 保留完整三態資料（其他前端頁面可能還需要看完整投票明細），`finalAttendees` 是另外算好的衍生視圖。
+
+欄位內容沿用 `final*` 前綴命名慣例（比照 `finalSlotId`/`finalNote`）：`finalAttendees` 為陣列，每筆 `{id, nickname, comment}`——不含 `slotAvailabilities`（已經知道是哪個時段，不需要再帶一次）。
+
 ## Risks / Trade-offs
 
 - **[風險] `ParticipantResponse` 軟刪除後，`unique_together (event, nickname)` 仍然生效** → 若未來加回 `reopen`、允許同一活動重新投票，同暱稱的舊（已軟刪除）紀錄仍會擋掉新投票的 `nickname` 唯一性——這次沒有 `reopen`，不影響本次範圍，留給未來若真的要做 `reopen` 時一併處理（可能需要把 `unique_together` 改成只在 `deleted_at IS NULL` 時生效的 partial unique index）。
