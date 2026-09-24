@@ -3052,8 +3052,11 @@ def test_finalize_cancelled_event_returns_409_already_cancelled():
     assert response.json()["code"] == "EVENT_ALREADY_CANCELLED"
 
 
-def test_finalize_link_expired_returns_410():
-    """⑨ 活動連結已失效 → 410 LINK_EXPIRED。"""
+def test_finalize_cancelled_and_link_expired_event_returns_409_not_410():
+    """code-review 補充:finalize 不呼叫 _display_status_or_410——連結是否
+    失效不影響擁有者對自己活動的定案/取消/重開操作(design.md 2026-09-24
+    修訂)。即使活動已取消超過 7 天(連結已失效),回應仍是 409
+    EVENT_ALREADY_CANCELLED,不是 410 LINK_EXPIRED。"""
     owner = _create_user()
     event = _create_event(
         owner,
@@ -3067,8 +3070,29 @@ def test_finalize_link_expired_returns_410():
         _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
     )
 
-    assert response.status_code == status.HTTP_410_GONE
-    assert response.json()["code"] == "LINK_EXPIRED"
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_ALREADY_CANCELLED"
+
+
+def test_owner_can_finalize_event_active_for_more_than_7_days():
+    """code-review 補充:_display_status_or_410 拿掉後,active 活動即使
+    response_deadline 已過很久(voting_closed_pending,不會變成
+    link_expired——active 分支本來就不會產生這個顯示狀態)仍可正常定案，
+    不受影響。這條原本就會過，補上是為了明確記錄「finalize 不受連結失效
+    邏輯影響」這個修正後的行為。"""
+    owner = _create_user()
+    event = _create_event(
+        owner, response_deadline=timezone.now() - timedelta(days=30)
+    )
+    slot = event.slots.first()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _finalize_url(event.id), {"finalSlotId": str(slot.id)}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["status"] == "finalized"
 
 
 def test_finalize_nonexistent_event_returns_404():
@@ -3246,8 +3270,10 @@ def test_cancel_already_cancelled_event_returns_409():
     assert participant_response.deleted_at == original_deleted_at
 
 
-def test_cancel_link_expired_returns_410():
-    """⑥ 活動連結已失效 → 410 LINK_EXPIRED。"""
+def test_cancel_cancelled_and_link_expired_event_returns_409_not_410():
+    """code-review 補充:cancel 不呼叫 _display_status_or_410（design.md
+    2026-09-24 修訂），理由同 finalize。即使活動已取消超過 7 天，回應仍是
+    409 EVENT_ALREADY_CANCELLED，不是 410 LINK_EXPIRED。"""
     owner = _create_user()
     event = _create_event(
         owner,
@@ -3258,8 +3284,29 @@ def test_cancel_link_expired_returns_410():
 
     response = client.post(_cancel_url(event.id), format="json")
 
-    assert response.status_code == status.HTTP_410_GONE
-    assert response.json()["code"] == "LINK_EXPIRED"
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_ALREADY_CANCELLED"
+
+
+def test_owner_can_cancel_event_finalized_more_than_7_days_ago():
+    """code-review 抓到的真實 bug(已修正):原本 cancel 會先呼叫
+    _display_status_or_410，一筆已定案超過 7 天(定案本身，不是聚會日期)
+    的活動 displayStatus 會算成 link_expired，導致主揪永遠無法取消一筆
+    「已經定案一段時間」的活動——即使聚會其實還沒發生。這條 CAS 前提只看
+    status 是否為 active/finalized，不看連結是否失效。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    Event.objects.filter(pk=event.id).update(
+        finalized_at=timezone.now() - timedelta(days=8)
+    )
+    client = _auth_client(owner)
+
+    response = client.post(_cancel_url(event.id), format="json")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["status"] == "cancelled"
 
 
 def test_cancel_nonexistent_event_returns_404():
@@ -3428,3 +3475,320 @@ def test_cancel_by_non_owner_on_link_expired_event_returns_403_not_410():
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
     assert response.json()["code"] == "FORBIDDEN"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/reopen (add-event-reopen)
+# ---------------------------------------------------------------------------
+
+
+def _reopen_url(event_id):
+    return f"/api/events/{event_id}/reopen/"
+
+
+def _finalize_event(event, slot, note=None):
+    """直接走 ORM 把 event 定案，供 reopen 測試準備前置狀態，不透過 API。"""
+    event.status = Event.Status.FINALIZED
+    event.final_slot = slot
+    event.final_note = note
+    event.finalized_at = timezone.now()
+    event.save()
+    return event
+
+
+def test_owner_can_reopen_finalized_event():
+    """① 主揪成功重新開放已定案活動 → 200，回應 status="active"、新
+    responseDeadline、finalSlotId/finalNote 皆為 null，DB 正確寫入，既有
+    投票紀錄不受影響。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot], email="voter@example.com")
+    _finalize_event(event, slot, note="記得帶睡袋")
+    new_deadline = timezone.now() + timedelta(days=5)
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": new_deadline.isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["status"] == "active"
+    assert body["finalSlotId"] is None
+    assert body["finalNote"] is None
+    assert len(body["responses"]) == 1
+
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+    assert event.final_slot_id is None
+    assert event.final_note is None
+    assert event.finalized_at is None
+    assert ParticipantResponse.objects.filter(event=event, deleted_at__isnull=True).count() == 1
+
+
+def test_reopen_by_non_owner_returns_403():
+    """② 已登入但非擁有者 → 403 FORBIDDEN。"""
+    owner = _create_user()
+    other_user = _create_user(email="other@example.com", google_sub="sub-other")
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    client = _auth_client(other_user)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["code"] == "FORBIDDEN"
+    event.refresh_from_db()
+    assert event.status == Event.Status.FINALIZED
+
+
+def test_reopen_unauthenticated_returns_401():
+    """③ 未登入 → 401。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    client = APIClient()
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    event.refresh_from_db()
+    assert event.status == Event.Status.FINALIZED
+
+
+def test_reopen_deadline_in_past_returns_400():
+    """④ 新截止時間早於/等於現在 → 400 DEADLINE_IN_PAST。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() - timedelta(days=1)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "DEADLINE_IN_PAST"
+    event.refresh_from_db()
+    assert event.status == Event.Status.FINALIZED
+
+
+def test_reopen_missing_deadline_returns_400():
+    """⑤ 新截止時間缺漏 → 400 RESPONSE_DEADLINE_REQUIRED。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    client = _auth_client(owner)
+
+    response = client.post(_reopen_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "RESPONSE_DEADLINE_REQUIRED"
+
+
+def test_reopen_active_event_returns_409():
+    """⑥ 對 active 活動重新開放 → 409 EVENT_NOT_FINALIZED。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_NOT_FINALIZED"
+
+
+def test_reopen_cancelled_event_returns_409():
+    """⑦ 對 cancelled 活動重新開放 → 409 EVENT_NOT_FINALIZED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner, status=Event.Status.CANCELLED, cancelled_at=timezone.now()
+    )
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_NOT_FINALIZED"
+
+
+def test_reopen_cancelled_and_link_expired_event_returns_409_not_410():
+    """code-review 補充:reopen 不呼叫 _display_status_or_410（design.md
+    2026-09-24 修訂），理由同 finalize/cancel。即使活動已取消超過 7 天，
+    回應仍是 409 EVENT_NOT_FINALIZED，不是 410 LINK_EXPIRED。"""
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.CANCELLED,
+        cancelled_at=timezone.now() - timedelta(days=8),
+    )
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["code"] == "EVENT_NOT_FINALIZED"
+
+
+def test_owner_can_reopen_event_finalized_more_than_7_days_ago():
+    """code-review 抓到的真實 bug(已修正):原本 reopen 會先呼叫
+    _display_status_or_410，一筆已定案超過 7 天的活動 displayStatus 會算
+    成 link_expired，導致 reopen 對它唯一有意義的目標對象（已定案一段時間
+    的活動）永遠回 410，功能形同無法使用——這正是 code-review 抓到的問題，
+    也是本次要修的核心情境。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    Event.objects.filter(pk=event.id).update(
+        finalized_at=timezone.now() - timedelta(days=8)
+    )
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(event.id),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["status"] == "active"
+
+
+def test_reopen_nonexistent_event_returns_404():
+    """⑨ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    owner = _create_user()
+    client = _auth_client(owner)
+
+    response = client.post(
+        _reopen_url(generate_short_id()),
+        {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["code"] == "EVENT_NOT_FOUND"
+
+
+def test_reopen_sends_email_to_participants_with_email_and_host(
+    django_capture_on_commit_callbacks, mailoutbox
+):
+    """⑩ 重新開放成功後,留 Email 的參與者與主揪本人各收到一封通知信。"""
+    owner = _create_user(email="host@example.com")
+    event = _create_event(owner, host_email="host@example.com")
+    slot = event.slots.first()
+    _create_participant_response(event, "小華", [slot], email="voter@example.com")
+    _finalize_event(event, slot)
+    client = _auth_client(owner)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(
+            _reopen_url(event.id),
+            {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    recipients = {addr for mail in mailoutbox for addr in mail.to}
+    assert recipients == {"voter@example.com", "host@example.com"}
+
+
+def test_reopen_succeeds_even_if_notification_dispatch_raises(
+    django_capture_on_commit_callbacks, monkeypatch
+):
+    """⑪ 通知信 .delay() 拋例外時 API 仍回 200（比照 add-event-lifecycle
+    2026-09-23 修訂的既有回歸測試寫法）。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+    client = _auth_client(owner)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("email backend misconfigured")
+
+    monkeypatch.setattr("apps.events.views.send_event_reopened_email.delay", _raise)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(
+            _reopen_url(event.id),
+            {"responseDeadline": (timezone.now() + timedelta(days=5)).isoformat()},
+            format="json",
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reopen_concurrent_requests_only_one_succeeds():
+    """⑫ 兩個並發重新開放請求同一活動,只有一個成功(200),另一個 409。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _finalize_event(event, slot)
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_reopen():
+        start_barrier.wait()
+        client = _auth_client(owner)
+        try:
+            response = client.post(
+                _reopen_url(event.id),
+                {
+                    "responseDeadline": (
+                        timezone.now() + timedelta(days=5)
+                    ).isoformat()
+                },
+                format="json",
+            )
+            status_codes.append(response.status_code)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=send_reopen) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_200_OK,
+        status.HTTP_409_CONFLICT,
+    ]
+    event.refresh_from_db()
+    assert event.status == Event.Status.ACTIVE

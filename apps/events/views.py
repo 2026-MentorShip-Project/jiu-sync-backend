@@ -15,7 +15,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
-from apps.notifications.tasks import send_event_cancelled_email, send_event_finalized_email
+from apps.notifications.tasks import (
+    send_event_cancelled_email,
+    send_event_finalized_email,
+    send_event_reopened_email,
+)
 from config.exceptions import ApiError, Gone
 
 from .authentication import OptionalJWTAuthentication
@@ -34,6 +38,7 @@ from .serializers import (
     EventDetailSerializer,
     EventFinalizeSerializer,
     EventPatchSerializer,
+    EventReopenSerializer,
     EventSummarySerializer,
     ParticipantResponseCreateSerializer,
     ParticipantResponsePatchSerializer,
@@ -578,6 +583,14 @@ class EventFinalizeView(APIView):
     ``FORBIDDEN``，未登入 401。狀態轉換用 compare-and-swap（design.md D7）
     ——`UPDATE ... WHERE status='active'` 才是真正保證「兩個並發定案請求只有
     一個成功」的地方，純 `.save()` 沒有 `WHERE` 條件做不到。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂，
+    `add-event-reopen` 的 code-review 抓到）：連結失效（``link_expired``）
+    是給參與者這類公開／匿名端點用的「這個連結已經死了，別再互動」概念，
+    不該套用在主揪對自己活動的管理動作上——且 `finalize` 的唯一可執行前提
+    狀態（`active`）本來就不可能算出 `link_expired`（見
+    `lifecycle.compute_display_status` 的 `active` 分支），這裡拿掉純粹是
+    為了跟 `EventCancelView`/`EventReopenView` 三支保持一致，不是行為改變。
     """
 
     permission_classes = [IsAuthenticated]
@@ -589,12 +602,8 @@ class EventFinalizeView(APIView):
         # 路徑白白多付一次 prefetch 成本，比照 ParticipantResponseCreateView
         # 既有的輕重分離寫法）。
         event = _get_event_or_404(id)
-        # 擁有者檢查先於連結失效檢查，比照 EventDetailView.patch() 的既有慣例
-        # （design.md D8）——code-review 抓到原本順序相反，會讓非擁有者從
-        # 410/403 的差異反推活動是否連結已失效。
         if request.user != event.owner:
             raise PermissionDenied("僅活動擁有者可定案")
-        _display_status_or_410(event)
 
         serializer = EventFinalizeSerializer(data=request.data, context={"event": event})
         serializer.is_valid(raise_exception=True)
@@ -632,6 +641,14 @@ class EventCancelView(APIView):
 
     取消成功會把既有的參與者投票紀錄全數軟刪除（design.md D6）——跟狀態轉換
     包在同一個 ``transaction.atomic()`` 裡，要嘛兩者一起成功、要嘛一起回滾。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂）——
+    這是 code-review 在審 `add-event-reopen` 時抓到的真實 bug，`cancel`
+    這支跟它同款：`cancel` 的可執行前提狀態包含 `finalized`，一筆定案超過
+    7 天（不是聚會超過 7 天，是「定案這個動作」超過 7 天）的活動
+    `displayStatus` 會被算成 `link_expired`，導致主揪永遠無法取消一筆
+    「已經定案一段時間、但聚會可能還沒發生」的活動。拿掉這層檢查後，
+    連結是否失效不再影響主揪能不能取消自己的活動。
     """
 
     permission_classes = [IsAuthenticated]
@@ -639,11 +656,8 @@ class EventCancelView(APIView):
     def post(self, request, id):
         # 輕量 queryset，理由同 EventFinalizeView（code-review 抓到）。
         event = _get_event_or_404(id)
-        # 擁有者檢查先於連結失效檢查，比照 EventDetailView.patch()（design.md
-        # D8；code-review 抓到原本順序相反）。
         if request.user != event.owner:
             raise PermissionDenied("僅活動擁有者可取消活動")
-        _display_status_or_410(event)
 
         claimed_at = timezone.now()
         with transaction.atomic():
@@ -671,6 +685,59 @@ class EventCancelView(APIView):
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         _schedule_notification(send_event_cancelled_email, event.id)
+
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class EventReopenView(APIView):
+    """``POST /api/events/{id}/reopen`` — 已登入且為活動擁有者的主揪，將一筆
+    已定案（``finalized``）的活動重新開放為進行中（``active``）（design.md
+    D1，`add-event-reopen`）。``active``/``cancelled`` 狀態皆拒絕，統一回
+    409 ``EVENT_NOT_FINALIZED``——不像 `finalize` 需要區分兩種「不能執行」的
+    來源，這裡只有一種允許的前置狀態，拒絕原因永遠相同。
+
+    既有參與者投票紀錄完全不動——``finalize`` 不會軟刪除任何
+    ``ParticipantResponse``（只有 ``cancel`` 才會），所以這條路徑上沒有
+    資料需要復原或清理，CAS 只需要動 ``Event`` 自己的欄位。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂，
+    code-review 抓到的真實 bug）：`reopen` 唯一的可執行前提狀態就是
+    `finalized`，而 `finalized` 活動一旦超過 7 天就會被
+    `compute_display_status` 算成 `link_expired`——這正是 `reopen`
+    最主要、甚至可能是唯一有意義的使用情境（主揪很久以前定案了，現在想
+    重開），原本的檢查順序會讓這個功能對它自己的核心用途完全用不了，
+    每次都先被 410 擋下，永遠碰不到下面真正的 CAS 判斷。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可重新開放投票")
+
+        serializer = EventReopenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        affected = Event.objects.filter(
+            pk=event.id, status=Event.Status.FINALIZED
+        ).update(
+            status=Event.Status.ACTIVE,
+            response_deadline=serializer.validated_data["responseDeadline"],
+            final_slot=None,
+            final_note=None,
+            finalized_at=None,
+        )
+        if affected == 0:
+            raise ApiError(
+                "活動目前不是已定案狀態，無法重新開放投票",
+                code="EVENT_NOT_FINALIZED",
+                status_code=409,
+            )
+
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        _schedule_notification(send_event_reopened_email, event.id)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
