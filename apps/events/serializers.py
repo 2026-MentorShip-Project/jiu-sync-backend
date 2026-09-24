@@ -413,6 +413,8 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
     slots = SlotSerializer(many=True, read_only=True)
     slotSummary = serializers.SerializerMethodField()
     responses = serializers.SerializerMethodField()
+    finalSlotId = serializers.SerializerMethodField()
+    finalNote = serializers.CharField(source="final_note", read_only=True)
 
     class Meta:
         model = Event
@@ -431,12 +433,21 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "slots",
             "slotSummary",
             "responses",
+            "finalSlotId",
+            "finalNote",
         ]
 
     def get_hostEmail(self, event):
         if not self._is_owner(event):
             return None
         return event.host_email
+
+    def get_finalSlotId(self, event):
+        # design.md（add-event-lifecycle）：final_slot/final_note 早就是
+        # schema-ahead 欄位（見 Event model docstring），但從沒被任何 API 回應
+        # 曝露過。用 event.final_slot_id（外鍵 id 屬性）而不是
+        # event.final_slot.id，前者不會觸發額外查詢；未定案時為 None。
+        return str(event.final_slot_id) if event.final_slot_id else None
 
     def get_slotSummary(self, event):
         # design.md D17:前端要「不同時段的三態票數」,不用自己 reduce
@@ -461,9 +472,10 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         # (含雜湊)/email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。
         # comment 原本(D12)只接受並儲存、不做顯示,使用者事後確認要在此彙整
         # 一併顯示,見 D12 2026-09-21 修訂。三態表態見 design.md D4/D8。view 端
-        # (_event_with_responses_queryset())已
-        # prefetch_related("responses__slot_availabilities"),這裡用 .all()
-        # 走的是 prefetch cache,不會額外觸發 query。
+        # (_event_with_responses_queryset())已用 Prefetch("responses", ...)
+        # 排除軟刪除的投票紀錄(add-event-lifecycle design.md D6),這裡用
+        # .all() 走的是那個 Prefetch queryset 的快取,不會額外觸發 query、
+        # 也已經不含已軟刪除的紀錄(code-review 抓到舊註解沒跟著更新)。
         return [
             {
                 "id": participant_response.id,
@@ -549,3 +561,28 @@ class CommentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Comment
         fields = ["id", "nickname", "message", "createdAt"]
+
+
+class EventFinalizeSerializer(serializers.Serializer):
+    """``POST /api/events/{id}/finalize`` 請求 body — 主揪定案活動
+    （design.md D3，`add-event-lifecycle`）。
+
+    Plain ``Serializer``——`finalSlotId` 對應的是 `Event.final_slot` 這個 FK,
+    需要先驗證屬於該活動的候選時段才能寫入,不適合用 ``source=`` 直接映射。
+    View 呼叫時須帶入 ``context={"event": event}``。
+    """
+
+    finalSlotId = serializers.UUIDField()
+    # 空字串正規化成「沒有留言」,比照 ParticipantResponse.comment
+    # （add-participant-responses D12）同款慣例，見 design.md D3。
+    finalNote = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True, max_length=200, default=None
+    )
+
+    def validate_finalSlotId(self, value):
+        event = self.context["event"]
+        if not event.slots.filter(id=value).exists():
+            raise serializers.ValidationError(
+                "所選的最終時段不存在於此活動候選時段", code="SLOT_NOT_FOUND"
+            )
+        return value
