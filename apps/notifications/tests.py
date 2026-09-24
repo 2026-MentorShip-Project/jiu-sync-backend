@@ -8,6 +8,7 @@ from .tasks import (
     _healthcheck_send_test_email,
     send_event_cancelled_email,
     send_event_finalized_email,
+    send_event_reopened_email,
 )
 
 
@@ -51,7 +52,7 @@ def test_send_event_finalized_email_skips_when_event_no_longer_finalized(mailout
     當下的舊狀態。"""
     event = _create_event(status=Event.Status.CANCELLED, cancelled_at=timezone.now())
 
-    send_event_finalized_email(event.id)
+    send_event_finalized_email(event.id, timezone.now())
 
     assert len(mailoutbox) == 0
 
@@ -61,6 +62,79 @@ def test_send_event_cancelled_email_skips_when_event_no_longer_cancelled(mailout
     """同上,cancel 版本。"""
     event = _create_event(status=Event.Status.ACTIVE)
 
-    send_event_cancelled_email(event.id)
+    send_event_cancelled_email(event.id, timezone.now())
 
     assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_finalized_email_skips_when_finalized_at_is_stale(mailoutbox):
+    """第二輪 code-review 抓到:光核對「現在的 status」擋不住
+    reopen→finalize→reopen→finalize 這種來回——舊 task 執行當下看到的 status
+    可能剛好又符合，因而重複寄信。task 額外核對呼叫端排入當下記下的
+    finalized_at 是否還跟資料庫現在的值一致,不一致代表這是一個被後續
+    transition 蓋過的過期 task,不該寄信。"""
+    event = _create_event(status=Event.Status.FINALIZED, finalized_at=timezone.now())
+    stale_finalized_at = event.finalized_at - timezone.timedelta(minutes=1)
+
+    send_event_finalized_email(event.id, stale_finalized_at)
+
+    assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_finalized_email_sends_when_finalized_at_matches_current(mailoutbox):
+    """對照組:傳入的 finalized_at 跟資料庫現在的值一致(不是過期 task)→
+    正常寄信。"""
+    event = _create_event(status=Event.Status.FINALIZED, finalized_at=timezone.now())
+    slot = event.slots.first()
+    event.final_slot = slot
+    event.save()
+
+    send_event_finalized_email(event.id, event.finalized_at)
+
+    assert len(mailoutbox) == 1
+
+
+@pytest.mark.django_db
+def test_send_event_cancelled_email_skips_when_cancelled_at_is_stale(mailoutbox):
+    """同 finalize 版本的過期 task 判斷,cancel 版本。"""
+    event = _create_event(status=Event.Status.CANCELLED, cancelled_at=timezone.now())
+    stale_cancelled_at = event.cancelled_at - timezone.timedelta(minutes=1)
+
+    send_event_cancelled_email(event.id, stale_cancelled_at)
+
+    assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_cancelled_email_sends_when_cancelled_at_matches_current(mailoutbox):
+    event = _create_event(status=Event.Status.CANCELLED, cancelled_at=timezone.now())
+
+    send_event_cancelled_email(event.id, event.cancelled_at)
+
+    assert len(mailoutbox) == 1
+
+
+@pytest.mark.django_db
+def test_send_event_reopened_email_skips_when_response_deadline_is_stale(mailoutbox):
+    """reopen 沒有專屬的時間戳欄位,借用 response_deadline 本身當作 transition
+    身分——舊 task 排入當下記下的 deadline 若跟資料庫現在的值不一致,代表
+    活動後來又被重新開放過一次(deadline 已經是更新的值),這是過期 task。"""
+    event = _create_event(status=Event.Status.ACTIVE)
+    stale_deadline = event.response_deadline - timezone.timedelta(days=1)
+
+    send_event_reopened_email(event.id, stale_deadline)
+
+    assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_reopened_email_sends_when_response_deadline_matches_current(
+    mailoutbox,
+):
+    event = _create_event(status=Event.Status.ACTIVE)
+
+    send_event_reopened_email(event.id, event.response_deadline)
+
+    assert len(mailoutbox) == 1

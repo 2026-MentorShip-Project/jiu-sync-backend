@@ -58,9 +58,13 @@ _DUMMY_PHONE_HASH_FOR_TIMING = make_password("000")
 logger = logging.getLogger(__name__)
 
 
-def _schedule_notification(task, event_id):
+def _schedule_notification(task, event_id, *task_args):
     """把通知信 task 排進 ``transaction.on_commit()``，並且吞掉排入/執行當下
     拋出的例外，只記 log，不讓它往上炸穿整個 view。
+
+    ``task_args``:這次 transition 寫入 DB 的識別值（例如 ``finalized_at``），
+    原樣轉傳給 task，讓 task 執行時能核對自己是否已被後續 transition 蓋過
+    （design.md D10，過期 task 判斷）。
 
     使用者實測發現:本機 ``CELERY_TASK_ALWAYS_EAGER=True`` 時，
     ``.delay()`` 在 ``on_commit`` 觸發當下同步執行，若寄信失敗（例如 email
@@ -75,7 +79,7 @@ def _schedule_notification(task, event_id):
 
     def _run():
         try:
-            task.delay(event_id)
+            task.delay(event_id, *task_args)
         except Exception:
             logger.exception(
                 "Failed to schedule notification task %s for event %s",
@@ -628,7 +632,7 @@ class EventFinalizeView(APIView):
             )
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
-        _schedule_notification(send_event_finalized_email, event.id)
+        _schedule_notification(send_event_finalized_email, event.id, event.finalized_at)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
@@ -684,7 +688,7 @@ class EventCancelView(APIView):
             ).update(deleted_at=claimed_at)
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
-        _schedule_notification(send_event_cancelled_email, event.id)
+        _schedule_notification(send_event_cancelled_email, event.id, event.cancelled_at)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
@@ -737,7 +741,9 @@ class EventReopenView(APIView):
             )
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
-        _schedule_notification(send_event_reopened_email, event.id)
+        _schedule_notification(
+            send_event_reopened_email, event.id, event.response_deadline
+        )
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)

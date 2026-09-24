@@ -96,6 +96,16 @@ CAS 成功後，序列化用的 `event` 物件需要反映寫入後的最新狀�
 
 欄位內容沿用 `final*` 前綴命名慣例（比照 `finalSlotId`/`finalNote`）：`finalAttendees` 為陣列，每筆 `{id, nickname, comment}`——不含 `slotAvailabilities`（已經知道是哪個時段，不需要再帶一次）。
 
+### D10. 通知信改成逐一寄送 + 過期 task 用 transition 時間戳判斷（2026-09-24 二輪 code-review 追加）
+
+第二輪外部 code-review（涵蓋這個 change 與已合併的 `add-event-reopen`）抓到三個合併阻斷等級的問題，逐一驗證屬實後修正：
+
+1. **Email 外洩**：`send_event_finalized_email`/`send_event_cancelled_email`/`send_event_reopened_email` 原本把所有收件人（含所有留 Email 的參與者與主揪本人）塞進同一封信的 `To`，導致每位參與者都能在自己收到的信裡看到其他人的 Email。改成 `_send_to_each_recipient()`，逐一收件人各寄一封獨立的信。
+2. **過期 task 重複寄信**：`_schedule_notification()` 原本只傳 `event_id`，task 執行時只核對「現在的 status」，無法分辨 reopen→finalize→reopen→finalize 這種來回是否讓自己變成一個被後續 transition 蓋過的過期 task——舊 task 執行當下若狀態剛好又符合，仍會寄出（不是內容錯誤，因為是 live query 現在的值，但會重複寄）。grill-me 確認修法：`_schedule_notification()` 改帶可變長度的 `*task_args`，`finalize`/`cancel` 傳當次 CAS 寫入的 `finalized_at`/`cancelled_at`，`reopen` 沒有專屬時間戳欄位，借用這次寫入的 `response_deadline` 本身當 transition 身分；task 執行時核對資料庫現在的值是否仍與排入當下一致，不一致就是過期 task，直接跳過。
+3. **console backend 收到 SMTP OPTIONS**：`MAILERS["default"]["OPTIONS"]` 原本不管 `BACKEND` 是什麼都無條件塞 `host`/`port`/`username`/`password`/`use_tls`，這正是本檔 Risks 段落 2026-09-23 修訂記錄那次 `InvalidMailer` 的根因——當時只修了「例外不炸穿 view」的症狀，沒修「console backend 本來就不該收到這些參數」的根因。抽成 `_mailer_config(backend)`，只有 `backend == SMTP` 才附帶 `OPTIONS`。
+
+另外一個次要問題：`get_finalAttendees()`（D9）原本只檢查 `final_slot_id`，沒核對 `status == FINALIZED`。正常 API 路徑 `cancel`/`reopen` 都會一併清空 `final_slot`，不會出現不一致資料，但補上這層檢查才忠於 spec 的「僅當活動已定案時」，成本也低，一併修正。
+
 ## Risks / Trade-offs
 
 - **[風險] `ParticipantResponse` 軟刪除後，`unique_together (event, nickname)` 仍然生效** → 若未來加回 `reopen`、允許同一活動重新投票，同暱稱的舊（已軟刪除）紀錄仍會擋掉新投票的 `nickname` 唯一性——這次沒有 `reopen`，不影響本次範圍，留給未來若真的要做 `reopen` 時一併處理（可能需要把 `unique_together` 改成只在 `deleted_at IS NULL` 時生效的 partial unique index）。

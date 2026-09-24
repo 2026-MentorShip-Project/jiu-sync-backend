@@ -61,3 +61,29 @@
 - [x] 4.3 `openspec/changes/add-event-lifecycle/specs/events/spec.md` 的
   「查詢單一活動完整資料」Requirement 加修訂記錄 + 2 個 Scenario；
   design.md 補 D9 — (auto) `openspec validate add-event-lifecycle --strict`
+
+## 5. 第二輪 code-review 修正（2026-09-24，D10）
+
+- [x] 5.1 [RED] `apps/events/tests/test_views.py` 三個既有寄信測試補
+  `assert all(len(mail.to) == 1 for mail in mailoutbox)`；
+  `apps/notifications/tests.py` 補 6 個過期 task 判斷測試（finalize/
+  cancel/reopen 各 2 個：stale 值不寄信、matches 值正常寄）；
+  `config/tests/test_mailer_config.py`（新檔）補 2 個 `_mailer_config()`
+  測試；`test_views.py` 補
+  `test_finalAttendees_is_empty_when_status_not_finalized_despite_stale_final_slot`
+  — (auto) `pytest` 顯示 7 個新/改測試 FAIL（3 個既有寄信測試斷言失敗，
+  4 個新測試因函式/參數不存在 FAIL）
+- [x] 5.2 [GREEN] `apps/notifications/tasks.py` 新增
+  `_send_to_each_recipient()`，三個通知 task 改用它逐一寄送；三個 task
+  簽名各加一個 transition 識別參數（`finalized_at`/`cancelled_at`/
+  `response_deadline`），執行時核對資料庫現在的值是否仍與傳入值一致，不
+  一致視為過期 task 直接跳過。`apps/events/views.py` 的
+  `_schedule_notification()` 改帶 `*task_args` 轉傳給 `task.delay()`，
+  三個 view 呼叫端補上對應的 transition 值。`config/settings/base.py`
+  抽出 `_mailer_config(backend)`，只有 SMTP backend 才附帶 `OPTIONS`。
+  `apps/events/serializers.py` 的 `get_finalAttendees()` 補上
+  `event.status != Event.Status.FINALIZED` 檢查 — (auto) `pytest -q`
+  （230 passed）、`ruff check .`、`manage.py check`、
+  `makemigrations --check --dry-run` 皆乾淨
+- [x] 5.3 design.md 補 D10，記錄三個合併阻斷問題 + 一個次要問題的驗證與
+  修法 — (auto) `openspec validate add-event-lifecycle --strict`

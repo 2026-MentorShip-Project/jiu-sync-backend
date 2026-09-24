@@ -498,7 +498,11 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         # D9(2026-09-24):只在已定案時計算,「可出席」嚴格定義為 available
         # (if_needed 不算)。走已經 prefetch 過的 event.responses.all()/
         # slot_availabilities.all(),不額外下 query,寫法比照 get_slotSummary。
-        if not event.final_slot_id:
+        # code-review 二輪抓到:原本只檢查 final_slot_id,沒核對 status——正常
+        # API 路徑 cancel/reopen 都會一併清空 final_slot,不會出現不一致資料,
+        # 但補上 status 檢查才忠於 spec 的「僅當活動已定案時」（D9 2026-09-24
+        # 二輪修正）。
+        if event.status != Event.Status.FINALIZED or not event.final_slot_id:
             return []
         return [
             {

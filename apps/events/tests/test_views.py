@@ -2973,6 +2973,25 @@ def test_active_event_finalAttendees_is_empty_list():
     assert response.json()["finalAttendees"] == []
 
 
+def test_finalAttendees_is_empty_when_status_not_finalized_despite_stale_final_slot():
+    """code-review 抓到:原本只檢查 final_slot_id,沒核對 status——正常 API
+    路徑 cancel/reopen 都會一併清空 final_slot,不會出現這種不一致資料,但為
+    了忠於 spec(「僅當活動已定案時」)直接用 ORM 造出 status="active" 但
+    final_slot 殘留的資料,確認這種防禦性情況下 finalAttendees 仍為空陣列。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    slot = event.slots.first()
+    _create_participant_response(event, "小美", {slot: "available"})
+    event.final_slot = slot
+    event.save()
+    client = _auth_client(owner)
+
+    response = client.get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["finalAttendees"] == []
+
+
 def test_owner_can_finalize_without_final_note():
     """finalNote 選填,不帶時 final_note 為 None。"""
     owner = _create_user()
@@ -3168,7 +3187,8 @@ def test_finalize_sends_email_to_participants_with_email_and_host(
     django_capture_on_commit_callbacks, mailoutbox
 ):
     """⑪ 定案成功後,留 Email 的參與者與主揪本人各收到一封通知信,沒留 Email
-    的參與者不會收到。"""
+    的參與者不會收到。code-review 抓到:每封信只能有一個收件人,不可讓參與者
+    看到其他參與者/主揪的 Email(隱私外洩)。"""
     owner = _create_user(email="host@example.com")
     event = _create_event(owner, host_email="host@example.com")
     slot = event.slots.first()
@@ -3184,6 +3204,7 @@ def test_finalize_sends_email_to_participants_with_email_and_host(
         )
 
     assert response.status_code == status.HTTP_200_OK
+    assert all(len(mail.to) == 1 for mail in mailoutbox)
     recipients = {addr for mail in mailoutbox for addr in mail.to}
     assert recipients == {"voter@example.com", "host@example.com"}
 
@@ -3392,7 +3413,7 @@ def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(
     django_capture_on_commit_callbacks, mailoutbox
 ):
     """⑨ 取消成功後,原本留 Email 的參與者(即使投票已被軟刪除)與主揪本人各
-    收到一封取消通知信。"""
+    收到一封取消通知信。每封信只能有一個收件人(隱私外洩防護,同 finalize)。"""
     owner = _create_user(email="host@example.com")
     event = _create_event(owner, host_email="host@example.com")
     slot = event.slots.first()
@@ -3405,6 +3426,7 @@ def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(
         response = client.post(_cancel_url(event.id), format="json")
 
     assert response.status_code == status.HTTP_200_OK
+    assert all(len(mail.to) == 1 for mail in mailoutbox)
     recipients = {addr for mail in mailoutbox for addr in mail.to}
     assert recipients == {"voter@example.com", "host@example.com"}
 
@@ -3756,7 +3778,8 @@ def test_reopen_nonexistent_event_returns_404():
 def test_reopen_sends_email_to_participants_with_email_and_host(
     django_capture_on_commit_callbacks, mailoutbox
 ):
-    """⑩ 重新開放成功後,留 Email 的參與者與主揪本人各收到一封通知信。"""
+    """⑩ 重新開放成功後,留 Email 的參與者與主揪本人各收到一封通知信。每封信
+    只能有一個收件人(隱私外洩防護,同 finalize)。"""
     owner = _create_user(email="host@example.com")
     event = _create_event(owner, host_email="host@example.com")
     slot = event.slots.first()
@@ -3772,6 +3795,7 @@ def test_reopen_sends_email_to_participants_with_email_and_host(
         )
 
     assert response.status_code == status.HTTP_200_OK
+    assert all(len(mail.to) == 1 for mail in mailoutbox)
     recipients = {addr for mail in mailoutbox for addr in mail.to}
     assert recipients == {"voter@example.com", "host@example.com"}
 
