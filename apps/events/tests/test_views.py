@@ -103,6 +103,47 @@ def test_unauthenticated_user_cannot_create_event():
     assert Event.objects.count() == 0
 
 
+def test_create_event_sends_share_url_email_to_host(
+    django_capture_on_commit_callbacks, mailoutbox
+):
+    """建立成功後,非同步寄一封含分享連結的通知信到主揪的 Google 帳號信箱
+    （`event.host_email`,即登入使用者的 email）,比照 finalize/cancel/reopen
+    既有的通知信機制（design.md,`add-event-created-email`）。"""
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload()
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert len(mailoutbox) == 1
+    assert mailoutbox[0].to == [user.email]
+    assert payload["title"] in mailoutbox[0].subject
+    assert body["shareUrl"] in mailoutbox[0].body
+
+
+def test_create_event_succeeds_even_if_notification_dispatch_raises(
+    django_capture_on_commit_callbacks, monkeypatch
+):
+    """通知信排程失敗不該讓已經成功的建立活動動作變成 500,沿用
+    `_schedule_notification` 既有保護機制（design.md D3）。"""
+    user = _create_user()
+    client = _auth_client(user)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("email backend misconfigured")
+
+    monkeypatch.setattr("apps.events.views.send_event_created_email.delay", _raise)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(EVENTS_URL, _valid_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Event.objects.count() == 1
+
+
 def test_response_deadline_equal_to_or_earlier_than_now_returns_400():
     """③ responseDeadline 等於或早於送出當下時間 → 400,code 為 "DEADLINE_IN_PAST",
     不建立任何資料。

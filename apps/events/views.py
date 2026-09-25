@@ -17,6 +17,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from apps.notifications.tasks import (
     send_event_cancelled_email,
+    send_event_created_email,
     send_event_finalized_email,
     send_event_reopened_email,
 )
@@ -173,6 +174,14 @@ class EventCreateView(EventListView):
     回應只含 ``{id, shareUrl}``,不回傳活動完整內容。``owner`` 一律取自
     ``request.user``,不採信請求內容中任何宣稱擁有者身分的欄位。繼承
     ``EventListView`` 只是為了共用同一個 URL 掛載點(見該類別 docstring)。
+
+    建立成功後比照 ``EventFinalizeView``/``EventCancelView``/``EventReopenView``
+    既有的機制,透過 ``_schedule_notification`` 非同步寄一封含分享連結的通知
+    信到主揪本人的 Google 帳號信箱（``event.host_email``,design.md D1，
+    `add-event-created-email`）。不像另外三支需要傳入 transition 當下的時間
+    戳做「過期 task」判斷（design.md D10）——建立活動對同一個 ``event.id``
+    只會發生一次,不存在被後續動作蓋過的疑慮（design.md D2）,所以只傳
+    ``event.id``。
     """
 
     def post(self, request):
@@ -181,6 +190,7 @@ class EventCreateView(EventListView):
         # host_email 一律取自 request.user.email,不採信請求 body 中任何
         # hostEmail 欄位——EventCreateSerializer 根本不宣告該欄位。
         event = serializer.save(owner=request.user, host_email=request.user.email)
+        _schedule_notification(send_event_created_email, event.id)
 
         # rstrip 避免 FRONTEND_BASE_URL 若帶結尾斜線組出雙斜線的 shareUrl。
         frontend_base_url = settings.FRONTEND_BASE_URL.rstrip("/")
