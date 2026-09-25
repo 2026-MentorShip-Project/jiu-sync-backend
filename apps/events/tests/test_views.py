@@ -2702,15 +2702,19 @@ def test_comment_post_nonexistent_event_returns_404():
 
 def test_comment_same_nickname_can_post_multiple_times():
     """⑨ 同一暱稱可連續留言兩次,皆成功——留言不要求活動內暱稱唯一
-    (design.md D6,跟 ParticipantResponse.nickname 的唯一限制不同)。"""
+    (design.md D6,跟 ParticipantResponse.nickname 的唯一限制不同)。
+
+    兩次請求刻意帶不同來源 IP(``REMOTE_ADDR``)——add-comment-rate-limit
+    上線後,同一 IP 對同一活動連續留言會被防洗版鎖擋下(見同檔案「留言防洗版
+    鎖」測試區塊),這裡要驗證的是暱稱本身不限制唯一,用不同 IP 排除防洗版鎖
+    的干擾,維持這則測試原本的驗證目的不變。"""
     owner = _create_user()
     event = _create_event(owner)
-    client = APIClient()
 
-    first = client.post(
+    first = APIClient(REMOTE_ADDR="10.0.0.1").post(
         _comments_url(event.id), _comment_payload(message="第一則"), format="json"
     )
-    second = client.post(
+    second = APIClient(REMOTE_ADDR="10.0.0.2").post(
         _comments_url(event.id), _comment_payload(message="第二則"), format="json"
     )
 
@@ -3108,6 +3112,205 @@ def test_comment_delete_concurrent_requests_only_one_succeeds():
     ]
     comment.refresh_from_db()
     assert comment.deleted_at is not None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/comments — 留言防洗版鎖 (add-comment-rate-limit)
+#
+# 上鎖時機是「驗證通過之後、寫入 DB 之前」，用單一原子的 Redis
+# `SET key 1 NX EX 2` 搶鎖（design.md D2/D3）——這是這個 change 存在的核心理
+# 由：兩個內容皆合法、近乎同時送達的請求，只能有一則真的寫入成功。
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_redis_client():
+    """連到跟 view 相同的留言防洗版 Redis（``settings.COMMENT_RATE_LIMIT_REDIS_URL``）
+    ,測試需要直接操控 key／TTL 時使用（見 ④）。不 mock Redis client 本身,這是
+    真的連線。"""
+    import redis
+
+    return redis.Redis.from_url(settings.COMMENT_RATE_LIMIT_REDIS_URL)
+
+
+def test_comment_rate_limit_second_request_same_ip_same_event_returns_429():
+    """① 同一 IP 對同一活動連續兩次留言(間隔 <2 秒)→ 第二次回傳 429,
+    COMMENT_RATE_LIMITED,且第二次的留言內容沒有被寫入 DB。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    first = client.post(
+        _comments_url(event.id), _comment_payload(message="第一則"), format="json"
+    )
+    second = client.post(
+        _comments_url(event.id), _comment_payload(message="第二則"), format="json"
+    )
+
+    assert first.status_code == status.HTTP_201_CREATED
+    assert second.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    assert second.json()["code"] == "COMMENT_RATE_LIMITED"
+    assert Comment.objects.filter(event=event).count() == 1
+    assert Comment.objects.get(event=event).message == "第一則"
+
+
+def test_comment_rate_limit_does_not_cross_events():
+    """② 同一 IP 對不同活動連續留言 → 兩則都成功(鎖不跨活動,見 design.md
+    D1)。"""
+    owner = _create_user()
+    event_a = _create_event(owner)
+    event_b = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    response_a = client.post(
+        _comments_url(event_a.id), _comment_payload(message="活動 A"), format="json"
+    )
+    response_b = client.post(
+        _comments_url(event_b.id), _comment_payload(message="活動 B"), format="json"
+    )
+
+    assert response_a.status_code == status.HTTP_201_CREATED
+    assert response_b.status_code == status.HTTP_201_CREATED
+
+
+def test_comment_rate_limit_does_not_cross_ips():
+    """③ 不同 IP 對同一活動連續留言 → 兩則都成功(鎖不跨 IP)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+
+    response_1 = APIClient(REMOTE_ADDR="1.1.1.1").post(
+        _comments_url(event.id), _comment_payload(message="來自 1.1.1.1"), format="json"
+    )
+    response_2 = APIClient(REMOTE_ADDR="2.2.2.2").post(
+        _comments_url(event.id), _comment_payload(message="來自 2.2.2.2"), format="json"
+    )
+
+    assert response_1.status_code == status.HTTP_201_CREATED
+    assert response_2.status_code == status.HTTP_201_CREATED
+
+
+def test_comment_rate_limit_expires_and_allows_next_comment():
+    """④ 鎖定時間過後(這裡直接操控 Redis TTL,不真的 sleep 2 秒)→ 同一 IP
+    對同一活動可以再次留言成功。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    first = client.post(
+        _comments_url(event.id), _comment_payload(message="第一則"), format="json"
+    )
+    assert first.status_code == status.HTTP_201_CREATED
+
+    redis_client = _rate_limit_redis_client()
+    redis_client.delete(f"comment_rl:{event.id}:1.2.3.4")
+
+    second = client.post(
+        _comments_url(event.id), _comment_payload(message="第二則"), format="json"
+    )
+
+    assert second.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 2
+
+
+def test_comment_rate_limit_invalid_request_does_not_consume_lock():
+    """⑤ 留言驗證失敗(缺暱稱,400)→ 不消耗鎖,緊接著送出合法留言仍然成功
+    (design.md D2:上鎖時機在驗證通過之後,驗證失敗根本不會走到嘗試上鎖這一
+    步)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+    invalid_payload = _comment_payload()
+    del invalid_payload["nickname"]
+
+    invalid_response = client.post(
+        _comments_url(event.id), invalid_payload, format="json"
+    )
+    valid_response = client.post(
+        _comments_url(event.id), _comment_payload(message="合法留言"), format="json"
+    )
+
+    assert invalid_response.status_code == status.HTTP_400_BAD_REQUEST
+    assert valid_response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+def test_comment_rate_limit_fails_open_when_redis_unreachable():
+    """⑥ 模擬 Redis 連線失敗(指向一個不存在的位址／port,不 mock Redis
+    client 本身)→ 留言仍正常寫入成功,不因為 Redis 異常而 500 或被擋下
+    (design.md D7,fail-open)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    with override_settings(COMMENT_RATE_LIMIT_REDIS_URL="redis://localhost:1/0"):
+        response = client.post(
+            _comments_url(event.id), _comment_payload(), format="json"
+        )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+def test_comment_rate_limit_fails_open_when_redis_url_is_malformed():
+    """code-review 補充:``COMMENT_RATE_LIMIT_REDIS_URL`` 設定錯誤（不合法的
+    URL scheme,例如漏打或打錯）→ ``redis.Redis.from_url()`` 拋的是
+    ``ValueError``,不是 ``redis.exceptions.RedisError``——這個分支若只捕
+    捉後者,設定錯誤會讓每個留言請求都 500,違反 D7 fail-open 的初衷。留言
+    仍應正常寫入成功。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    with override_settings(COMMENT_RATE_LIMIT_REDIS_URL="not-a-valid-redis-url"):
+        response = client.post(
+            _comments_url(event.id), _comment_payload(), format="json"
+        )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_comment_rate_limit_concurrent_legit_requests_only_one_succeeds():
+    """⑦ 併發情境(這個 change 存在的核心理由):同一 IP、同一活動,兩個內容皆
+    合法的請求近乎同時送達(模擬連點)→ 只有一則成功寫入 DB,另一則收到
+    429,不能兩則都成功。驗證 design.md D2/D3:鎖必須設在「驗證通過之後、
+    寫入 DB 之前」,不是等 DB 寫入完成才上鎖——否則兩個近乎同時抵達、都通過
+    驗證的請求會在鎖生效前搶先都執行完 ``save()``,變成兩則都寫入成功,完全
+    達不到防洗版的目的。用 ``transaction=True`` 讓兩個執行緒各自拿到真正獨立
+    的 DB connection,才測得出真實的併發行為(同款寫法見
+    ``test_comment_delete_concurrent_requests_only_one_succeeds``)。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_comment(message):
+        start_barrier.wait()
+        client = APIClient(REMOTE_ADDR="1.2.3.4")
+        try:
+            response = client.post(
+                _comments_url(event.id), _comment_payload(message=message), format="json"
+            )
+            status_codes.append(response.status_code)
+        finally:
+            connection.close()
+
+    threads = [
+        threading.Thread(target=send_comment, args=(f"連點留言 {i}",)) for i in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_201_CREATED,
+        status.HTTP_429_TOO_MANY_REQUESTS,
+    ]
+    assert Comment.objects.filter(event=event).count() == 1
 
 
 # ---------------------------------------------------------------------------
