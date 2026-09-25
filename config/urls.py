@@ -16,6 +16,7 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 from apps.accounts.views import MeView
 from config.health import healthz
@@ -23,6 +24,8 @@ from config.health import healthz
 admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
 
 urlpatterns = [
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
     path('admin/', admin.site.urls),
     path('api/me/', MeView.as_view(), name='me'),
     path('healthz/', healthz, name='healthz'),

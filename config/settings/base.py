@@ -35,6 +35,7 @@ DJANGO_APPS = [
 
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "drf_spectacular",
     "rest_framework_simplejwt",
     "corsheaders",
 ]
@@ -164,6 +165,7 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     # Host-only endpoints require auth by default; participant/room endpoints
     # (PRD: fully login-free) must explicitly override to AllowAny per-view.
     "DEFAULT_PERMISSION_CLASSES": (
@@ -174,6 +176,13 @@ REST_FRAMEWORK = {
     # 全站一致的非 2xx 錯誤回應格式 {"message": ..., "code": ...}. See
     # openspec/changes/api-error-format/design.md.
     "EXCEPTION_HANDLER": "config.exceptions.custom_exception_handler",
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Jiu Sync API",
+    "DESCRIPTION": "API for coordinating event availability.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
 }
 
 SIMPLE_JWT = {

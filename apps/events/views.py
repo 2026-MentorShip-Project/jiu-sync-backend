@@ -216,12 +216,12 @@ class EventDetailView(APIView):
     """
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if getattr(self.request, "method", None) == "PATCH":
             return [IsAuthenticated()]
         return [AllowAny()]
 
     def get_authenticators(self):
-        if self.request.method == "PATCH":
+        if getattr(self.request, "method", None) == "PATCH":
             return [JWTAuthentication()]
         return [OptionalJWTAuthentication()]
 
