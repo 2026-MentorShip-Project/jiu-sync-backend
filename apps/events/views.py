@@ -6,8 +6,8 @@ from datetime import timedelta
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
-from django.db.models import Prefetch
-from django.utils import timezone
+from django.db.models import Prefetch, Q
+from django.utils import dateparse, timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -48,6 +48,10 @@ from .serializers import (
 
 # ParticipantResponseAccessToken 的效期,核發後固定 30 分鐘(design.md D2)。
 PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
+
+# GET /api/events/{id}/comments 固定每頁筆數,不開放前端指定 limit
+# （add-comment-pagination design.md D4)。
+COMMENT_PAGE_SIZE = 10
 
 # 暱稱查無資料時,仍對這個固定雜湊值跑一次 check_password,讓「暱稱不存在」與
 # 「暱稱存在但手機碼錯誤」兩種失敗耗費的時間趨於一致——design.md D3 只保證
@@ -517,6 +521,33 @@ class ParticipantResponseDetailView(APIView):
         return Response(response_serializer.data, status=status.HTTP_200_OK)
 
 
+def _encode_comment_cursor(comment):
+    """組出 keyset pagination 的 cursor(add-comment-pagination design.md D2)。
+    格式 ``{created_at.isoformat()}_{id}``,不做 base64 包裝——cursor 不是
+    敏感資訊,純粹是查詢起點,base64 只會增加除錯難度。用底線分隔是因為
+    ``created_at.isoformat()`` 本身不含底線字元,可以安全用
+    ``rsplit("_", 1)`` 還原成兩段。"""
+    return f"{comment.created_at.isoformat()}_{comment.id}"
+
+
+def _decode_comment_cursor(cursor):
+    """解析 ``_encode_comment_cursor`` 產生的 cursor,回傳
+    ``(created_at, id)`` tuple；格式不合法(缺底線、``created_at`` 不是合法
+    ISO 字串、id 段落為空)一律回傳 ``None``,不拋例外——呼叫端把 ``None``
+    視同沒有帶 cursor(design.md「風險」段落:cursor 被竄改成不存在或格式
+    不合法的值,查詢應該優雅退化,不能 500)。"""
+    if not cursor:
+        return None
+    try:
+        created_at_part, comment_id = cursor.rsplit("_", 1)
+    except ValueError:
+        return None
+    created_at = dateparse.parse_datetime(created_at_part)
+    if created_at is None or not comment_id:
+        return None
+    return created_at, comment_id
+
+
 class CommentListCreateView(APIView):
     """``GET``/``POST /api/events/{id}/comments`` — 活動留言板，任何人（含未
     登入）皆可查詢、留言。完全公開，不需要登入，不採用任何身分驗證，同三支
@@ -535,12 +566,37 @@ class CommentListCreateView(APIView):
     def get(self, request, id):
         event = _get_event_or_404(id)
         _display_status_or_410(event)
-        # Comment.Meta.ordering 已定義 created_at 遞增,.all() 就是這個順序,
-        # 不需要重複 order_by(code-review 抓到)。已軟刪除的留言(design.md
-        # D9)排除在外——對查詢者而言就是不存在。
+        # 已軟刪除的留言(design.md D9)排除在外——對查詢者而言就是不存在,
+        # 也不計入分頁筆數(add-comment-pagination design.md tasks 2.1 ⑥)。
         comments = event.comments.filter(deleted_at__isnull=True)
-        serializer = CommentSerializer(comments, many=True)
-        return Response(serializer.data)
+
+        # Cursor 分頁(keyset pagination,不是 offset——add-comment-pagination
+        # design.md D3):cursor 解析失敗一律視同沒有帶 cursor,優雅退化回傳
+        # 最新一頁,不 500。用複合條件(created_at 為主、id 為次要排序鍵)是
+        # 為了處理兩則留言 created_at 完全相同的邊界情況。
+        cursor = _decode_comment_cursor(request.query_params.get("cursor"))
+        if cursor is not None:
+            cursor_created_at, cursor_id = cursor
+            comments = comments.filter(
+                Q(created_at__lt=cursor_created_at)
+                | Q(created_at=cursor_created_at, id__lt=cursor_id)
+            )
+
+        # 固定每頁 10 則,不開放前端指定 limit(design.md D4)。由新到舊排序
+        # ——跟 Comment.Meta.ordering(遞增,由舊到新)方向相反,這支端點的
+        # 回應順序刻意反過來(design.md Context)。
+        page = list(comments.order_by("-created_at", "-id")[:COMMENT_PAGE_SIZE])
+
+        # 取滿一頁才代表可能還有更舊的資料;不滿一頁代表已經是最後一批,
+        # nextCursor 為 None（design.md D1，不額外加 hasMore）。
+        next_cursor = (
+            _encode_comment_cursor(page[-1])
+            if len(page) == COMMENT_PAGE_SIZE
+            else None
+        )
+
+        serializer = CommentSerializer(page, many=True)
+        return Response({"comments": serializer.data, "nextCursor": next_cursor})
 
     def post(self, request, id):
         event = _get_event_or_404(id)

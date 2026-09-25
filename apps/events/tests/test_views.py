@@ -11,7 +11,7 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import IntegrityError, connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
-from django.utils import dateparse, timezone
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -2750,37 +2750,94 @@ def test_comment_id_collision_retries_and_still_succeeds(monkeypatch):
     assert Comment.objects.count() == 2
 
 
-def test_comment_list_returns_all_sorted_by_created_at_ascending():
-    """⑪ 活動有 3 則留言(刻意用不同的建立順序/created_at)→ 200,回應陣列依
-    created_at 由舊到新排序。``created_at`` 是 ``auto_now_add``,``.create()``
-    時傳入的值會被忽略、強制寫成當下時間——建立後改用 ``.update()``(繞過
-    ``auto_now_add`` 的 ``pre_save``,只有 ``.save()``/``.create()`` 才會觸發)
-    才能真正控制每筆的時間,驗證排序不是碰巧跟建立順序一致。"""
+# ---------------------------------------------------------------------------
+# GET /api/events/{id}/comments — cursor 分頁 (add-comment-pagination)
+#
+# 回應格式改為 {"comments": [...], "nextCursor": string|null}(breaking
+# change,design.md D5,不做新舊格式相容層)；預設由新到舊排序、固定每頁 10
+# 則(design.md D4)；cursor 為 keyset pagination(design.md D3),不是
+# offset——這是這個 change 存在的核心理由:並發新增留言不會讓翻頁時漏掉或
+# 重複看到既有留言。
+# ---------------------------------------------------------------------------
+
+
+def _create_comment_at(event, nickname, message, created_at):
+    """建立一則留言並把 ``created_at`` 覆寫成指定時間。``created_at`` 是
+    ``auto_now_add``,``.create()`` 時傳入的值會被忽略、強制寫成當下時
+    間——建立後改用 ``.update()``(繞過 ``auto_now_add`` 的 ``pre_save``,只
+    有 ``.save()``/``.create()`` 才會觸發)才能真正控制每筆的時間。"""
+    comment = Comment.objects.create(event=event, nickname=nickname, message=message)
+    Comment.objects.filter(pk=comment.pk).update(created_at=created_at)
+    comment.refresh_from_db()
+    return comment
+
+
+def test_comment_list_first_page_returns_latest_10_desc_with_next_cursor():
+    """① 活動有 15 則留言、不帶 cursor 查詢 → 回傳最新 10 則(依 created_at
+    由新到舊),nextCursor 非 null。"""
     owner = _create_user()
     event = _create_event(owner)
-    now = timezone.now()
-    third = Comment.objects.create(event=event, nickname="小美", message="第三則")
-    first = Comment.objects.create(event=event, nickname="小華", message="第一則")
-    second = Comment.objects.create(event=event, nickname="小明", message="第二則")
-    Comment.objects.filter(pk=third.pk).update(created_at=now)
-    Comment.objects.filter(pk=first.pk).update(created_at=now - timedelta(minutes=10))
-    Comment.objects.filter(pk=second.pk).update(created_at=now - timedelta(minutes=5))
-    first.refresh_from_db()
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]  # comments[0] 最舊、comments[14] 最新
     client = APIClient()
 
     response = client.get(_comments_url(event.id))
 
     assert response.status_code == status.HTTP_200_OK
     body = response.json()
-    assert [item["id"] for item in body] == [first.id, second.id, third.id]
-    assert body[0]["id"] == first.id
-    assert body[0]["nickname"] == "小華"
-    assert body[0]["message"] == "第一則"
-    assert dateparse.parse_datetime(body[0]["createdAt"]) == first.created_at
+    expected_ids = [c.id for c in reversed(comments[5:15])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert set(body.keys()) == {"comments", "nextCursor"}
+    assert body["nextCursor"] is not None
 
 
-def test_comment_list_returns_empty_array_when_no_comments():
-    """⑫ 活動無留言 → 200,空陣列。"""
+def test_comment_list_second_page_returns_remaining_with_null_next_cursor():
+    """② 帶上一頁回傳的 nextCursor 再查一次 → 回傳剩下 5 則(更舊的那批),
+    nextCursor 為 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]
+    client = APIClient()
+    first_page = client.get(_comments_url(event.id)).json()
+
+    response = client.get(_comments_url(event.id), {"cursor": first_page["nextCursor"]})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments[0:5])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_returns_all_when_10_or_fewer_with_null_next_cursor():
+    """③ 活動留言數 ≤10、不帶 cursor → 回傳全部,nextCursor 為 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(7)
+    ]
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments)]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_returns_empty_when_no_comments():
+    """④ 活動完全沒有留言 → 回傳空陣列,nextCursor 為 null。"""
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
@@ -2788,11 +2845,103 @@ def test_comment_list_returns_empty_array_when_no_comments():
     response = client.get(_comments_url(event.id))
 
     assert response.status_code == status.HTTP_200_OK
-    assert response.json() == []
+    assert response.json() == {"comments": [], "nextCursor": None}
+
+
+def test_comment_list_invalid_cursor_falls_back_to_first_page():
+    """⑤ 帶一個格式不合法的 cursor(例如亂數字串)→ 視同沒帶 cursor,回傳
+    最新一頁,不 500。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(3)
+    ]
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id), {"cursor": "not-a-valid-cursor"})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments)]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_deleted_comments_do_not_count_toward_page_size():
+    """⑥ 已軟刪除的留言不計入任何一頁、不影響分頁筆數:12 則留言其中最新的
+    2 則已被軟刪除 → 第一頁仍回傳 10 則未刪除留言(不是只回傳 8 則)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(12)
+    ]
+    Comment.objects.filter(pk__in=[comments[10].pk, comments[11].pk]).update(
+        deleted_at=timezone.now()
+    )
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert len(body["comments"]) == 10
+    expected_ids = [c.id for c in reversed(comments[0:10])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    # 剛好取滿 10 筆(design.md tasks 2.2:「取到滿 10 筆時,用第 10 筆算
+    # cursor」),即使背後其實已經沒有更舊的資料,nextCursor 仍非 null——下一
+    # 頁查詢會優雅退化成空陣列(design.md Risks 段落),不是這裡就先判斷
+    # 「是否真的還有更多」。
+    assert body["nextCursor"] is not None
+
+    next_page = client.get(
+        _comments_url(event.id), {"cursor": body["nextCursor"]}
+    ).json()
+    assert next_page == {"comments": [], "nextCursor": None}
+
+
+def test_comment_list_second_page_unaffected_by_concurrent_insert():
+    """⑦ 併發情境:模擬「查第一頁之後、翻第二頁之前,資料庫插入一則新留
+    言」→ 第二頁結果不受這則新插入留言影響(不重複也不跳過既有留言)。這是
+    cursor(keyset)分頁 vs offset 分頁的關鍵差異(design.md D3)——offset
+    分頁在這個情境下,原本該在第二頁的留言會被新插入的留言往後推一位,造成
+    重複或跳過;cursor 分頁固定接續在「已看過的最後一則」之後查詢,不受影
+    響。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]  # comments[14] 最新
+    client = APIClient()
+
+    first_page = client.get(_comments_url(event.id)).json()
+    expected_first_page_ids = [c.id for c in reversed(comments[5:15])]
+    assert [item["id"] for item in first_page["comments"]] == expected_first_page_ids
+
+    # 並發:在翻第二頁之前,有一則新留言插入,created_at 比目前所有留言都新
+    new_comment = _create_comment_at(
+        event, "小美", "插隊留言", base + timedelta(minutes=100)
+    )
+
+    second_page = client.get(
+        _comments_url(event.id), {"cursor": first_page["nextCursor"]}
+    ).json()
+
+    expected_second_page_ids = [c.id for c in reversed(comments[0:5])]
+    second_page_ids = [item["id"] for item in second_page["comments"]]
+    assert second_page_ids == expected_second_page_ids
+    assert new_comment.id not in second_page_ids
+    assert second_page["nextCursor"] is None
 
 
 def test_comment_list_nonexistent_event_returns_404():
-    """⑬ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    """⑧ 活動不存在 → 404 EVENT_NOT_FOUND(既有行為,確認分頁改動沒有連帶
+    破壞)。"""
     client = APIClient()
 
     response = client.get(_comments_url(generate_short_id()))
@@ -2826,7 +2975,7 @@ def test_comment_owner_can_delete_own_event_comment():
     assert comment.deleted_at is not None
 
     list_response = APIClient().get(_comments_url(event.id))
-    assert list_response.json() == []
+    assert list_response.json()["comments"] == []
 
 
 def test_comment_delete_by_non_owner_returns_403():
@@ -2918,7 +3067,7 @@ def test_comment_list_excludes_deleted_comments():
 
     assert response.status_code == status.HTTP_200_OK
     body = response.json()
-    assert [item["id"] for item in body] == [visible.id]
+    assert [item["id"] for item in body["comments"]] == [visible.id]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -3482,7 +3631,7 @@ def test_cancel_does_not_affect_existing_comments():
 
     assert response.status_code == status.HTTP_200_OK
     comments_response = APIClient().get(_comments_url(event.id))
-    assert len(comments_response.json()) == 1
+    assert len(comments_response.json()["comments"]) == 1
 
 
 def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(
