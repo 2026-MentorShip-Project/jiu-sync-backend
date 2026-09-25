@@ -4,6 +4,8 @@ import unicodedata
 from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from rest_framework import serializers
 
 from config.exceptions import ApiError
@@ -381,9 +383,11 @@ class _OwnerAndDisplayStatusMixin:
         user = getattr(request, "user", None)
         return bool(user) and user.is_authenticated and user == event.owner
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_isOwner(self, event):
         return self._is_owner(event)
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_displayStatus(self, event):
         # EventDetailView.get() 為了判斷要不要回 410 LINK_EXPIRED,已經算過一次
         # displayStatus,算好的值會放進 context 直接複用,不用重算(同一個純函式、
@@ -444,11 +448,13 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "finalAttendees",
         ]
 
+    @extend_schema_field(serializers.EmailField(allow_null=True))
     def get_hostEmail(self, event):
         if not self._is_owner(event):
             return None
         return event.host_email
 
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
     def get_finalSlotId(self, event):
         # design.md（add-event-lifecycle）：final_slot/final_note 早就是
         # schema-ahead 欄位（見 Event model docstring），但從沒被任何 API 回應
@@ -456,6 +462,18 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
         # event.final_slot.id，前者不會觸發額外查詢；未定案時為 None。
         return str(event.final_slot_id) if event.final_slot_id else None
 
+    @extend_schema_field(
+        inline_serializer(
+            "SlotSummary",
+            fields={
+                "slotId": serializers.UUIDField(),
+                "available": serializers.IntegerField(),
+                "if_needed": serializers.IntegerField(),
+                "unavailable": serializers.IntegerField(),
+            },
+            many=True,
+        )
+    )
     def get_slotSummary(self, event):
         # design.md D17:前端要「不同時段的三態票數」,不用自己 reduce
         # responses 陣列。key 沿用 availability 的 enum 值本身
@@ -474,6 +492,18 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             {"slotId": str(slot.id), **counts[slot.id]} for slot in event.slots.all()
         ]
 
+    @extend_schema_field(
+        inline_serializer(
+            "EventParticipantResponse",
+            fields={
+                "id": serializers.CharField(),
+                "nickname": serializers.CharField(),
+                "comment": serializers.CharField(allow_null=True),
+                "slotAvailabilities": SlotAvailabilityInputSerializer(many=True),
+            },
+            many=True,
+        )
+    )
     def get_responses(self, event):
         # D8:回傳 nickname/slotAvailabilities/comment,刻意不含 phoneLastThree
         # (含雜湊)/email——那些屬於參與者聯絡資訊,不對外(含其他參與者)公開。
@@ -499,6 +529,17 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             for participant_response in event.responses.all()
         ]
 
+    @extend_schema_field(
+        inline_serializer(
+            "FinalAttendee",
+            fields={
+                "id": serializers.CharField(),
+                "nickname": serializers.CharField(),
+                "comment": serializers.CharField(allow_null=True),
+            },
+            many=True,
+        )
+    )
     def get_finalAttendees(self, event):
         # D9(2026-09-24):只在已定案時計算,「可出席」嚴格定義為 available
         # (if_needed 不算)。走已經 prefetch 過的 event.responses.all()/
@@ -554,6 +595,7 @@ class EventSummarySerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSeria
             "responseCount",
         ]
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_responseCount(self, event):
         # ParticipantResponse model 尚未建立,固定回傳 0。
         return 0
