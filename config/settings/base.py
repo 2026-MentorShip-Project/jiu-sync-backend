@@ -124,19 +124,36 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # in prod via env. Notifications per PRD §5 (finalized / deadline / board
 # update, only to participants who filled in an email).
 
-MAILERS = {
-    "default": {
-        "BACKEND": env(
-            "EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend"
-        ),
-        "OPTIONS": {
+_SMTP_EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+
+def _mailer_config(backend):
+    """只有 SMTP backend 才帶 host/port/username/password/use_tls 這些
+    OPTIONS——code-review 抓到:原本不管 BACKEND 是什麼都無條件塞這組 SMTP
+    專屬參數，console backend（開發預設值）不吃這些參數，若 .env 剛好設了
+    EMAIL_HOST 等變數但沒設 EMAIL_BACKEND（維持 console 預設），寄信當下會
+    直接拋 InvalidMailer（design.md add-event-lifecycle Risks 2026-09-23
+    修訂記錄，使用者本機實測過一次真的觸發，見 add-event-lifecycle
+    design.md D10 2026-09-24 二輪修正）。
+    """
+    config = {"BACKEND": backend}
+    if backend == _SMTP_EMAIL_BACKEND:
+        config["OPTIONS"] = {
             "host": env("EMAIL_HOST", default=""),
             "port": env.int("EMAIL_PORT", default=587),
             "username": env("EMAIL_HOST_USER", default=""),
             "password": env("EMAIL_HOST_PASSWORD", default=""),
             "use_tls": env.bool("EMAIL_USE_TLS", default=True),
-        },
-    },
+        }
+    return config
+
+
+MAILERS = {
+    "default": _mailer_config(
+        env(
+            "EMAIL_BACKEND", default="django.core.mail.backends.console.EmailBackend"
+        )
+    ),
 }
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="jiu-sync@example.com")
 
@@ -186,6 +203,10 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
+# 正式環境需要真的部署一個 Celery worker 程序消費佇列，預設 False（真非同步）。
+# dev.py 覆寫成 True——本機/測試沒有另外跑 worker，.delay() 同步在原地執行完，
+# 見 openspec/changes/add-event-lifecycle/design.md D2。
+CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 
 
 # Google SSO — host login only (see apps.accounts). Backend verifies the

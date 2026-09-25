@@ -1,10 +1,12 @@
 import hashlib
+import logging
 import secrets
 from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
@@ -13,6 +15,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
+from apps.notifications.tasks import (
+    send_event_cancelled_email,
+    send_event_finalized_email,
+    send_event_reopened_email,
+)
 from config.exceptions import ApiError, Gone
 
 from .authentication import OptionalJWTAuthentication
@@ -20,6 +27,7 @@ from .lifecycle import compute_display_status
 from .models import (
     Comment,
     Event,
+    ParticipantResponse,
     ParticipantResponseAccessToken,
     ParticipantResponseSlotAvailability,
 )
@@ -28,7 +36,9 @@ from .serializers import (
     CommentSerializer,
     EventCreateSerializer,
     EventDetailSerializer,
+    EventFinalizeSerializer,
     EventPatchSerializer,
+    EventReopenSerializer,
     EventSummarySerializer,
     ParticipantResponseCreateSerializer,
     ParticipantResponsePatchSerializer,
@@ -44,6 +54,40 @@ PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
 # 側錄暱稱是否存在(code-review 抓到)。模組載入時算一次即可,不用每次請求
 # 重新雜湊。
 _DUMMY_PHONE_HASH_FOR_TIMING = make_password("000")
+
+logger = logging.getLogger(__name__)
+
+
+def _schedule_notification(task, event_id, *task_args):
+    """把通知信 task 排進 ``transaction.on_commit()``，並且吞掉排入/執行當下
+    拋出的例外，只記 log，不讓它往上炸穿整個 view。
+
+    ``task_args``:這次 transition 寫入 DB 的識別值（例如 ``finalized_at``），
+    原樣轉傳給 task，讓 task 執行時能核對自己是否已被後續 transition 蓋過
+    （design.md D10，過期 task 判斷）。
+
+    使用者實測發現:本機 ``CELERY_TASK_ALWAYS_EAGER=True`` 時，
+    ``.delay()`` 在 ``on_commit`` 觸發當下同步執行，若寄信失敗（例如 email
+    backend 設定錯誤），例外會直接讓這次 API 回應變成 500——即使真正的
+    狀態轉換（``EventFinalizeView``/``EventCancelView`` 的 CAS ``UPDATE``）
+    早在 ``on_commit`` 觸發前就已經 commit 成功。通知信寄送失敗不該讓一個
+    已經成功的動作看起來像失敗（design.md Risks 原本就講明這是刻意的設計
+    意圖，只是先前沒有真的做防護）。正式環境用真的 Celery worker 時，這層
+    防護仍然有意義：``.delay()`` 本身（把訊息放進 Redis 佇列）理論上也可能
+    因為 broker 連線問題丟例外，同樣不該讓 API 回應失敗。
+    """
+
+    def _run():
+        try:
+            task.delay(event_id, *task_args)
+        except Exception:
+            logger.exception(
+                "Failed to schedule notification task %s for event %s",
+                task.name,
+                event_id,
+            )
+
+    transaction.on_commit(_run)
 
 
 def _get_event_or_404(id, queryset=None):
@@ -72,12 +116,25 @@ def _event_with_responses_queryset():
     """所有會回傳完整 ``EventDetailSerializer`` 結果的 view 共用
     (``EventDetailView`` 的 ``GET``/``PATCH``,以及三態投票寫入後的
     ``ParticipantResponseCreateView``/``ParticipantResponseDetailView``,見
-    D16)。``prefetch_related("slots", "responses__slot_availabilities")``
-    避免 ``get_responses()``/``get_slotSummary()``(D17)各自造成 N+1,抽成
-    共用函式避免多處重複一次一模一樣的 queryset 組合。
+    D16;以及 ``EventFinalizeView``/``EventCancelView``)。
+    ``prefetch_related("slots", ...)`` 避免 ``get_responses()``/
+    ``get_slotSummary()``(D17)各自造成 N+1,抽成共用函式避免多處重複一次
+    一模一樣的 queryset 組合。
+
+    ``responses`` 用 ``Prefetch`` 而不是純字串 ``"responses__slot_availabilities"``
+    ——需要把「排除已軟刪除的投票紀錄」（``add-event-lifecycle`` design.md D6）
+    做進 prefetch queryset 本身：直接在 serializer 端對 ``event.responses``
+    多加一次 ``.filter()`` 不會命中 prefetch cache（只有原封不動的 ``.all()``
+    才吃快取），會變成另開一條 N+1 query，等於白做這層防護。
     """
     return Event.objects.select_related("owner", "final_slot").prefetch_related(
-        "slots", "responses__slot_availabilities"
+        "slots",
+        Prefetch(
+            "responses",
+            queryset=ParticipantResponse.objects.filter(
+                deleted_at__isnull=True
+            ).prefetch_related("slot_availabilities"),
+        ),
     )
 
 
@@ -520,3 +577,173 @@ class CommentDetailView(APIView):
             )
 
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class EventFinalizeView(APIView):
+    """``POST /api/events/{id}/finalize`` — 已登入且為活動擁有者的主揪，將一筆
+    進行中（``active``）的活動定案（design.md D3，`add-event-lifecycle`）。
+
+    擁有者權限檢查比照 ``EventDetailView.patch()``：非擁有者 403
+    ``FORBIDDEN``，未登入 401。狀態轉換用 compare-and-swap（design.md D7）
+    ——`UPDATE ... WHERE status='active'` 才是真正保證「兩個並發定案請求只有
+    一個成功」的地方，純 `.save()` 沒有 `WHERE` 條件做不到。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂，
+    `add-event-reopen` 的 code-review 抓到）：連結失效（``link_expired``）
+    是給參與者這類公開／匿名端點用的「這個連結已經死了，別再互動」概念，
+    不該套用在主揪對自己活動的管理動作上——且 `finalize` 的唯一可執行前提
+    狀態（`active`）本來就不可能算出 `link_expired`（見
+    `lifecycle.compute_display_status` 的 `active` 分支），這裡拿掉純粹是
+    為了跟 `EventCancelView`/`EventReopenView` 三支保持一致，不是行為改變。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id):
+        # 輕量 queryset——這裡只需要 owner/status/slots.exists() 檢查，不需要
+        # 完整的 responses/slotSummary prefetch，那組留到成功後最終序列化
+        # 回應時才查一次（code-review 抓到：原本兩處都用重量 queryset，成功
+        # 路徑白白多付一次 prefetch 成本，比照 ParticipantResponseCreateView
+        # 既有的輕重分離寫法）。
+        event = _get_event_or_404(id)
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可定案")
+
+        serializer = EventFinalizeSerializer(data=request.data, context={"event": event})
+        serializer.is_valid(raise_exception=True)
+
+        claimed_at = timezone.now()
+        affected = Event.objects.filter(pk=event.id, status=Event.Status.ACTIVE).update(
+            status=Event.Status.FINALIZED,
+            final_slot_id=serializer.validated_data["finalSlotId"],
+            final_note=serializer.validated_data.get("finalNote") or None,
+            finalized_at=claimed_at,
+        )
+        if affected == 0:
+            current_status = Event.objects.values_list("status", flat=True).get(
+                pk=event.id
+            )
+            if current_status == Event.Status.CANCELLED:
+                raise ApiError(
+                    "活動已取消，無法定案", code="EVENT_ALREADY_CANCELLED", status_code=409
+                )
+            raise ApiError(
+                "活動已經定案過了", code="EVENT_ALREADY_FINALIZED", status_code=409
+            )
+
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        _schedule_notification(send_event_finalized_email, event.id, event.finalized_at)
+
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class EventCancelView(APIView):
+    """``POST /api/events/{id}/cancel`` — 已登入且為活動擁有者的主揪，取消一筆
+    進行中（``active``）或已定案（``finalized``）的活動（design.md D4，
+    `add-event-lifecycle`）。已經是 ``cancelled`` 的活動不可再次取消。
+
+    取消成功會把既有的參與者投票紀錄全數軟刪除（design.md D6）——跟狀態轉換
+    包在同一個 ``transaction.atomic()`` 裡，要嘛兩者一起成功、要嘛一起回滾。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂）——
+    這是 code-review 在審 `add-event-reopen` 時抓到的真實 bug，`cancel`
+    這支跟它同款：`cancel` 的可執行前提狀態包含 `finalized`，一筆定案超過
+    7 天（不是聚會超過 7 天，是「定案這個動作」超過 7 天）的活動
+    `displayStatus` 會被算成 `link_expired`，導致主揪永遠無法取消一筆
+    「已經定案一段時間、但聚會可能還沒發生」的活動。拿掉這層檢查後，
+    連結是否失效不再影響主揪能不能取消自己的活動。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id):
+        # 輕量 queryset，理由同 EventFinalizeView（code-review 抓到）。
+        event = _get_event_or_404(id)
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可取消活動")
+
+        claimed_at = timezone.now()
+        with transaction.atomic():
+            affected = Event.objects.filter(
+                pk=event.id, status__in=[Event.Status.ACTIVE, Event.Status.FINALIZED]
+            ).update(
+                status=Event.Status.CANCELLED,
+                cancelled_at=claimed_at,
+                # 取消一筆已定案的活動時，這三個欄位要一併清空——code-review
+                # 抓到：原本沒清，status="cancelled" 卻仍回傳舊的
+                # finalSlotId/finalNote，前端會看到自相矛盾的「已取消但也
+                # 已定案」畫面。
+                final_slot=None,
+                final_note=None,
+                finalized_at=None,
+            )
+            if affected == 0:
+                raise ApiError(
+                    "活動已經取消過了", code="EVENT_ALREADY_CANCELLED", status_code=409
+                )
+
+            ParticipantResponse.objects.filter(
+                event=event, deleted_at__isnull=True
+            ).update(deleted_at=claimed_at)
+
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        _schedule_notification(send_event_cancelled_email, event.id, event.cancelled_at)
+
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class EventReopenView(APIView):
+    """``POST /api/events/{id}/reopen`` — 已登入且為活動擁有者的主揪，將一筆
+    已定案（``finalized``）的活動重新開放為進行中（``active``）（design.md
+    D1，`add-event-reopen`）。``active``/``cancelled`` 狀態皆拒絕，統一回
+    409 ``EVENT_NOT_FINALIZED``——不像 `finalize` 需要區分兩種「不能執行」的
+    來源，這裡只有一種允許的前置狀態，拒絕原因永遠相同。
+
+    既有參與者投票紀錄完全不動——``finalize`` 不會軟刪除任何
+    ``ParticipantResponse``（只有 ``cancel`` 才會），所以這條路徑上沒有
+    資料需要復原或清理，CAS 只需要動 ``Event`` 自己的欄位。
+
+    刻意不呼叫 ``_display_status_or_410``（design.md 2026-09-24 修訂，
+    code-review 抓到的真實 bug）：`reopen` 唯一的可執行前提狀態就是
+    `finalized`，而 `finalized` 活動一旦超過 7 天就會被
+    `compute_display_status` 算成 `link_expired`——這正是 `reopen`
+    最主要、甚至可能是唯一有意義的使用情境（主揪很久以前定案了，現在想
+    重開），原本的檢查順序會讓這個功能對它自己的核心用途完全用不了，
+    每次都先被 410 擋下，永遠碰不到下面真正的 CAS 判斷。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id):
+        event = _get_event_or_404(id)
+        if request.user != event.owner:
+            raise PermissionDenied("僅活動擁有者可重新開放投票")
+
+        serializer = EventReopenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        affected = Event.objects.filter(
+            pk=event.id, status=Event.Status.FINALIZED
+        ).update(
+            status=Event.Status.ACTIVE,
+            response_deadline=serializer.validated_data["responseDeadline"],
+            final_slot=None,
+            final_note=None,
+            finalized_at=None,
+        )
+        if affected == 0:
+            raise ApiError(
+                "活動目前不是已定案狀態，無法重新開放投票",
+                code="EVENT_NOT_FINALIZED",
+                status_code=409,
+            )
+
+        event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
+        _schedule_notification(
+            send_event_reopened_email, event.id, event.response_deadline
+        )
+
+        response_serializer = EventDetailSerializer(event, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_200_OK)

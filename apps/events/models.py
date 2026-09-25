@@ -99,6 +99,11 @@ class ParticipantResponse(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # 軟刪除標記，命名比照本 app 既有的 Comment.deleted_at（同一套查詢慣例:
+    # filter(deleted_at__isnull=True)）。目前唯一觸發來源是主揪取消整場活動
+    # （EventCancelView，見 openspec/changes/add-event-lifecycle/design.md
+    # D6），不是使用者能個別操作的欄位。
+    deleted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ("event", "nickname")
