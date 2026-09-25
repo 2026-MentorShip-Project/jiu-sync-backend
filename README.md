@@ -20,6 +20,11 @@ uv run python manage.py migrate
 uv run python manage.py runserver
 ```
 
+API documentation:
+
+- Swagger UI: `http://localhost:8000/api/docs/`
+- OpenAPI schema: `http://localhost:8000/api/schema/`
+
 Celery worker（`DJANGO_SETTINGS_MODULE` 必須明確指定，無預設值）：
 
 ```bash

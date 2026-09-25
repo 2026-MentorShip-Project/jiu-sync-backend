@@ -8,6 +8,7 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 from django.db.models import Prefetch
 from django.utils import timezone
+from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -43,6 +44,7 @@ from .serializers import (
     ParticipantResponseCreateSerializer,
     ParticipantResponsePatchSerializer,
     ParticipantResponseVerifySerializer,
+    SlotAvailabilityInputSerializer,
 )
 
 # ParticipantResponseAccessToken 的效期,核發後固定 30 分鐘(design.md D2)。
@@ -56,6 +58,37 @@ PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
 _DUMMY_PHONE_HASH_FOR_TIMING = make_password("000")
 
 logger = logging.getLogger(__name__)
+
+
+_EVENT_CREATED_RESPONSE = inline_serializer(
+    "EventCreated",
+    fields={"id": serializers.CharField(), "shareUrl": serializers.URLField()},
+)
+
+# Raw schema: drf-spectacular marks every serializer field optional on PATCH, but both are required here.
+_PARTICIPANT_RESPONSE_PATCH_REQUEST = {
+    "type": "object",
+    "required": ["accessToken", "slotAvailabilities"],
+    "properties": {
+        "accessToken": {"type": "string"},
+        "slotAvailabilities": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/SlotAvailabilityInput"},
+        },
+    },
+}
+
+_PARTICIPANT_RESPONSE_VERIFIED_RESPONSE = inline_serializer(
+    "ParticipantResponseVerified",
+    fields={
+        "accessToken": serializers.CharField(),
+        "expiresAt": serializers.DateTimeField(),
+        "id": serializers.CharField(),
+        "nickname": serializers.CharField(),
+        "email": serializers.EmailField(allow_null=True),
+        "slotAvailabilities": SlotAvailabilityInputSerializer(many=True),
+    },
+)
 
 
 def _schedule_notification(task, event_id, *task_args):
@@ -153,6 +186,11 @@ class EventListView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        summary="主揪查詢自己擁有的活動清單",
+        parameters=[OpenApiParameter("owner", str, required=True, enum=["me"])],
+        responses={200: EventSummarySerializer(many=True)},
+    )
     def get(self, request):
         if request.query_params.get("owner") != "me":
             raise serializers.ValidationError(
@@ -175,6 +213,11 @@ class EventCreateView(EventListView):
     ``EventListView`` 只是為了共用同一個 URL 掛載點(見該類別 docstring)。
     """
 
+    @extend_schema(
+        summary="主揪建立活動",
+        request=EventCreateSerializer,
+        responses={201: _EVENT_CREATED_RESPONSE},
+    )
     def post(self, request):
         serializer = EventCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -216,15 +259,16 @@ class EventDetailView(APIView):
     """
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if getattr(self.request, "method", None) == "PATCH":
             return [IsAuthenticated()]
         return [AllowAny()]
 
     def get_authenticators(self):
-        if self.request.method == "PATCH":
+        if getattr(self.request, "method", None) == "PATCH":
             return [JWTAuthentication()]
         return [OptionalJWTAuthentication()]
 
+    @extend_schema(summary="查詢活動完整資料", responses={200: EventDetailSerializer})
     def get(self, request, id):
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         display_status = _display_status_or_410(event)
@@ -233,6 +277,11 @@ class EventDetailView(APIView):
         )
         return Response(serializer.data)
 
+    @extend_schema(
+        summary="主揪編輯活動基本欄位",
+        request=EventPatchSerializer,
+        responses={200: EventDetailSerializer},
+    )
     def patch(self, request, id):
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         if request.user != event.owner:
@@ -306,6 +355,11 @@ class ParticipantResponseCreateView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        summary="參與者初次投票",
+        request=ParticipantResponseCreateSerializer,
+        responses={201: EventDetailSerializer},
+    )
     def post(self, request, id):
         event = _get_event_or_404(id)
         _check_participation_preconditions(event)
@@ -351,6 +405,11 @@ class ParticipantResponseVerifyView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        summary="參與者核對身分並取得一次性存取憑證",
+        request=ParticipantResponseVerifySerializer,
+        responses={200: _PARTICIPANT_RESPONSE_VERIFIED_RESPONSE},
+    )
     def post(self, request, id):
         event = _get_event_or_404(id)
         _check_participation_preconditions(event)
@@ -420,6 +479,11 @@ class ParticipantResponseDetailView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(
+        summary="參與者憑存取憑證更新投票",
+        request={"application/json": _PARTICIPANT_RESPONSE_PATCH_REQUEST},
+        responses={200: EventDetailSerializer},
+    )
     def patch(self, request, id, responseId):
         event = _get_event_or_404(id)
 
@@ -522,6 +586,7 @@ class CommentListCreateView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 
+    @extend_schema(summary="查詢活動留言", responses={200: CommentSerializer(many=True)})
     def get(self, request, id):
         event = _get_event_or_404(id)
         _display_status_or_410(event)
@@ -532,6 +597,11 @@ class CommentListCreateView(APIView):
         serializer = CommentSerializer(comments, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        summary="新增活動留言",
+        request=CommentCreateSerializer,
+        responses={201: CommentSerializer},
+    )
     def post(self, request, id):
         event = _get_event_or_404(id)
         _display_status_or_410(event)
@@ -555,6 +625,7 @@ class CommentDetailView(APIView):
     細分原因（這是自然結果，不是刻意的側通道防禦，見 design.md D9）。
     """
 
+    @extend_schema(summary="主揪刪除留言", responses={204: None})
     def delete(self, request, id, commentId):
         event = _get_event_or_404(id)
         if request.user != event.owner:
@@ -599,6 +670,11 @@ class EventFinalizeView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        summary="主揪定案活動",
+        request=EventFinalizeSerializer,
+        responses={200: EventDetailSerializer},
+    )
     def post(self, request, id):
         # 輕量 queryset——這裡只需要 owner/status/slots.exists() 檢查，不需要
         # 完整的 responses/slotSummary prefetch，那組留到成功後最終序列化
@@ -657,6 +733,7 @@ class EventCancelView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(summary="主揪取消活動", request=None, responses={200: EventDetailSerializer})
     def post(self, request, id):
         # 輕量 queryset，理由同 EventFinalizeView（code-review 抓到）。
         event = _get_event_or_404(id)
@@ -716,6 +793,11 @@ class EventReopenView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        summary="主揪重新開放投票",
+        request=EventReopenSerializer,
+        responses={200: EventDetailSerializer},
+    )
     def post(self, request, id):
         event = _get_event_or_404(id)
         if request.user != event.owner:
