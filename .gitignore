@@ -11,6 +11,7 @@ staticfiles/
 .coverage
 .spectra/
 openspec/.vector-search.db*
+.claude/worktrees/
 
 # Terraform
 infra/terraform/.terraform/

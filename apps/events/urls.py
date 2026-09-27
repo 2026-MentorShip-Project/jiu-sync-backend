@@ -7,6 +7,7 @@ from .views import (
     EventCreateView,
     EventDetailView,
     EventFinalizeView,
+    EventPollView,
     EventReopenView,
     ParticipantResponseCreateView,
     ParticipantResponseDetailView,
@@ -76,5 +77,10 @@ urlpatterns = [
         "<shortid:id>/reopen/",
         EventReopenView.as_view(),
         name="event-reopen",
+    ),
+    path(
+        "<shortid:id>/poll/",
+        EventPollView.as_view(),
+        name="event-poll",
     ),
 ]
