@@ -3,11 +3,12 @@ import logging
 import secrets
 from datetime import timedelta
 
+import redis
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
-from django.db.models import Count, Max, Prefetch
-from django.utils import timezone
+from django.db.models import Count, Max, Prefetch, Q
+from django.utils import dateparse, timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -17,6 +18,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from apps.notifications.tasks import (
     send_event_cancelled_email,
+    send_event_created_email,
     send_event_finalized_email,
     send_event_reopened_email,
 )
@@ -47,6 +49,14 @@ from .serializers import (
 
 # ParticipantResponseAccessToken 的效期,核發後固定 30 分鐘(design.md D2)。
 PARTICIPANT_ACCESS_TOKEN_TTL = timedelta(minutes=30)
+
+# GET /api/events/{id}/comments 固定每頁筆數,不開放前端指定 limit
+# （add-comment-pagination design.md D4)。
+COMMENT_PAGE_SIZE = 10
+
+# POST /api/events/{id}/comments 留言防洗版鎖的鎖定秒數（add-comment-rate-limit
+# design.md D3）。同一來源 IP 對同一活動,鎖定期間內再次留言會被拒絕。
+COMMENT_RATE_LIMIT_TTL_SECONDS = 2
 
 # 暱稱查無資料時,仍對這個固定雜湊值跑一次 check_password,讓「暱稱不存在」與
 # 「暱稱存在但手機碼錯誤」兩種失敗耗費的時間趨於一致——design.md D3 只保證
@@ -88,6 +98,94 @@ def _schedule_notification(task, event_id, *task_args):
             )
 
     transaction.on_commit(_run)
+
+
+def _get_client_ip(request):
+    """回傳這次請求的來源 client IP(add-comment-rate-limit design.md D4)。
+
+    正式環境下每個請求都經過 nginx，``REMOTE_ADDR`` 固定是 nginx 自己的位址、
+    不是真正的使用者來源，必須讀 nginx 轉發的 ``X-Forwarded-For``（取第一個
+    逗號分隔值）才拿得到真實 client IP。本機開發環境沒有 nginx，沒有這個
+    header 時退回 ``REMOTE_ADDR``。
+
+    外部依賴（不在本 repo 範圍，見 design.md D4）：這個 helper 的前提是 nginx
+    設定檔有正確帶上 ``X-Forwarded-For``；沒有的話正式環境會一律拿到 nginx
+    自己的位址，導致所有使用者共用同一把鎖。
+    """
+    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR", "")
+
+
+_comment_rate_limit_redis_client = None
+_comment_rate_limit_redis_client_url = None
+
+
+def _get_comment_rate_limit_redis_client():
+    """回傳留言防洗版鎖專用的 Redis client，快取重用而不是每次請求都重新
+    建立（code-review 抓到：熱路徑上每個 POST 都重新
+    ``redis.Redis.from_url()`` 會重複付出建立 connection pool 的成本）。
+
+    只有 ``settings.COMMENT_RATE_LIMIT_REDIS_URL`` 改變時才重建——測試會用
+    ``override_settings`` 指向不存在的位址模擬連線失敗（D7），若整支快取死
+    在模組載入當下的第一份 client，測試改的 setting 永遠不會生效。
+    """
+    global _comment_rate_limit_redis_client, _comment_rate_limit_redis_client_url
+    url = settings.COMMENT_RATE_LIMIT_REDIS_URL
+    if (
+        _comment_rate_limit_redis_client is None
+        or _comment_rate_limit_redis_client_url != url
+    ):
+        _comment_rate_limit_redis_client = redis.Redis.from_url(
+            url, socket_connect_timeout=1, socket_timeout=1
+        )
+        _comment_rate_limit_redis_client_url = url
+    return _comment_rate_limit_redis_client
+
+
+def _try_acquire_comment_rate_limit_lock(event_id, client_ip):
+    """留言防洗版鎖(add-comment-rate-limit design.md D2/D3)。
+
+    用單一原子的 Redis ``SET key 1 NX EX 2`` 當「檢查是否鎖定中」與「上鎖」
+    合一的單一動作——回傳成功即代表這次請求搶到鎖、可以繼續寫入 DB；回傳
+    失敗(key 已存在)即代表目前在鎖定中，呼叫端應直接拒絕、不寫入。不拆成
+    「先 GET 檢查」再「另外 SET」兩步，那樣兩個近乎同時抵達的併發請求會都
+    通過檢查階段、都寫入、都上鎖，一樣是 check-then-act 的 TOCTOU 問題，達不
+    到防洗版效果(design.md D3)。
+
+    呼叫端必須在 ``serializer.is_valid()`` 成功之後、``serializer.save()`` 之
+    前呼叫這個函式(design.md D2)——驗證失敗（400）不該消耗鎖；但也不能等
+    ``save()`` 也成功了才上鎖，否則兩個近乎同時抵達、都通過驗證的請求會在鎖
+    生效前搶先都執行完 ``save()``，變成兩則都寫入成功，完全防不了連點洗版
+    （這正是這個 change 要擋下的核心情境）。
+
+    Redis 例外一律 fail-open(design.md D7)：防洗版是附加保護機制，不應該
+    因為 Redis 本身的基礎設施問題拖垮留言這個核心功能，只記一筆 warning
+    log、視同搶到鎖，讓呼叫端繼續寫入 DB。除了連線類例外
+    (``redis.exceptions.RedisError``，涵蓋 timeout／connection refused 等)
+    也一併捕捉 ``ValueError``——``redis.Redis.from_url()`` 對不合法的 URL
+    scheme（例如 ``COMMENT_RATE_LIMIT_REDIS_URL`` 設定錯誤）是拋
+    ``ValueError`` 而不是 ``RedisError``，只捕捉後者會讓設定錯誤直接讓每
+    個留言請求都 500，違反 D7 fail-open 的初衷（code-review 抓到）。
+
+    ``socket_connect_timeout``／``socket_timeout`` 給得很短——fail-open 情境下
+    仍要盡快讓請求正常往下走，不能讓一個掛掉的 Redis 拖住整個請求的回應
+    時間。
+    """
+    key = f"comment_rl:{event_id}:{client_ip}"
+    try:
+        client = _get_comment_rate_limit_redis_client()
+        acquired = client.set(key, 1, nx=True, ex=COMMENT_RATE_LIMIT_TTL_SECONDS)
+    except (redis.exceptions.RedisError, ValueError):
+        logger.warning(
+            "Comment rate limit Redis unavailable (event=%s, ip=%s), failing open",
+            event_id,
+            client_ip,
+            exc_info=True,
+        )
+        return True
+    return bool(acquired)
 
 
 def _get_event_or_404(id, queryset=None):
@@ -173,6 +271,14 @@ class EventCreateView(EventListView):
     回應只含 ``{id, shareUrl}``,不回傳活動完整內容。``owner`` 一律取自
     ``request.user``,不採信請求內容中任何宣稱擁有者身分的欄位。繼承
     ``EventListView`` 只是為了共用同一個 URL 掛載點(見該類別 docstring)。
+
+    建立成功後比照 ``EventFinalizeView``/``EventCancelView``/``EventReopenView``
+    既有的機制,透過 ``_schedule_notification`` 非同步寄一封含分享連結的通知
+    信到主揪本人的 Google 帳號信箱（``event.host_email``,design.md D1，
+    `add-event-created-email`）。不像另外三支需要傳入 transition 當下的時間
+    戳做「過期 task」判斷（design.md D10）——建立活動對同一個 ``event.id``
+    只會發生一次,不存在被後續動作蓋過的疑慮（design.md D2）,所以只傳
+    ``event.id``。
     """
 
     def post(self, request):
@@ -181,6 +287,7 @@ class EventCreateView(EventListView):
         # host_email 一律取自 request.user.email,不採信請求 body 中任何
         # hostEmail 欄位——EventCreateSerializer 根本不宣告該欄位。
         event = serializer.save(owner=request.user, host_email=request.user.email)
+        _schedule_notification(send_event_created_email, event.id)
 
         # rstrip 避免 FRONTEND_BASE_URL 若帶結尾斜線組出雙斜線的 shareUrl。
         frontend_base_url = settings.FRONTEND_BASE_URL.rstrip("/")
@@ -515,6 +622,33 @@ class ParticipantResponseDetailView(APIView):
         return Response(response_serializer.data, status=status.HTTP_200_OK)
 
 
+def _encode_comment_cursor(comment):
+    """組出 keyset pagination 的 cursor(add-comment-pagination design.md D2)。
+    格式 ``{created_at.isoformat()}_{id}``,不做 base64 包裝——cursor 不是
+    敏感資訊,純粹是查詢起點,base64 只會增加除錯難度。用底線分隔是因為
+    ``created_at.isoformat()`` 本身不含底線字元,可以安全用
+    ``rsplit("_", 1)`` 還原成兩段。"""
+    return f"{comment.created_at.isoformat()}_{comment.id}"
+
+
+def _decode_comment_cursor(cursor):
+    """解析 ``_encode_comment_cursor`` 產生的 cursor,回傳
+    ``(created_at, id)`` tuple；格式不合法(缺底線、``created_at`` 不是合法
+    ISO 字串、id 段落為空)一律回傳 ``None``,不拋例外——呼叫端把 ``None``
+    視同沒有帶 cursor(design.md「風險」段落:cursor 被竄改成不存在或格式
+    不合法的值,查詢應該優雅退化,不能 500)。"""
+    if not cursor:
+        return None
+    try:
+        created_at_part, comment_id = cursor.rsplit("_", 1)
+    except ValueError:
+        return None
+    created_at = dateparse.parse_datetime(created_at_part)
+    if created_at is None or not comment_id:
+        return None
+    return created_at, comment_id
+
+
 class CommentListCreateView(APIView):
     """``GET``/``POST /api/events/{id}/comments`` — 活動留言板，任何人（含未
     登入）皆可查詢、留言。完全公開，不需要登入，不採用任何身分驗證，同三支
@@ -525,6 +659,10 @@ class CommentListCreateView(APIView):
     ``_check_participation_preconditions``——活動狀態（進行中／已定案／已
     取消）與投票截止時間皆不影響能否留言，這點跟參與者投票三支端點明確不同
     （design.md D5）。
+
+    ``POST`` 額外套用留言防洗版鎖（add-comment-rate-limit design.md D1/D2/D3）
+    ：以「來源 IP + 活動 id」為 key，驗證通過後、寫入 DB 前嘗試搶
+    2 秒的 Redis 鎖，搶不到回 429 ``COMMENT_RATE_LIMITED``、不寫入。
     """
 
     permission_classes = [AllowAny]
@@ -533,12 +671,37 @@ class CommentListCreateView(APIView):
     def get(self, request, id):
         event = _get_event_or_404(id)
         _display_status_or_410(event)
-        # Comment.Meta.ordering 已定義 created_at 遞增,.all() 就是這個順序,
-        # 不需要重複 order_by(code-review 抓到)。已軟刪除的留言(design.md
-        # D9)排除在外——對查詢者而言就是不存在。
+        # 已軟刪除的留言(design.md D9)排除在外——對查詢者而言就是不存在,
+        # 也不計入分頁筆數(add-comment-pagination design.md tasks 2.1 ⑥)。
         comments = event.comments.filter(deleted_at__isnull=True)
-        serializer = CommentSerializer(comments, many=True)
-        return Response(serializer.data)
+
+        # Cursor 分頁(keyset pagination,不是 offset——add-comment-pagination
+        # design.md D3):cursor 解析失敗一律視同沒有帶 cursor,優雅退化回傳
+        # 最新一頁,不 500。用複合條件(created_at 為主、id 為次要排序鍵)是
+        # 為了處理兩則留言 created_at 完全相同的邊界情況。
+        cursor = _decode_comment_cursor(request.query_params.get("cursor"))
+        if cursor is not None:
+            cursor_created_at, cursor_id = cursor
+            comments = comments.filter(
+                Q(created_at__lt=cursor_created_at)
+                | Q(created_at=cursor_created_at, id__lt=cursor_id)
+            )
+
+        # 固定每頁 10 則,不開放前端指定 limit(design.md D4)。由新到舊排序
+        # ——跟 Comment.Meta.ordering(遞增,由舊到新)方向相反,這支端點的
+        # 回應順序刻意反過來(design.md Context)。
+        page = list(comments.order_by("-created_at", "-id")[:COMMENT_PAGE_SIZE])
+
+        # 取滿一頁才代表可能還有更舊的資料;不滿一頁代表已經是最後一批,
+        # nextCursor 為 None（design.md D1，不額外加 hasMore）。
+        next_cursor = (
+            _encode_comment_cursor(page[-1])
+            if len(page) == COMMENT_PAGE_SIZE
+            else None
+        )
+
+        serializer = CommentSerializer(page, many=True)
+        return Response({"comments": serializer.data, "nextCursor": next_cursor})
 
     def post(self, request, id):
         event = _get_event_or_404(id)
@@ -546,6 +709,20 @@ class CommentListCreateView(APIView):
 
         serializer = CommentCreateSerializer(data=request.data, context={"event": event})
         serializer.is_valid(raise_exception=True)
+
+        # 上鎖時機:驗證通過之後、寫入 DB 之前（design.md D2）——驗證失敗
+        # （400）不會走到這裡，不消耗鎖；但也不能等 serializer.save() 也成功
+        # 了才上鎖，否則兩個近乎同時抵達、都通過驗證的請求會在鎖生效前搶先
+        # 都寫入成功，完全防不了連點洗版。搶不到鎖直接 429，不呼叫
+        # serializer.save()。
+        client_ip = _get_client_ip(request)
+        if not _try_acquire_comment_rate_limit_lock(event.id, client_ip):
+            raise ApiError(
+                "留言太頻繁，請稍後再試",
+                code="COMMENT_RATE_LIMITED",
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         comment = serializer.save()
 
         response_serializer = CommentSerializer(comment)

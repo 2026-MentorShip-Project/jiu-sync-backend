@@ -4,9 +4,19 @@
 見 openspec/changes/api-error-format/design.md。
 """
 
+import logging
+
 from django.http import JsonResponse
 from rest_framework.exceptions import APIException
 from rest_framework.views import exception_handler as drf_exception_handler
+
+logger = logging.getLogger(__name__)
+
+# 這裡記的是後端自己查驗用的 log,不是回給前端的 {message, code}——故意只記
+# 401/403(可能是憑證被冒用/竄改,值得留意)跟 5xx(伺服器真的出包)。
+# 400/404/409/410 這類使用者打錯、資料本來就找不到的正常業務流程量大且多半沒
+# 意義,記了只是雜訊。
+_LOGGED_STATUS_CODES = {401, 403}
 
 
 class ApiError(APIException):
@@ -145,27 +155,51 @@ def _resolve_field_code(field, raw_code):
     return FIELD_CODE_OVERRIDES.get((field, raw_code), raw_code)
 
 
+def _nested_indexed_items(value):
+    """偵測 DRF 對 `many=True` 巢狀 serializer 產生的錯誤形狀，回傳
+    `[(index, item_dict), ...]`；不是這個形狀就回傳 `None`。
+
+    實測確認（DRF 3.18，透過真的 HTTP POST 打 `EventCreateSerializer`，不是手動
+    構造 `ValidationError`）：`ListSerializer` 驗證失敗時回傳的是**只包含失敗
+    索引**的 dict（例如兩筆 slots、只有索引 1 錯 → `{1: {"date": [...]}}`），
+    不是補滿通過索引、長度對齊原始輸入的完整 list（`[{}, {"date": [...]}]`）。
+    後者是這次改動之前這個函式唯一處理、也唯一被測試過的形狀，但那份測試是
+    手動構造假資料，從來沒有透過真正的 API 請求驗證過，這個落差直到補上端對端
+    測試才被抓到——`slots[0].date` 這種路徑命名先前對真實請求其實從未生效過
+    （會落到下面的一般欄位分支，`field` 停在 `"slots"`、code 也拿不到
+    `NESTED_SUBFIELD_CODE_OVERRIDES` 的對照）。
+
+    這裡兩種形狀都認得:dict 形式（真實 DRF 3.18 的行為）優先；list 形式維持
+    當防禦性 fallback（不確定未來 DRF 版本會不會換回這個形狀，或有沒有別的
+    呼叫端手動構造這種輸入，兩種都認得比只認一種安全，成本很低）。
+    """
+    if isinstance(value, dict) and value and all(isinstance(k, int) for k in value):
+        return sorted(value.items())
+    if isinstance(value, list) and any(isinstance(item, dict) and item for item in value):
+        return list(enumerate(value))
+    return None
+
+
 def _build_errors(data):
     """把 ValidationError 的 dict 形狀 `response.data`（沒有 "detail" 鍵）展開成
     `errors` 陣列：`[{"field": ..., "code": ..., "message": ...}, ...]`，涵蓋
     全部欄位，不只第一個。
 
     見 design.md D1/D2/D7。逐一走訪 `data` 的全部 key：
-    - 若該值是 dict、且 key 全部是 int（DRF 對 `ChildSerializer(many=True)` 巢狀
-      serializer 產生的錯誤形狀，例如 `slots`/`slotAvailabilities`——實測確認
-      是「以索引為 key 的 dict」，不是原本以為的 list，add-participant-responses
-      的 code-review 紀錄有修正說明）→ 依索引展開，每個子欄位各自組成一筆
+    - 若該值符合 `_nested_indexed_items` 認得的巢狀陣列欄位形狀（例如
+      `slots`）→ 依索引展開，非空 dict 元素裡的每個子欄位各自組成一筆
       `"<key>[<index>].<子欄位>"`（只處理一層巢狀，見 design.md D2），code 用
       `NESTED_SUBFIELD_CODE_OVERRIDES` 依子欄位名查（不分 DRF 原始 code 是
       required 還是 invalid，這個巢狀層級前端只要求一個 code）
-    - 否則（一般欄位、或巢狀但非索引 dict，例如 `{"parent": {"child": [...]}}`）
+    - 否則（一般欄位、或非陣列的巢狀 dict，例如 `{"parent": {"child": [...]}}`）
       → 沿用既有的遞迴找 leaf 邏輯，取第一則訊息，code 透過 `_resolve_field_code`
       查 `FIELD_CODE_OVERRIDES`
     """
     errors = []
     for field, value in data.items():
-        if isinstance(value, dict) and value and all(isinstance(k, int) for k in value):
-            for index, item in value.items():
+        nested_items = _nested_indexed_items(value)
+        if nested_items is not None:
+            for index, item in nested_items:
                 if isinstance(item, dict) and item:
                     for subfield, sub_value in item.items():
                         detail = _find_leaf_detail(sub_value)
@@ -208,6 +242,38 @@ def _flatten_message(data):
     return str(data)
 
 
+def _log_error_response(exc, context, status_code, code, message):
+    """把 401/403/5xx 記到後端自己的 log,補足回給前端的 {message, code} 沒帶的
+    脈絡(使用者是誰、打哪支 API)——方便事後查驗,不是給前端看的內容。
+
+    `context` 可能沒有 "request"(既有測試/未來呼叫端可能直接傳 {}),或
+    `request.user` 未設(認證失敗，走不到 DRF 幫忙塞 user 那一步)，兩者皆用
+    `getattr(..., None)` 保護，記 log 這件事本身不該有任何機會讓請求跟著炸掉。
+    """
+    if status_code not in _LOGGED_STATUS_CODES and status_code < 500:
+        return
+
+    request = context.get("request")
+    method = getattr(request, "method", None)
+    path = getattr(request, "path", None)
+    user = getattr(request, "user", None)
+    user_id = (
+        str(user.id) if user is not None and getattr(user, "is_authenticated", False) else None
+    )
+
+    log_fn = logger.error if status_code >= 500 else logger.warning
+    log_fn(
+        "API error response: %s %s status=%s code=%s user=%s message=%s",
+        method,
+        path,
+        status_code,
+        code,
+        user_id,
+        message,
+        exc_info=(type(exc), exc, exc.__traceback__) if status_code >= 500 else None,
+    )
+
+
 def custom_exception_handler(exc, context):
     """全站共用 EXCEPTION_HANDLER：把任何例外轉成 {"message": ..., "code": ...} 形狀。
 
@@ -215,7 +281,8 @@ def custom_exception_handler(exc, context):
     見 design.md「Decisions」D1/D2。401/403/404/500 在沒有既有業務 `ApiError` code
     時，依狀態碼補上固定預設值，見 D3。同一批「detail」形狀的例外（DRF/simplejwt
     內建、預設訊息是英文的）也一併換成固定中文 message，前端可以直接顯示，不會
-    混到框架自帶的英文字串。
+    混到框架自帶的英文字串。401/403/5xx 額外記一筆後端可查驗的 log(見
+    `_log_error_response`),400/404/409/410 這類正常業務流程不記。
     """
     response = drf_exception_handler(exc, context)
     if response is None:
@@ -258,6 +325,7 @@ def custom_exception_handler(exc, context):
     if errors is not None:
         body["errors"] = errors
     response.data = body
+    _log_error_response(exc, context, response.status_code, code, message)
     return response
 
 
@@ -275,11 +343,16 @@ def handler404(request, exception):
 def handler500(request):
     """Django 層級的 500（連 DRF 例外處理都攔不到）——見 design.md Post-review 補充決策。
 
-    `message` 是寫死的固定字串，不能包含 `exception` 細節，避免洩漏內部資訊。
-    Django 自己的錯誤紀錄機制（`django.request` logger、錯誤通知）完全不受影響，
-    這裡只改變回給使用者的 body 形狀。簽名是 Django 規定的 `(request)`，沒有
-    `exception` 參數。
+    `message` 是寫死的固定字串，不能包含 `exception` 細節，避免洩漏內部資訊，
+    但後端自己要查驗，所以額外記一筆 ERROR log(含 exc_info,才有 traceback)——
+    這支處理的是真正未預期的例外(程式本身的 bug),是最需要留存記錄的一種，跟
+    Django 自己的 `django.request` logger／錯誤通知機制彼此獨立、互不影響。
+    簽名是 Django 規定的 `(request)`，沒有 `exception` 參數，改用
+    `logger.error(..., exc_info=True)` 在仍處於例外處理當下時抓 `sys.exc_info()`。
     """
+    logger.error(
+        "Unhandled exception: %s %s", request.method, request.path, exc_info=True
+    )
     return JsonResponse(
         {"message": "伺服器發生未預期的錯誤", "code": STATUS_CODE_DEFAULT_CODES[500]}, status=500
     )

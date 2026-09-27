@@ -53,8 +53,20 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # 留言防洗版測試(test_comment_rate_limit_*)需要真的 Redis 連線,
+      # 對應 docker-compose.yml 的 redis:7 與預設 CELERY_BROKER_URL(localhost:6381)
+      redis:
+        image: redis:7
+        ports:
+          - 6381:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:5432/jiu_sync
+      CELERY_BROKER_URL: redis://localhost:6381/0
     steps:
       - name: Checkout
         uses: actions/checkout@v4

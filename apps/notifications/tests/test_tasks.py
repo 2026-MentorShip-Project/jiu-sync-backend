@@ -2,11 +2,14 @@ import pytest
 from django.utils import timezone
 
 from apps.accounts.models import User
+from apps.events.ids import generate_short_id
 from apps.events.models import Event, Slot
 
-from .tasks import (
+from ..tasks import (
+    _event_share_url,
     _healthcheck_send_test_email,
     send_event_cancelled_email,
+    send_event_created_email,
     send_event_finalized_email,
     send_event_reopened_email,
 )
@@ -138,3 +141,46 @@ def test_send_event_reopened_email_sends_when_response_deadline_matches_current(
     send_event_reopened_email(event.id, event.response_deadline)
 
     assert len(mailoutbox) == 1
+
+
+@pytest.mark.django_db
+def test_send_event_created_email_sends_to_host_with_share_url(mailoutbox):
+    """① event.host_email 存在時,task 執行後 outbox 收到一封信,收件人為
+    host_email,內容含 _event_share_url(event)（design.md，
+    `add-event-created-email`）。"""
+    event = _create_event(host_email="host@example.com")
+
+    send_event_created_email(event.id)
+
+    assert len(mailoutbox) == 1
+    assert mailoutbox[0].to == ["host@example.com"]
+    assert _event_share_url(event) in mailoutbox[0].body
+
+
+@pytest.mark.django_db
+def test_send_event_created_email_skips_when_host_email_is_none(mailoutbox):
+    """② event.host_email 為 None 時不寄信（D1:建立活動當下沒有任何參與者,
+    只需要核對主揪本人的收件地址是否存在）。"""
+    event = _create_event(host_email=None)
+
+    send_event_created_email(event.id)
+
+    assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_created_email_skips_when_host_email_is_blank(mailoutbox):
+    """② event.host_email 為空字串時不寄信,同上。"""
+    event = _create_event(host_email="")
+
+    send_event_created_email(event.id)
+
+    assert len(mailoutbox) == 0
+
+
+@pytest.mark.django_db
+def test_send_event_created_email_skips_when_event_not_found(mailoutbox):
+    """③ event_id 對應不到任何 Event 時(防禦性,D2)不拋例外、不寄信。"""
+    send_event_created_email(generate_short_id())
+
+    assert len(mailoutbox) == 0

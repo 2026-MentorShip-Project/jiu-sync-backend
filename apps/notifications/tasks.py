@@ -50,6 +50,39 @@ def _send_to_each_recipient(subject, body, recipients):
 
 
 @shared_task
+def send_event_created_email(event_id):
+    """主揪建立活動成功後，把分享連結寄到主揪本人的 Google 帳號信箱
+    （design.md D1，`add-event-created-email`）。
+
+    只核對 ``event.host_email`` 是否存在，不重用 ``_notification_recipients()``
+    ——那支函式回傳「留過 Email 的參與者 + 主揪本人」，但活動剛建立時還沒有
+    任何 ``ParticipantResponse``，語意上這裡只需要主揪本人（design.md D1）。
+    ``host_email`` 來自 ``EventCreateView.post()`` 寫入當下的
+    ``request.user.email``（Google 帳號 email，恆存在），這裡的存在性檢查是
+    防禦性的，跟其他三支通知信的寫法一致。
+
+    不做「過期 task」判斷（design.md D2）：建立活動這個動作對同一個
+    ``event.id`` 只會發生一次，不存在被後續 transition 蓋過的疑慮，只需要
+    核對 ``event`` 是否存在（純防禦性，理論上不會發生，系統沒有刪除活動的
+    功能）。
+    """
+    event = Event.objects.filter(pk=event_id).first()
+    if event is None or not event.host_email:
+        return
+
+    body = (
+        f"你已經成功建立活動「{event.title}」。\n"
+        f"分享連結：{_event_share_url(event)}"
+    )
+    send_mail(
+        f"「{event.title}」已建立",
+        body,
+        settings.DEFAULT_FROM_EMAIL,
+        [event.host_email],
+    )
+
+
+@shared_task
 def send_event_finalized_email(event_id, finalized_at):
     """主揪定案活動後通知留過 Email 的參與者與主揪本人（design.md D1，
     `add-event-lifecycle`）。傳 ``event_id``（純值）不傳 model instance——

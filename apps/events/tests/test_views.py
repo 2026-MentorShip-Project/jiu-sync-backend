@@ -11,7 +11,7 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import IntegrityError, connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
-from django.utils import dateparse, timezone
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -101,6 +101,47 @@ def test_unauthenticated_user_cannot_create_event():
 
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
     assert Event.objects.count() == 0
+
+
+def test_create_event_sends_share_url_email_to_host(
+    django_capture_on_commit_callbacks, mailoutbox
+):
+    """建立成功後,非同步寄一封含分享連結的通知信到主揪的 Google 帳號信箱
+    （`event.host_email`,即登入使用者的 email）,比照 finalize/cancel/reopen
+    既有的通知信機制（design.md,`add-event-created-email`）。"""
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload()
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert len(mailoutbox) == 1
+    assert mailoutbox[0].to == [user.email]
+    assert payload["title"] in mailoutbox[0].subject
+    assert body["shareUrl"] in mailoutbox[0].body
+
+
+def test_create_event_succeeds_even_if_notification_dispatch_raises(
+    django_capture_on_commit_callbacks, monkeypatch
+):
+    """通知信排程失敗不該讓已經成功的建立活動動作變成 500,沿用
+    `_schedule_notification` 既有保護機制（design.md D3）。"""
+    user = _create_user()
+    client = _auth_client(user)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("email backend misconfigured")
+
+    monkeypatch.setattr("apps.events.views.send_event_created_email.delay", _raise)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = client.post(EVENTS_URL, _valid_payload(), format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Event.objects.count() == 1
 
 
 def test_response_deadline_equal_to_or_earlier_than_now_returns_400():
@@ -288,24 +329,59 @@ def test_slot_label_over_100_chars_returns_400():
     assert Event.objects.count() == 0
 
 
-def test_slot_label_over_100_chars_error_has_nested_semantic_code():
-    """code-review 補充:確認上一則測試的 400 回應,`errors[]` 裡巢狀欄位
-    `slots[0].label` 的 code 真的是語意化的 SLOT_LABEL_TOO_LONG,不是未對照的
-    DRF 原始碼——`config/exceptions.py::_build_errors` 原本誤判
-    `ChildSerializer(many=True)` 的巢狀驗證錯誤形狀是 list,實際是以索引為
-    key 的 dict,這條巢狀 code 對照從未真的生效過(add-participant-responses
-    的 code-review 修正)。"""
+def test_slot_date_wrong_format_returns_chinese_message_not_english():
+    """新增:slots[].date 格式錯誤 → code 為 "SLOT_DATE_INVALID",message 是中文,
+    不是 DRF DateField 內建的英文原文("Date has wrong format...")。
+
+    DRF 對 DateField 格式錯誤的內建翻譯剛好沒收錄 zh-hant(同欄位的 TimeField
+    卻有中文翻譯),屬於第三方翻譯檔覆蓋不全,不是我們自己程式碼的問題。這裡
+    直接在欄位宣告用 error_messages 覆寫,不影響 code(仍走
+    NESTED_SUBFIELD_CODE_OVERRIDES 對照表)。
+    """
     user = _create_user()
     client = _auth_client(user)
-    payload = _valid_payload(slots=[{"date": "2026-10-01", "label": "a" * 101}])
+    payload = _valid_payload(slots=[{"date": "not-a-date"}])
 
     response = client.post(EVENTS_URL, payload, format="json")
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     body = response.json()
-    matching = [e for e in body["errors"] if e["field"] == "slots[0].label"]
-    assert len(matching) == 1
-    assert matching[0]["code"] == "SLOT_LABEL_TOO_LONG"
+    assert body["code"] == "SLOT_DATE_INVALID"
+    assert body["errors"] == [
+        {
+            "field": "slots[0].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
+    assert "Date has wrong format" not in body["message"]
+    assert Event.objects.count() == 0
+
+
+def test_slot_date_wrong_format_uses_correct_index_when_multiple_slots():
+    """新增:多筆 slots 裡只有其中一筆(索引 1)日期格式錯誤 → errors 陣列的
+    field 正確標出 "slots[1].date"(不是 "slots[0].date"),證明巢狀索引路徑
+    對「只有部分索引失敗」的真實情境也正確——這正是先前落差沒被抓到的情境
+    (DRF 對這種情況回傳的是只含失敗索引的 dict,不是補滿通過索引的完整 list)。
+    """
+    user = _create_user()
+    client = _auth_client(user)
+    payload = _valid_payload(
+        slots=[{"date": "2026-10-01"}, {"date": "not-a-date"}, {"date": "2026-10-03"}]
+    )
+
+    response = client.post(EVENTS_URL, payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    assert body["errors"] == [
+        {
+            "field": "slots[1].date",
+            "code": "SLOT_DATE_INVALID",
+            "message": "日期格式錯誤，請用 YYYY-MM-DD 格式",
+        }
+    ]
+    assert Event.objects.count() == 0
 
 
 @override_settings(FRONTEND_BASE_URL="https://example.com/")
@@ -2654,15 +2730,19 @@ def test_comment_post_nonexistent_event_returns_404():
 
 def test_comment_same_nickname_can_post_multiple_times():
     """⑨ 同一暱稱可連續留言兩次,皆成功——留言不要求活動內暱稱唯一
-    (design.md D6,跟 ParticipantResponse.nickname 的唯一限制不同)。"""
+    (design.md D6,跟 ParticipantResponse.nickname 的唯一限制不同)。
+
+    兩次請求刻意帶不同來源 IP(``REMOTE_ADDR``)——add-comment-rate-limit
+    上線後,同一 IP 對同一活動連續留言會被防洗版鎖擋下(見同檔案「留言防洗版
+    鎖」測試區塊),這裡要驗證的是暱稱本身不限制唯一,用不同 IP 排除防洗版鎖
+    的干擾,維持這則測試原本的驗證目的不變。"""
     owner = _create_user()
     event = _create_event(owner)
-    client = APIClient()
 
-    first = client.post(
+    first = APIClient(REMOTE_ADDR="10.0.0.1").post(
         _comments_url(event.id), _comment_payload(message="第一則"), format="json"
     )
-    second = client.post(
+    second = APIClient(REMOTE_ADDR="10.0.0.2").post(
         _comments_url(event.id), _comment_payload(message="第二則"), format="json"
     )
 
@@ -2702,37 +2782,94 @@ def test_comment_id_collision_retries_and_still_succeeds(monkeypatch):
     assert Comment.objects.count() == 2
 
 
-def test_comment_list_returns_all_sorted_by_created_at_ascending():
-    """⑪ 活動有 3 則留言(刻意用不同的建立順序/created_at)→ 200,回應陣列依
-    created_at 由舊到新排序。``created_at`` 是 ``auto_now_add``,``.create()``
-    時傳入的值會被忽略、強制寫成當下時間——建立後改用 ``.update()``(繞過
-    ``auto_now_add`` 的 ``pre_save``,只有 ``.save()``/``.create()`` 才會觸發)
-    才能真正控制每筆的時間,驗證排序不是碰巧跟建立順序一致。"""
+# ---------------------------------------------------------------------------
+# GET /api/events/{id}/comments — cursor 分頁 (add-comment-pagination)
+#
+# 回應格式改為 {"comments": [...], "nextCursor": string|null}(breaking
+# change,design.md D5,不做新舊格式相容層)；預設由新到舊排序、固定每頁 10
+# 則(design.md D4)；cursor 為 keyset pagination(design.md D3),不是
+# offset——這是這個 change 存在的核心理由:並發新增留言不會讓翻頁時漏掉或
+# 重複看到既有留言。
+# ---------------------------------------------------------------------------
+
+
+def _create_comment_at(event, nickname, message, created_at):
+    """建立一則留言並把 ``created_at`` 覆寫成指定時間。``created_at`` 是
+    ``auto_now_add``,``.create()`` 時傳入的值會被忽略、強制寫成當下時
+    間——建立後改用 ``.update()``(繞過 ``auto_now_add`` 的 ``pre_save``,只
+    有 ``.save()``/``.create()`` 才會觸發)才能真正控制每筆的時間。"""
+    comment = Comment.objects.create(event=event, nickname=nickname, message=message)
+    Comment.objects.filter(pk=comment.pk).update(created_at=created_at)
+    comment.refresh_from_db()
+    return comment
+
+
+def test_comment_list_first_page_returns_latest_10_desc_with_next_cursor():
+    """① 活動有 15 則留言、不帶 cursor 查詢 → 回傳最新 10 則(依 created_at
+    由新到舊),nextCursor 非 null。"""
     owner = _create_user()
     event = _create_event(owner)
-    now = timezone.now()
-    third = Comment.objects.create(event=event, nickname="小美", message="第三則")
-    first = Comment.objects.create(event=event, nickname="小華", message="第一則")
-    second = Comment.objects.create(event=event, nickname="小明", message="第二則")
-    Comment.objects.filter(pk=third.pk).update(created_at=now)
-    Comment.objects.filter(pk=first.pk).update(created_at=now - timedelta(minutes=10))
-    Comment.objects.filter(pk=second.pk).update(created_at=now - timedelta(minutes=5))
-    first.refresh_from_db()
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]  # comments[0] 最舊、comments[14] 最新
     client = APIClient()
 
     response = client.get(_comments_url(event.id))
 
     assert response.status_code == status.HTTP_200_OK
     body = response.json()
-    assert [item["id"] for item in body] == [first.id, second.id, third.id]
-    assert body[0]["id"] == first.id
-    assert body[0]["nickname"] == "小華"
-    assert body[0]["message"] == "第一則"
-    assert dateparse.parse_datetime(body[0]["createdAt"]) == first.created_at
+    expected_ids = [c.id for c in reversed(comments[5:15])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert set(body.keys()) == {"comments", "nextCursor"}
+    assert body["nextCursor"] is not None
 
 
-def test_comment_list_returns_empty_array_when_no_comments():
-    """⑫ 活動無留言 → 200,空陣列。"""
+def test_comment_list_second_page_returns_remaining_with_null_next_cursor():
+    """② 帶上一頁回傳的 nextCursor 再查一次 → 回傳剩下 5 則(更舊的那批),
+    nextCursor 為 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]
+    client = APIClient()
+    first_page = client.get(_comments_url(event.id)).json()
+
+    response = client.get(_comments_url(event.id), {"cursor": first_page["nextCursor"]})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments[0:5])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_returns_all_when_10_or_fewer_with_null_next_cursor():
+    """③ 活動留言數 ≤10、不帶 cursor → 回傳全部,nextCursor 為 null。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(7)
+    ]
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments)]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_returns_empty_when_no_comments():
+    """④ 活動完全沒有留言 → 回傳空陣列,nextCursor 為 null。"""
     owner = _create_user()
     event = _create_event(owner)
     client = APIClient()
@@ -2740,11 +2877,103 @@ def test_comment_list_returns_empty_array_when_no_comments():
     response = client.get(_comments_url(event.id))
 
     assert response.status_code == status.HTTP_200_OK
-    assert response.json() == []
+    assert response.json() == {"comments": [], "nextCursor": None}
+
+
+def test_comment_list_invalid_cursor_falls_back_to_first_page():
+    """⑤ 帶一個格式不合法的 cursor(例如亂數字串)→ 視同沒帶 cursor,回傳
+    最新一頁,不 500。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(3)
+    ]
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id), {"cursor": "not-a-valid-cursor"})
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    expected_ids = [c.id for c in reversed(comments)]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    assert body["nextCursor"] is None
+
+
+def test_comment_list_deleted_comments_do_not_count_toward_page_size():
+    """⑥ 已軟刪除的留言不計入任何一頁、不影響分頁筆數:12 則留言其中最新的
+    2 則已被軟刪除 → 第一頁仍回傳 10 則未刪除留言(不是只回傳 8 則)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(12)
+    ]
+    Comment.objects.filter(pk__in=[comments[10].pk, comments[11].pk]).update(
+        deleted_at=timezone.now()
+    )
+    client = APIClient()
+
+    response = client.get(_comments_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert len(body["comments"]) == 10
+    expected_ids = [c.id for c in reversed(comments[0:10])]
+    assert [item["id"] for item in body["comments"]] == expected_ids
+    # 剛好取滿 10 筆(design.md tasks 2.2:「取到滿 10 筆時,用第 10 筆算
+    # cursor」),即使背後其實已經沒有更舊的資料,nextCursor 仍非 null——下一
+    # 頁查詢會優雅退化成空陣列(design.md Risks 段落),不是這裡就先判斷
+    # 「是否真的還有更多」。
+    assert body["nextCursor"] is not None
+
+    next_page = client.get(
+        _comments_url(event.id), {"cursor": body["nextCursor"]}
+    ).json()
+    assert next_page == {"comments": [], "nextCursor": None}
+
+
+def test_comment_list_second_page_unaffected_by_concurrent_insert():
+    """⑦ 併發情境:模擬「查第一頁之後、翻第二頁之前,資料庫插入一則新留
+    言」→ 第二頁結果不受這則新插入留言影響(不重複也不跳過既有留言)。這是
+    cursor(keyset)分頁 vs offset 分頁的關鍵差異(design.md D3)——offset
+    分頁在這個情境下,原本該在第二頁的留言會被新插入的留言往後推一位,造成
+    重複或跳過;cursor 分頁固定接續在「已看過的最後一則」之後查詢,不受影
+    響。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    base = timezone.now() - timedelta(hours=1)
+    comments = [
+        _create_comment_at(event, "小華", f"第{i}則", base + timedelta(minutes=i))
+        for i in range(15)
+    ]  # comments[14] 最新
+    client = APIClient()
+
+    first_page = client.get(_comments_url(event.id)).json()
+    expected_first_page_ids = [c.id for c in reversed(comments[5:15])]
+    assert [item["id"] for item in first_page["comments"]] == expected_first_page_ids
+
+    # 並發:在翻第二頁之前,有一則新留言插入,created_at 比目前所有留言都新
+    new_comment = _create_comment_at(
+        event, "小美", "插隊留言", base + timedelta(minutes=100)
+    )
+
+    second_page = client.get(
+        _comments_url(event.id), {"cursor": first_page["nextCursor"]}
+    ).json()
+
+    expected_second_page_ids = [c.id for c in reversed(comments[0:5])]
+    second_page_ids = [item["id"] for item in second_page["comments"]]
+    assert second_page_ids == expected_second_page_ids
+    assert new_comment.id not in second_page_ids
+    assert second_page["nextCursor"] is None
 
 
 def test_comment_list_nonexistent_event_returns_404():
-    """⑬ 活動不存在 → 404 EVENT_NOT_FOUND。"""
+    """⑧ 活動不存在 → 404 EVENT_NOT_FOUND(既有行為,確認分頁改動沒有連帶
+    破壞)。"""
     client = APIClient()
 
     response = client.get(_comments_url(generate_short_id()))
@@ -2778,7 +3007,7 @@ def test_comment_owner_can_delete_own_event_comment():
     assert comment.deleted_at is not None
 
     list_response = APIClient().get(_comments_url(event.id))
-    assert list_response.json() == []
+    assert list_response.json()["comments"] == []
 
 
 def test_comment_delete_by_non_owner_returns_403():
@@ -2870,7 +3099,7 @@ def test_comment_list_excludes_deleted_comments():
 
     assert response.status_code == status.HTTP_200_OK
     body = response.json()
-    assert [item["id"] for item in body] == [visible.id]
+    assert [item["id"] for item in body["comments"]] == [visible.id]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -2911,6 +3140,205 @@ def test_comment_delete_concurrent_requests_only_one_succeeds():
     ]
     comment.refresh_from_db()
     assert comment.deleted_at is not None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{id}/comments — 留言防洗版鎖 (add-comment-rate-limit)
+#
+# 上鎖時機是「驗證通過之後、寫入 DB 之前」，用單一原子的 Redis
+# `SET key 1 NX EX 2` 搶鎖（design.md D2/D3）——這是這個 change 存在的核心理
+# 由：兩個內容皆合法、近乎同時送達的請求，只能有一則真的寫入成功。
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_redis_client():
+    """連到跟 view 相同的留言防洗版 Redis（``settings.COMMENT_RATE_LIMIT_REDIS_URL``）
+    ,測試需要直接操控 key／TTL 時使用（見 ④）。不 mock Redis client 本身,這是
+    真的連線。"""
+    import redis
+
+    return redis.Redis.from_url(settings.COMMENT_RATE_LIMIT_REDIS_URL)
+
+
+def test_comment_rate_limit_second_request_same_ip_same_event_returns_429():
+    """① 同一 IP 對同一活動連續兩次留言(間隔 <2 秒)→ 第二次回傳 429,
+    COMMENT_RATE_LIMITED,且第二次的留言內容沒有被寫入 DB。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    first = client.post(
+        _comments_url(event.id), _comment_payload(message="第一則"), format="json"
+    )
+    second = client.post(
+        _comments_url(event.id), _comment_payload(message="第二則"), format="json"
+    )
+
+    assert first.status_code == status.HTTP_201_CREATED
+    assert second.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    assert second.json()["code"] == "COMMENT_RATE_LIMITED"
+    assert Comment.objects.filter(event=event).count() == 1
+    assert Comment.objects.get(event=event).message == "第一則"
+
+
+def test_comment_rate_limit_does_not_cross_events():
+    """② 同一 IP 對不同活動連續留言 → 兩則都成功(鎖不跨活動,見 design.md
+    D1)。"""
+    owner = _create_user()
+    event_a = _create_event(owner)
+    event_b = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    response_a = client.post(
+        _comments_url(event_a.id), _comment_payload(message="活動 A"), format="json"
+    )
+    response_b = client.post(
+        _comments_url(event_b.id), _comment_payload(message="活動 B"), format="json"
+    )
+
+    assert response_a.status_code == status.HTTP_201_CREATED
+    assert response_b.status_code == status.HTTP_201_CREATED
+
+
+def test_comment_rate_limit_does_not_cross_ips():
+    """③ 不同 IP 對同一活動連續留言 → 兩則都成功(鎖不跨 IP)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+
+    response_1 = APIClient(REMOTE_ADDR="1.1.1.1").post(
+        _comments_url(event.id), _comment_payload(message="來自 1.1.1.1"), format="json"
+    )
+    response_2 = APIClient(REMOTE_ADDR="2.2.2.2").post(
+        _comments_url(event.id), _comment_payload(message="來自 2.2.2.2"), format="json"
+    )
+
+    assert response_1.status_code == status.HTTP_201_CREATED
+    assert response_2.status_code == status.HTTP_201_CREATED
+
+
+def test_comment_rate_limit_expires_and_allows_next_comment():
+    """④ 鎖定時間過後(這裡直接操控 Redis TTL,不真的 sleep 2 秒)→ 同一 IP
+    對同一活動可以再次留言成功。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    first = client.post(
+        _comments_url(event.id), _comment_payload(message="第一則"), format="json"
+    )
+    assert first.status_code == status.HTTP_201_CREATED
+
+    redis_client = _rate_limit_redis_client()
+    redis_client.delete(f"comment_rl:{event.id}:1.2.3.4")
+
+    second = client.post(
+        _comments_url(event.id), _comment_payload(message="第二則"), format="json"
+    )
+
+    assert second.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 2
+
+
+def test_comment_rate_limit_invalid_request_does_not_consume_lock():
+    """⑤ 留言驗證失敗(缺暱稱,400)→ 不消耗鎖,緊接著送出合法留言仍然成功
+    (design.md D2:上鎖時機在驗證通過之後,驗證失敗根本不會走到嘗試上鎖這一
+    步)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+    invalid_payload = _comment_payload()
+    del invalid_payload["nickname"]
+
+    invalid_response = client.post(
+        _comments_url(event.id), invalid_payload, format="json"
+    )
+    valid_response = client.post(
+        _comments_url(event.id), _comment_payload(message="合法留言"), format="json"
+    )
+
+    assert invalid_response.status_code == status.HTTP_400_BAD_REQUEST
+    assert valid_response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+def test_comment_rate_limit_fails_open_when_redis_unreachable():
+    """⑥ 模擬 Redis 連線失敗(指向一個不存在的位址／port,不 mock Redis
+    client 本身)→ 留言仍正常寫入成功,不因為 Redis 異常而 500 或被擋下
+    (design.md D7,fail-open)。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    with override_settings(COMMENT_RATE_LIMIT_REDIS_URL="redis://localhost:1/0"):
+        response = client.post(
+            _comments_url(event.id), _comment_payload(), format="json"
+        )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+def test_comment_rate_limit_fails_open_when_redis_url_is_malformed():
+    """code-review 補充:``COMMENT_RATE_LIMIT_REDIS_URL`` 設定錯誤（不合法的
+    URL scheme,例如漏打或打錯）→ ``redis.Redis.from_url()`` 拋的是
+    ``ValueError``,不是 ``redis.exceptions.RedisError``——這個分支若只捕
+    捉後者,設定錯誤會讓每個留言請求都 500,違反 D7 fail-open 的初衷。留言
+    仍應正常寫入成功。"""
+    owner = _create_user()
+    event = _create_event(owner)
+    client = APIClient(REMOTE_ADDR="1.2.3.4")
+
+    with override_settings(COMMENT_RATE_LIMIT_REDIS_URL="not-a-valid-redis-url"):
+        response = client.post(
+            _comments_url(event.id), _comment_payload(), format="json"
+        )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert Comment.objects.filter(event=event).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_comment_rate_limit_concurrent_legit_requests_only_one_succeeds():
+    """⑦ 併發情境(這個 change 存在的核心理由):同一 IP、同一活動,兩個內容皆
+    合法的請求近乎同時送達(模擬連點)→ 只有一則成功寫入 DB,另一則收到
+    429,不能兩則都成功。驗證 design.md D2/D3:鎖必須設在「驗證通過之後、
+    寫入 DB 之前」,不是等 DB 寫入完成才上鎖——否則兩個近乎同時抵達、都通過
+    驗證的請求會在鎖生效前搶先都執行完 ``save()``,變成兩則都寫入成功,完全
+    達不到防洗版的目的。用 ``transaction=True`` 讓兩個執行緒各自拿到真正獨立
+    的 DB connection,才測得出真實的併發行為(同款寫法見
+    ``test_comment_delete_concurrent_requests_only_one_succeeds``)。"""
+    import threading
+
+    owner = _create_user()
+    event = _create_event(owner)
+
+    status_codes = []
+    start_barrier = threading.Barrier(2)
+
+    def send_comment(message):
+        start_barrier.wait()
+        client = APIClient(REMOTE_ADDR="1.2.3.4")
+        try:
+            response = client.post(
+                _comments_url(event.id), _comment_payload(message=message), format="json"
+            )
+            status_codes.append(response.status_code)
+        finally:
+            connection.close()
+
+    threads = [
+        threading.Thread(target=send_comment, args=(f"連點留言 {i}",)) for i in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(status_codes) == [
+        status.HTTP_201_CREATED,
+        status.HTTP_429_TOO_MANY_REQUESTS,
+    ]
+    assert Comment.objects.filter(event=event).count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3434,7 +3862,7 @@ def test_cancel_does_not_affect_existing_comments():
 
     assert response.status_code == status.HTTP_200_OK
     comments_response = APIClient().get(_comments_url(event.id))
-    assert len(comments_response.json()) == 1
+    assert len(comments_response.json()["comments"]) == 1
 
 
 def test_cancel_sends_email_to_participants_even_when_votes_soft_deleted(

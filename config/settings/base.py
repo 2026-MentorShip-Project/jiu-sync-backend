@@ -208,6 +208,23 @@ CELERY_TIMEZONE = TIME_ZONE
 # 見 openspec/changes/add-event-lifecycle/design.md D2。
 CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
 
+# 留言防洗版鎖（`CommentListCreateView.post()`）專用的 Redis 連線，跟 Celery
+# broker 用同一台 Redis instance、但獨立 DB index（db=1，Celery broker 用
+# db=0）——避免鎖的 key 跟 Celery 佇列訊息混在同一個 keyspace，SCAN／監控／
+# 未來清理都比較乾淨。見 openspec/changes/add-comment-rate-limit/design.md D5。
+# 預設值直接把 CELERY_BROKER_URL 結尾的 db index 由 0 換成 1 算出來，兩者共用
+# 同一台 Redis（同一個 docker-compose `redis` service），不需要額外開容器；
+# CELERY_BROKER_URL 若不是以 "/0" 結尾（例如被覆寫成別的 db index），原樣沿用
+# 不硬改，避免猜錯意圖。
+COMMENT_RATE_LIMIT_REDIS_URL = env(
+    "COMMENT_RATE_LIMIT_REDIS_URL",
+    default=(
+        CELERY_BROKER_URL[: -len("/0")] + "/1"
+        if CELERY_BROKER_URL.endswith("/0")
+        else CELERY_BROKER_URL
+    ),
+)
+
 
 # Google SSO — host login only (see apps.accounts). Backend verifies the
 # Google-issued id_token audience against this client ID.
