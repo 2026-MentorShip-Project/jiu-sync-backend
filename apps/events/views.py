@@ -7,7 +7,7 @@ import redis
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
-from django.db.models import Prefetch, Q
+from django.db.models import Count, Max, Prefetch, Q
 from django.utils import dateparse, timezone
 from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied
@@ -608,6 +608,14 @@ class ParticipantResponseDetailView(APIView):
                     for item in availabilities
                 ]
             )
+            # 上面只動了子表(ParticipantResponseSlotAvailability),完全沒碰
+            # ParticipantResponse 本身任何欄位，auto_now 的 updated_at 不會
+            # 自動蓋章。add-event-poll 的輪詢端點需要靠這個欄位分辨「有投票
+            # 被修改」（不只是「有新投票」），這裡補一次輕量 UPDATE，沿用同一個
+            # 已經算好的 claimed_at，不重新呼叫 timezone.now()。
+            ParticipantResponse.objects.filter(pk=participant_response.pk).update(
+                updated_at=claimed_at
+            )
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         response_serializer = EventDetailSerializer(event, context={"request": request})
@@ -795,6 +803,7 @@ class EventFinalizeView(APIView):
             final_slot_id=serializer.validated_data["finalSlotId"],
             final_note=serializer.validated_data.get("finalNote") or None,
             finalized_at=claimed_at,
+            updated_at=claimed_at,
         )
         if affected == 0:
             current_status = Event.objects.values_list("status", flat=True).get(
@@ -854,6 +863,7 @@ class EventCancelView(APIView):
                 final_slot=None,
                 final_note=None,
                 finalized_at=None,
+                updated_at=claimed_at,
             )
             if affected == 0:
                 raise ApiError(
@@ -909,6 +919,7 @@ class EventReopenView(APIView):
             final_slot=None,
             final_note=None,
             finalized_at=None,
+            updated_at=timezone.now(),
         )
         if affected == 0:
             raise ApiError(
@@ -924,3 +935,48 @@ class EventReopenView(APIView):
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+class EventPollView(APIView):
+    """``GET /api/events/{id}/poll`` — 公開（不需登入）的輕量輪詢端點，前端
+    每隔固定秒數（例如 10 秒）查詢一筆活動有沒有變化，不含 ``responses``/
+    ``slotSummary``/``comments`` 明細內容（add-event-poll D1）。前端偵測到
+    回應值跟上次不同才另外打 ``GET /api/events/{id}``／
+    ``GET /api/events/{id}/comments`` 取得完整內容。
+
+    跟 ``GET /api/events/{id}`` 同一批對象、同一套連結失效規則（D3）：
+    ``AllowAny`` + 空 ``authentication_classes``（不需要 ``isOwner`` 判斷，
+    不用 ``EventDetailView`` 的 ``OptionalJWTAuthentication``），
+    ``_display_status_or_410`` 算出 ``link_expired`` 時回 410。
+
+    ``responseCount``/``commentCount`` 只算未軟刪除的紀錄（D4），
+    ``latestResponseAt`` 用 ``MAX(updated_at)`` 而非 ``MAX(created_at)``——
+    ``PATCH .../responses/{responseId}`` 改票時也會更新 ``updated_at``
+    （D2），才能同時反映「新投票」與「改票」兩種變化。
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, id):
+        event = _get_event_or_404(id)
+        display_status = _display_status_or_410(event)
+
+        response_agg = ParticipantResponse.objects.filter(
+            event=event, deleted_at__isnull=True
+        ).aggregate(count=Count("id"), latest=Max("updated_at"))
+        comment_agg = Comment.objects.filter(
+            event=event, deleted_at__isnull=True
+        ).aggregate(count=Count("id"), latest=Max("created_at"))
+
+        return Response(
+            {
+                "status": event.status,
+                "displayStatus": display_status,
+                "eventUpdatedAt": event.updated_at,
+                "responseCount": response_agg["count"],
+                "latestResponseAt": response_agg["latest"],
+                "commentCount": comment_agg["count"],
+                "latestCommentAt": comment_agg["latest"],
+            }
+        )
