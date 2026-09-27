@@ -1,4 +1,7 @@
-from django.test import Client, override_settings
+import logging
+
+import pytest
+from django.test import Client, RequestFactory, override_settings
 from rest_framework.exceptions import (
     AuthenticationFailed,
     NotAuthenticated,
@@ -6,8 +9,9 @@ from rest_framework.exceptions import (
     PermissionDenied,
     ValidationError,
 )
+from rest_framework.request import Request
 
-from config.exceptions import ApiError, Gone, custom_exception_handler
+from config.exceptions import ApiError, Gone, custom_exception_handler, handler500
 
 
 def test_api_error_with_code_and_status_code():
@@ -334,3 +338,117 @@ def test_handler_flattens_two_level_nested_validation_error():
     assert "{" not in message
     assert "}" not in message
     assert "bad" in message
+
+
+class _FakeUser:
+    """context["request"].user 的假物件——不需要真的打 DB 建立使用者，只要
+    `_log_error_response` 用到的 `id`/`is_authenticated` 兩個屬性存在即可。"""
+
+    def __init__(self, id, is_authenticated=True):
+        self.id = id
+        self.is_authenticated = is_authenticated
+
+
+def _context_with_request(method="get", path="/api/events/abc123/finalize/", user=None):
+    factory = RequestFactory()
+    django_request = getattr(factory, method)(path)
+    request = Request(django_request)
+    if user is not None:
+        request.user = user
+    return {"request": request}
+
+
+def test_handler_logs_warning_for_401_with_request_context(caplog):
+    """401 → 記 WARNING，內容含狀態碼/code/使用者 id/路徑，供後端查驗（不是給前端看的）。"""
+    exc = ApiError("驗證失敗", code="UNAUTHORIZED", status_code=401)
+    context = _context_with_request(user=_FakeUser("u1"))
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        custom_exception_handler(exc, context)
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelname == "WARNING"
+    message = record.getMessage()
+    assert "401" in message
+    assert "UNAUTHORIZED" in message
+    assert "u1" in message
+    assert "/api/events/abc123/finalize/" in message
+
+
+def test_handler_logs_warning_for_403(caplog):
+    """403 → 記 WARNING（未帶 user，匿名請求也不能讓記 log 這件事噴例外）。"""
+    exc = ApiError("沒有權限", code="FORBIDDEN", status_code=403)
+    context = _context_with_request()
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        custom_exception_handler(exc, context)
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+
+
+def test_handler_logs_error_for_explicit_500_api_error(caplog):
+    """業務程式碼明確 raise ApiError(..., status_code=500) → 記 ERROR，不是 WARNING。"""
+    exc = ApiError("伺服器錯誤", status_code=500)
+    context = _context_with_request()
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        custom_exception_handler(exc, context)
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "ERROR"
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 409])
+def test_handler_does_not_log_ordinary_business_errors(caplog, status_code):
+    """400/404/409 這類正常業務流程（使用者打錯、資料本來就找不到）不記 log，避免雜訊。"""
+    exc = ApiError("訊息", status_code=status_code)
+    context = _context_with_request()
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        custom_exception_handler(exc, context)
+
+    assert caplog.records == []
+
+
+def test_handler_does_not_log_410_gone(caplog):
+    """410（連結失效，正常業務流程）同樣不記 log。"""
+    exc = Gone("連結已失效")
+    context = _context_with_request()
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        custom_exception_handler(exc, context)
+
+    assert caplog.records == []
+
+
+def test_handler_logs_without_request_in_context_does_not_crash(caplog):
+    """context 沒有 request(既有測試多半直接傳 {})時仍能正常記 log，不噴例外。"""
+    exc = ApiError("驗證失敗", status_code=401)
+
+    with caplog.at_level(logging.WARNING, logger="config.exceptions"):
+        response = custom_exception_handler(exc, {})
+
+    assert response.status_code == 401
+    assert len(caplog.records) == 1
+
+
+def test_handler500_logs_error_with_exception_info(caplog):
+    """Django 層級、真正未預期的例外(走不到 custom_exception_handler)→ handler500
+    也要記 ERROR，且帶原始例外的 traceback(exc_info),這是排查真 bug 最重要的一種。"""
+    factory = RequestFactory()
+    django_request = factory.get("/api/events/abc123/")
+
+    with caplog.at_level(logging.ERROR, logger="config.exceptions"):
+        try:
+            raise KeyError("boom")
+        except KeyError:
+            response = handler500(django_request)
+
+    assert response.status_code == 500
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelname == "ERROR"
+    assert record.exc_info is not None
+    assert "/api/events/abc123/" in record.getMessage()
