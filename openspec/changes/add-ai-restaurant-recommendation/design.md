@@ -72,7 +72,8 @@ except Exception:
     req 標記 failed(UNEXPECTED_ERROR);log.exception;re-raise → 500
 else:
     with transaction.atomic():                   # 確認時兜底(見下)
-        User.objects.select_for_update().get(pk=user.pk)
+        RestaurantRecommendationRequest.objects.select_for_update().filter(pk=req.pk)  # 先鎖紀錄
+        User.objects.select_for_update().filter(pk=user.pk)                              # 再鎖 User
         now = timezone.now()
         if req.created_at <= now - PENDING_EXPIRY and used(req.quota_period, 排除 req) >= limit:
             req 標記 failed(QUOTA_EXCEEDED_AT_CONFIRM,result/usage 仍保存);回 403 QUOTA_EXCEEDED
@@ -84,7 +85,7 @@ else:
 - `pending` 本身就是預留:同一使用者後續請求在鎖內計數時一定看得到它,所以不會超用。
 - 失敗的補償就是把 `pending` 改成 `failed`(不再計數),不存在「加回去」的算術。
 - 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時:成功路徑仍回 201 與結果,失敗路徑照常回錯誤,log 的 `event`、等級與 `error_code` 皆維持原本路徑的值(成功 INFO、上游失敗 WARNING、非預期例外 ERROR,失敗保留原 `error_code`),只額外帶布林欄位 `record_missing: true`(已列入白名單);其他情況不輸出此欄位。此時該次不計次,屬可接受的極端情況;費用仍計入 log 統計(上游確實收費)。
-- **確認時兜底(grill 2026-09-29 Q1–Q3)**:額度正確性不依賴「請求存活時間 < `PENDING_EXPIRY`」這個時間假設(見 D5 已知限制)。每次轉 `succeeded` 都在 `User` 列鎖內進行;只有自己的 `pending` 已過期(`created_at <= now - PENDING_EXPIRY`,與 `compute_quota` 的條件相反,`now` 在鎖內取)時才重算額度,重算用紀錄自己的 `quota_period`(D6,跨月以建立月份為準),不計入自己。已達上限 → 紀錄轉 `failed`、`error_code` `QUOTA_EXCEEDED_AT_CONFIRM`,`result`/`usage` 仍寫入 DB 方便追查,回 403 `AI_RECOMMENDATION_QUOTA_EXCEEDED`(body 與一般額度用完相同),log `ai_rec.failed`(WARNING)額外帶 `cost_usd`;未達上限照常成功。未過期時不重算:自己的預留一直被計入,其他請求不可能搶走這一次。失敗路徑不拿鎖(`failed` 不計次)。轉換仍用 `filter(status=pending).update`,判斷依記憶體中的 `created_at`/`quota_period`;更新 0 列時沿用上一條的 `record_missing` 規則。代價:極罕見情況下浪費一次已付費的上游呼叫。
+- **確認時兜底(grill 2026-09-29 Q1–Q3)**:額度正確性不依賴「請求存活時間 < `PENDING_EXPIRY`」這個時間假設(見 D5 已知限制)。每次轉 `succeeded` 都在 `User` 列鎖內進行;只有自己的 `pending` 已過期(`created_at <= now - PENDING_EXPIRY`,與 `compute_quota` 的條件相反,`now` 在鎖內取)時才重算額度,重算用紀錄自己的 `quota_period`(D6,跨月以建立月份為準),不計入自己。已達上限 → 紀錄轉 `failed`、`error_code` `QUOTA_EXCEEDED_AT_CONFIRM`,`result`/`usage` 仍寫入 DB 方便追查,回 403 `AI_RECOMMENDATION_QUOTA_EXCEEDED`(body 與一般額度用完相同),log `ai_rec.failed`(WARNING)額外帶 `cost_usd`;未達上限照常成功。未過期時不重算:自己的預留一直被計入,其他請求不可能搶走這一次。失敗路徑不拿鎖(`failed` 不計次)。轉換仍用 `filter(status=pending).update`,判斷依記憶體中的 `created_at`/`quota_period`;更新 0 列時沿用上一條的 `record_missing` 規則。**鎖順序為先鎖自己的紀錄、再鎖 `User`**,與 Django cascade 刪除使用者的順序(先刪依附紀錄、最後刪 `User`)一致,反過來會互鎖而變成 500(task 5.4 code-review);兩者皆用 `filter` 而非 `get`,紀錄或使用者在請求期間被刪除時不丟例外。額度仍由 `User` 列鎖序列化。代價:極罕見情況下浪費一次已付費的上游呼叫。
   - 替代:引擎內 watchdog(`threading.Timer` 到期 `shutdown` socket,或 executor + `future.result(timeout)`)——需依賴 urllib3 內部屬性或留下未結束的 thread,脆弱,不採用。替代:接受風險、只收緊啟動檢查——上游慢速回傳時仍可能超用,不符合併發安全邊界,不採用。
 - 為什麼鎖 `User` 列而不是鎖紀錄表:要鎖的是「這個使用者的額度」,紀錄表在額度為 0 筆時沒有列可鎖(phantom),`User` 列一定存在。
 - 替代:Redis `SET NX` 鎖——會形成第二份狀態、需要處理解鎖失敗與 TTL,且 Redis 失敗時仍需 DB 兜底,見 grill Q11 討論,不採用。
@@ -236,6 +237,7 @@ with transaction.atomic():
 - [t2.micro 記憶體] → gthread 共用 process,不增加 worker process 數,記憶體增量小。
 - [確認時才發現超額,浪費一次上游費用] → 只在請求活得比 `pending`(5 分鐘)久且額度同時被用滿時發生;以 `error_code = QUOTA_EXCEEDED_AT_CONFIRM` 的 log 監控頻率(D11)。
 - [reopen 後已選餐廳可能不再適合新時段] → 推薦依舊時段與人數產生;保留選擇,由主揪重新定案後自行更換,前端可依活動狀態淡化顯示(D13)。
+- [跨月請求的 201 `quota` 顯示上個月] → 月底開始、跨午夜才確認的請求,成功回應的 `quota` 以請求開始時間計算,顯示的是建立月份(與計次歸屬一致,D6),下一次查詢即為新月份;只影響該次顯示,不處理。
 - [`pending` 殘留] → 5 分鐘後不計數;若 log 看到大量殘留代表 worker 被殺,需調查逾時設定。
 - [Perplexity 費用] → `usage.cost` 入庫,可隨時 `SUM` 估算;上限可由 env 調整。
 - [模型回傳虛構餐廳] → prompt 要求只推薦可搜尋確認的真實店家、查不到填 null;`sourceUrl` 只用真實來源。無法完全消除,前端應標示「AI 推薦,請自行確認」。

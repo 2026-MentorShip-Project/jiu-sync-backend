@@ -24,7 +24,7 @@ PRD(前端 repo `docs/auth-&-AI-feature-2026-0901/`)把產品收斂成「成團�
 
 ### Modified Capabilities
 
-(無 — 不改變既有活動、登入、錯誤格式的行為;活動詳情回應只純新增 `selectedRestaurant` 欄位,定義在 `restaurant-recommendations`;新錯誤代碼沿用既有的統一錯誤回應形狀)
+(無 — 不改變既有活動、登入、錯誤格式的行為;活動詳情回應只純新增選定餐廳欄位,其行為歸在 `restaurant-recommendations` 定義;新錯誤代碼沿用既有的統一錯誤回應形狀)
 
 ## Impact
 
