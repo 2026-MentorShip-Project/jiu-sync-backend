@@ -64,7 +64,10 @@
 
 ## 7. 收尾
 
-- [ ] 7.1 全套驗證:`pytest -q`、`ruff check .`、`manage.py check`、`makemigrations --check --dry-run` 皆乾淨;`openspec validate add-ai-restaurant-recommendation --strict` 通過 — (auto)
-- [ ] 7.2 `/code-review` 自審,處理發現的真實問題 — (auto)
-- [ ] 7.3 `spectra analyze` + `spectra drift` 確認實作與 design.md 一致、無落差;有落差先修正或 `ingest` — (auto)
+- [x] 7.1 全套驗證:`pytest -q`、`ruff check .`、`manage.py check`、`makemigrations --check --dry-run` 皆乾淨;`openspec validate add-ai-restaurant-recommendation --strict` 通過 — (auto)
+  - 結果:`pytest -q` 702 passed(修正後;修正前 697)、`ruff check .` 乾淨、`manage.py check` 無問題、`makemigrations --check --dry-run` No changes、`openspec validate --strict` valid。
+- [x] 7.2 `/code-review` 自審,處理發現的真實問題 — (auto)
+  - 結果:修 2 項真問題(先 RED 再修,29ad114):上游文字含 NUL 時 DB 拒收→殘留 pending/500 且上游文字進 log;送出階段 requests 例外 `from exc` 帶上游 status line 進 traceback。選定 PUT 與 cascade 刪除的鎖順序、`_read_body` 捕捉所有例外等列為待決事項,未自行拍板。
+- [x] 7.3 `spectra analyze` + `spectra drift` 確認實作與 design.md 一致、無落差;有落差先修正或 `ingest` — (auto)
+  - 結果:analyze 0.04 秒(24 則:9 requirement/13 design 主題「無對應 task」與 2 則 SUGGEST,皆為 tasks 以 Dx/情境描述引用而非標題文字的誤報,逐項對照已有實作與 task)、drift 0.32 秒(5 個斷裂 anchor:前端檔在前端 repo `that-is-so-sweet/src/mocks/`、gunicorn 參數在 `gunicorn --help` 皆存在,屬誤報);無真實落差,未改規劃文件。
 - [ ] 7.4 整理給前端的串接說明(request/response 範例、錯誤碼表、`restrictions` 新欄位、quota API、進行中停用按鈕、「重新推薦也計次」、`PUT selected-restaurant` 與活動詳情 `selectedRestaurant`、「確認時才發現超額也回 403」),以及 design.md D11 的 LogQL/SQL 查詢,放在 PR 描述 — (manual)我確認後再轉給前端
