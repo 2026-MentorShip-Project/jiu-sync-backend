@@ -77,7 +77,7 @@ else:
 - 鎖只包住「計數 + 建 pending」這一小段,呼叫上游時不持有 DB 鎖與 transaction。
 - `pending` 本身就是預留:同一使用者後續請求在鎖內計數時一定看得到它,所以不會超用。
 - 失敗的補償就是把 `pending` 改成 `failed`(不再計數),不存在「加回去」的算術。
-- 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時:成功路徑仍回 201 與結果,失敗路徑照常回錯誤,兩者都記一筆 WARNING(`event` 沿用 `ai_rec.succeeded`/`ai_rec.failed`,另帶 `error_code=RECORD_MISSING`);此時該次不計次,屬可接受的極端情況。
+- 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時:成功路徑仍回 201 與結果,失敗路徑照常回錯誤,log 的 `event`、等級與 `error_code` 皆維持原本路徑的值(成功 INFO、上游失敗 WARNING、非預期例外 ERROR,失敗保留原 `error_code`),只額外帶布林欄位 `record_missing: true`(已列入白名單);其他情況不輸出此欄位。此時該次不計次,屬可接受的極端情況;費用仍計入 log 統計(上游確實收費)。
 - 為什麼鎖 `User` 列而不是鎖紀錄表:要鎖的是「這個使用者的額度」,紀錄表在額度為 0 筆時沒有列可鎖(phantom),`User` 列一定存在。
 - 替代:Redis `SET NX` 鎖——會形成第二份狀態、需要處理解鎖失敗與 TTL,且 Redis 失敗時仍需 DB 兜底,見 grill Q11 討論,不採用。
 - 替代:先扣後不退——上游失敗成本轉嫁給使用者,不採用。

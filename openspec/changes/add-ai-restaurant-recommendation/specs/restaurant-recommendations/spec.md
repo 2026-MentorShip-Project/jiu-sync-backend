@@ -180,6 +180,7 @@
 - `ai_rec.quota_denied`(INFO):`user_id`、`used`、`limit`、`period`
 - `ai_rec.in_progress_denied`(INFO):`user_id`、`event_id`
 - `ai_rec.unavailable`(ERROR):`user_id`、`event_id`
+- `ai_rec.succeeded`/`ai_rec.failed` 在推薦紀錄於請求期間被刪除時,額外帶布林欄位 `record_missing: true`
 
 #### Scenario: 成功事件
 - **WHEN** 一次推薦成功
@@ -188,6 +189,10 @@
 #### Scenario: 上游失敗事件
 - **WHEN** 外部服務逾時
 - **THEN** 輸出 `event` 為 `ai_rec.failed`、`error_code` 為逾時代碼的 JSON log,且包含例外資訊
+
+#### Scenario: 推薦紀錄在請求期間被刪除
+- **WHEN** 推薦進行中,其紀錄因活動被刪除而消失,之後外部服務成功或失敗
+- **THEN** 回應照常(成功 201、失敗回對應錯誤),log 的 `event`、等級、`error_code` 與一般情況相同,另外帶 `record_missing: true`
 
 #### Scenario: log 不含使用者輸入
 - **WHEN** 請求帶有 `customPrompt`
