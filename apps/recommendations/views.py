@@ -472,7 +472,7 @@ class SelectedRestaurantView(APIView):
 
     檢查順序見 design.md D13:認證 → 活動存在 → 擁有者 → body 驗證 → 鎖內(狀態 →
     推薦紀錄 → 餐廳)→ 寫入。狀態檢查、驗證與寫入都在 ``Event`` 列的
-    ``select_for_update`` 內:兩個分頁同時選不同間時由鎖序列化(最後寫入者勝、
+    ``select_for_update(no_key=True)`` 內:兩個分頁同時選不同間時由鎖序列化(最後寫入者勝、
     兩者皆 200),也不會與 reopen/cancel(同樣更新該列)競態。
 
     冪等:目前選擇已是同一 ``(recommendation, restaurant_ref)`` 時不寫入,
@@ -494,8 +494,10 @@ class SelectedRestaurantView(APIView):
         with transaction.atomic():
             # of=("self",):只鎖活動列;final_slot 是 nullable 外鍵(LEFT JOIN),
             # Postgres 不允許對 outer join 的 nullable 端加 FOR UPDATE。
+            # no_key=True(FOR NO KEY UPDATE):仍與 reopen/cancel 的 UPDATE 互斥,
+            # 但不阻擋同活動推薦紀錄 INSERT 對活動列取的 FK KEY SHARE 鎖(D13)。
             event = (
-                Event.objects.select_for_update(of=("self",))
+                Event.objects.select_for_update(of=("self",), no_key=True)
                 .select_related("final_slot")
                 .filter(pk=event.pk)
                 .first()

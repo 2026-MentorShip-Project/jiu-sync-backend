@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from django.db import connection
+from django.db import OperationalError, connection, transaction
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
@@ -815,6 +815,119 @@ def test_concurrent_puts_selecting_different_restaurants_both_succeed(monkeypatc
         assert body["restaurant"] == _restaurant(recommendation, ref)
     assert EventRestaurantSelection.objects.filter(event=event).count() == 1
     assert EventRestaurantSelection.objects.get(event=event).restaurant_ref in {"r1", "r2"}
+
+
+class HoldInsideLock:
+    """包住 view 用的 `compute_display_status`(在 `Event` 列鎖內呼叫):
+    通知主執行緒「已持鎖」,等主執行緒放行後才繼續寫入並 commit。"""
+
+    def __init__(self, original):
+        self.original = original
+        self.locked = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, *args, **kwargs):
+        # 守住「同步點位於鎖內 transaction」:狀態檢查若被移到取鎖之前,
+        # 這裡會先失敗,不會讓下方測試在沒持鎖的情況下空過。
+        assert connection.in_atomic_block, "status check must run inside the locked transaction"
+        result = self.original(*args, **kwargs)
+        self.locked.set()
+        self.release.wait(timeout=JOIN_TIMEOUT)
+        return result
+
+
+def _run_while_put_holds_event_lock(monkeypatch, other_connection_work):
+    """PUT 在持有 `Event` 列鎖期間暫停,主執行緒的連線以 `lock_timeout = 1s`
+    執行 `other_connection_work(event)`;回傳該工作丟出的例外(沒有則 None)。"""
+    owner = _create_user()
+    event = _create_finalized_event(owner)
+    recommendation = _create_recommendation(event)
+    hold = HoldInsideLock(views_module.compute_display_status)
+    monkeypatch.setattr(views_module, "compute_display_status", hold)
+
+    results = {}
+    errors = []
+    put_client = _auth_client(owner)
+
+    def send():
+        try:
+            response = put_client.put(_url(event.id), _body(recommendation, "r1"), format="json")
+            results["put"] = response.status_code
+        except Exception as exc:  # noqa: BLE001 — 轉交主執行緒斷言,不吞掉
+            errors.append(exc)
+        finally:
+            hold.locked.set()  # PUT 提早失敗時不讓主執行緒空等
+            connection.close()
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    outcome = None
+    try:
+        assert hold.locked.wait(timeout=JOIN_TIMEOUT), "PUT never reached the lock"
+        assert errors == []
+        # commit 必須留在 try 內、且在放行 PUT 之前:Django 的 FK 是
+        # DEFERRABLE INITIALLY DEFERRED,INSERT 對活動列取 KEY SHARE 的檢查
+        # 發生在 commit 時,移到放行之後測試就會空過。
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '1s'")
+                other_connection_work(event)
+        except OperationalError as exc:
+            outcome = exc
+    finally:
+        hold.release.set()
+        thread.join(timeout=JOIN_TIMEOUT)
+
+    assert not thread.is_alive(), "request thread hung"
+    assert errors == []
+    assert results["put"] == status.HTTP_200_OK
+    return outcome
+
+
+def _is_lock_timeout(exc):
+    return exc is not None and getattr(exc.__cause__, "sqlstate", None) == "55P03"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_put_holding_event_lock_does_not_block_new_recommendation_insert(monkeypatch):
+    """D13:`FOR NO KEY UPDATE` 不與 INSERT 推薦紀錄時 FK 取的 `KEY SHARE` 衝突。"""
+
+    def insert_recommendation(event):
+        _create_recommendation(event, record_status=Status.PENDING, result=None)
+
+    outcome = _run_while_put_holds_event_lock(monkeypatch, insert_recommendation)
+
+    assert outcome is None, f"insert blocked by PUT's Event lock: {outcome!r}"
+    assert RestaurantRecommendationRequest.objects.count() == 2
+
+
+def _reopen_style_update(event):
+    Event.objects.filter(pk=event.pk, status=Event.Status.FINALIZED).update(
+        status=Event.Status.ACTIVE, final_slot=None, updated_at=timezone.now()
+    )
+
+
+def _cancel_style_update(event):
+    now = timezone.now()
+    Event.objects.filter(
+        pk=event.pk, status__in=[Event.Status.ACTIVE, Event.Status.FINALIZED]
+    ).update(status=Event.Status.CANCELLED, cancelled_at=now, final_slot=None, updated_at=now)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("update", [_reopen_style_update, _cancel_style_update])
+def test_put_holding_event_lock_still_blocks_lifecycle_update(monkeypatch, update):
+    """D13:reopen/cancel 對 `Event` 列的 UPDATE 仍須等 PUT 釋放鎖。
+
+    兩者照 `apps/events/views.py` 的 `EventReopenView`/`EventCancelView` 條件式
+    `.update()` 形狀(只改非 key 欄位);那邊的寫法改變時這裡要跟著看。
+    """
+    outcome = _run_while_put_holds_event_lock(monkeypatch, update)
+
+    assert _is_lock_timeout(outcome), f"expected lock_timeout, got {outcome!r}"
+    event = Event.objects.get()
+    assert event.status == Event.Status.FINALIZED
 
 
 # ---------------------------------------------------------------------------
