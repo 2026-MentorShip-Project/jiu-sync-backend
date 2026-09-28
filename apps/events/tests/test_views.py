@@ -3,7 +3,7 @@ import re
 import secrets
 import time
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from django.conf import settings
@@ -577,6 +577,28 @@ def test_event_detail_display_status_reflects_expired_deadline():
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json()["displayStatus"] == "voting_closed_pending"
+
+
+def test_event_detail_display_status_uses_taipei_date_after_midnight(monkeypatch):
+    """台灣時間 9/29 00:30(UTC 仍為 9/28 16:30)查詢昨天(9/28)定案時段、
+    定案未滿 7 天的活動 → displayStatus 為 finalized_past(以台灣日期判斷)。"""
+    fixed_now = datetime(2026, 9, 28, 16, 30, tzinfo=UTC)
+    monkeypatch.setattr(timezone, "now", lambda: fixed_now)
+    owner = _create_user()
+    event = _create_event(
+        owner,
+        status=Event.Status.FINALIZED,
+        response_deadline=fixed_now - timedelta(days=2),
+        finalized_at=fixed_now - timedelta(days=1),
+    )
+    slot = Slot.objects.create(event=event, date="2026-09-28")
+    event.final_slot = slot
+    event.save(update_fields=["final_slot"])
+
+    response = APIClient().get(_detail_url(event.id))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["displayStatus"] == "finalized_past"
 
 
 def test_invalid_bearer_token_can_still_view_event_detail_anonymously():
