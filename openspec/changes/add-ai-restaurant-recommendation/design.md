@@ -104,14 +104,14 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 - HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`timeout=(5, 45)`(connect, read)。
 - 模型設定:`PERPLEXITY_MODEL` 預設 `preset:low`(task 0.2 實測:延遲中位數 24 秒,`medium` 為 57–94 秒會超過 45 秒逾時)。值以 `preset:` 開頭 → 送 `preset` 欄位;否則視為 `provider/model` → 送 `model` 欄位。其他格式在啟動時 `ImproperlyConfigured`。
 - Request:`instructions` = 執行計畫書 §6 System Prompt,但**規則 1 放寬**(見下);移除「輸出純 JSON 不要 markdown」這類由 schema 取代的文字。`input` = §7 User Prompt 樣板;`tools: [{"type": "web_search"}]`;`response_format` = json_schema(`restaurants[]` + `notes`,欄位同 spec,`name`/`address` required,**不含任何 url 欄位**)。
-- System Prompt 規則 1 改為:「只推薦在本次搜尋結果中實際出現的真實餐廳,不可編造店名或地址。無法確認目前是否營業、是否能容納指定人數或是否符合某項條件時,仍可列出,但必須在 `recommendReason` 或 `notes` 具體註明哪一項無法確認;查不到的欄位填 null。」原規則「只能推薦能確認仍在營業的餐廳」在 `preset:low` 下導致過度保守(PRD 標準情境回傳 0 間)。放寬後以 task 0.2 補充重測驗證。
+- System Prompt 規則 1 改為:「只推薦在本次搜尋結果中實際出現的真實餐廳,不可編造店名或地址。無法確認目前是否營業、是否能容納指定人數或是否符合某項條件時,仍可列出,但必須在 `recommend_reason` 或 `notes` 具體註明哪一項無法確認;查不到的欄位填 null。」原規則「只能推薦能確認仍在營業的餐廳」在 `preset:low` 下導致過度保守(PRD 標準情境回傳 0 間)。放寬後以 task 0.2b 重測驗證:C1–C4 有 ≥3 間由 2/4 升為 3/4,延遲中位數 16 秒,人工核對無編造店家。
 - 解析(依 task 0.2 實測的真實結構):
   - `output[]` 只處理 `type == "message"`(取 `content[].text`)與 `type == "search_results"`(`results[]`);其他 type(例如 `fetch_url_results`)忽略,不視為錯誤。一個回應可能有多個 `search_results` 區塊。
   - message text → `json.loads` → 自行驗證結構(不依賴回應頂層 `text.format`,實測永遠是 `{"type":"text"}`)。
   - HTTP 非 2xx → `UpstreamHTTPError`(帶 status;429 的 body 為 `{"error":{message,type,code}}`,沒有 `status`/`output`)。`status != "completed"`、JSON 解析失敗、結構不符 → `UpstreamInvalidResponse`。
   - 回應中的 `model`(例如 `openai/gpt-6-luna`)才是實際使用的模型,寫入 DB `model` 與 log;不使用設定值。
 - 過濾:丟掉 `name`/`address` 去空白後為空的項目;剩 0 間 → `NoUsableResults`(攜帶模型回傳的 `notes`,可為 null);超過 5 間取前 5。依序給 `id` = `r1`…`r5`。
-- `sourceUrl` 比對:只蒐集 `search_results.results[]` 的 `url`/`title`(實測 `annotations` 全部為空,仍一併蒐集以防未來出現,但不依賴)。以正規化後(去空白、全形轉半形、小寫)的餐廳 `name` 是否出現在來源 `title` 中比對;找不到為 `null`。只使用上游給的 url,不組網址。
+- `sourceUrl` 比對:只蒐集 `search_results.results[]` 的 `url`/`title`/`snippet`(實測 `annotations` 全部為空,仍一併蒐集以防未來出現,但不依賴)。以正規化後(去空白、全形轉半形、小寫)的餐廳 `name` 比對:先找 `title` 含店名的來源,找不到再找 `snippet` 含店名的來源(放寬規則 1 後模型常從彙整文章的摘要中取店,只比 title 時命中率由 90% 降到 73%);皆無為 `null`。只使用上游給的 url,不組網址。因此 `sourceUrl` 可能是提及該店的文章而非店家官方頁面,前端應以「參考來源」呈現。
 - 輸出欄位轉 camelCase 回傳前端。
 
 ### D9. Prompt 組裝與自由文字隔離

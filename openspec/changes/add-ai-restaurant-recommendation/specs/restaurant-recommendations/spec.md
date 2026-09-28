@@ -10,7 +10,7 @@
 
 每間餐廳 SHALL 包含:`id`(同一次推薦內唯一、由系統產生)、`name`、`address`(兩者必為非空字串),以及 `phone`、`rating`、`reviewCount`、`openingHours`、`priceRange`、`avgPricePerPerson`(`{min, max}`)、`cuisineType`、`distanceInfo`(`{transitPoint, walkMinutes}`)、`recommendReason`、`sourceUrl`(查不到時為 `null`)。
 
-`sourceUrl` SHALL 只來自外部 AI 服務回應中附帶的搜尋來源,不得由系統或模型自行組出網址;比對不到對應來源時為 `null`。
+`sourceUrl` SHALL 只來自外部 AI 服務回應中附帶的搜尋來源,不得由系統或模型自行組出網址;比對不到對應來源時為 `null`。`sourceUrl` 代表「提及此店的參考來源」,可能是彙整文章而非店家官方頁面。
 
 #### Scenario: 成功取得推薦
 - **WHEN** 活動擁有者對一個已定案、聚會日期未過的活動送出合法偏好條件,且外部 AI 服務回傳可用結果
@@ -23,6 +23,10 @@
 #### Scenario: 部分結果缺少必要欄位
 - **WHEN** 外部 AI 服務回傳 3 間餐廳,其中 1 間 `address` 為空
 - **THEN** 該間被捨棄,回傳其餘 2 間,本次視為成功
+
+#### Scenario: 店名只出現在來源摘要中
+- **WHEN** 某間餐廳的店名沒有出現在任何來源標題中,但出現在某個來源的摘要中
+- **THEN** 該間的 `sourceUrl` 為該來源的網址
 
 #### Scenario: 來源網址比對不到
 - **WHEN** 某間餐廳在外部服務附帶的搜尋來源中找不到對應項目
