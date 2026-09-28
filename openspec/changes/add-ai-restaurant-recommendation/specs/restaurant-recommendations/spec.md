@@ -147,8 +147,12 @@
 - **THEN** 回傳 504,`code` 為 `AI_RECOMMENDATION_UPSTREAM_TIMEOUT`,不計次
 
 #### Scenario: 外部服務錯誤或回應格式不符
-- **WHEN** 外部服務回傳非成功狀態、回應不符合預期結構,或沒有任何一間可用餐廳
+- **WHEN** 外部服務回傳非成功狀態或回應不符合預期結構
 - **THEN** 回傳 502,`code` 為 `AI_RECOMMENDATION_UPSTREAM_FAILED`,不計次
+
+#### Scenario: 找不到任何可用餐廳
+- **WHEN** 外部服務正常回應,但沒有任何一間同時具備 `name` 與 `address` 的餐廳
+- **THEN** 回傳 502,`code` 為 `AI_RECOMMENDATION_UPSTREAM_FAILED`,body 額外包含 `notes`(外部服務說明找不到的原因,可能為 null),不計次
 
 ### Requirement: 推薦事件輸出結構化 log
 

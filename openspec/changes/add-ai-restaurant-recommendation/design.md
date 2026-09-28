@@ -5,7 +5,7 @@
 - 活動狀態判斷已有純函式 `apps.events.lifecycle.compute_display_status`(`finalized_upcoming` / `finalized_past` / `link_expired` …),`TIME_ZONE = "Asia/Taipei"`、`USE_TZ = True`。
 - 正式環境:gunicorn `--workers 3 --timeout 30`(`Dockerfile`),nginx 為 EC2 host 原生安裝(不在此 repo),**沒有 celery worker**。
 - 前端偏好表單的選項值定義在前端 `src/mocks/aiRecommendDemo.ts`;Perplexity 串接細節見前端 repo《AI選餐廳_Perplexity串接執行計畫書》(System Prompt、User Prompt 樣板、不讓模型產生網址)。
-- Perplexity Agent API(2026-09-28 查官方文件確認):`POST https://api.perplexity.ai/v1/agent`,`Authorization: Bearer`,body 需 `input` + `model`/`preset` 其一,支援 `instructions`、`tools: [{type: "web_search"}]`、`response_format: {type: "json_schema", json_schema: {name, schema}}`、`max_output_tokens`。回應 `output[]` 內有 `type: "message"`(`content[].text` + `annotations[]` 的 `url_citation`)與 `type: "search_results"`(`results[]` 含 `url`/`title`/`snippet`);`usage` 含 token 數與 `cost.total_cost`;`status` 可能為 `completed`/`failed`/`incomplete`。
+- Perplexity Agent API(2026-09-28 查官方文件確認):`POST https://api.perplexity.ai/v1/agent`,`Authorization: Bearer`,body 需 `input` + `model`/`preset` 其一(實際結構差異見 D8 與 `notes/perplexity-benchmark.md`),支援 `instructions`、`tools: [{type: "web_search"}]`、`response_format: {type: "json_schema", json_schema: {name, schema}}`、`max_output_tokens`。回應 `output[]` 內有 `type: "message"`(`content[].text` + `annotations[]` 的 `url_citation`)與 `type: "search_results"`(`results[]` 含 `url`/`title`/`snippet`);`usage` 含 token 數與 `cost.total_cost`;`status` 可能為 `completed`/`failed`/`incomplete`。
 
 ## Goals / Non-Goals
 
@@ -95,17 +95,23 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 `apps/recommendations/engines/__init__.py`:
 - `get_engine() -> RecommendationEngine`:依 `settings.RECOMMENDATION_ENGINE` 回傳實例;目前只有 `perplexity`。
 - `RecommendationEngine.is_available() -> bool`、`recommend(context: RecommendationContext) -> RecommendationResult`。
-- 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`。
+- 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
 - `RECOMMENDATION_ENGINE` 為未知值時,在 `RecommendationsConfig.ready()` 丟 `ImproperlyConfigured`(啟動即失敗,不靜默 fallback)。
 - 測試以 `monkeypatch`/fixture 替換 `get_engine()` 回傳的假引擎;Perplexity 引擎本身的解析/比對邏輯另以「假 HTTP 回應」做單元測試(`monkeypatch` 替換 `requests.post`,不新增 mock 套件、不打網路)。
 
 ### D8. Perplexity 呼叫細節
 
-- HTTP client:`requests`(已是 `google-auth[requests]` 的間接依賴),改為在 `pyproject.toml` 明確宣告;`timeout=(5, 45)`(connect, read)。
-- Request:`model` 由設定 `PERPLEXITY_MODEL` 決定(預設值在 task 1 實測後定案,候選為 `preset: "low"` 或具體模型);`instructions` = 執行計畫書 §6 System Prompt(移除「輸出純 JSON 不要 markdown」這類由 schema 取代的文字);`input` = §7 User Prompt 樣板;`tools: [{"type": "web_search"}]`;`response_format` = json_schema(`restaurants[]` + `notes`,欄位同 spec,`name`/`address` required,**不含任何 url 欄位**)。
-- 解析:取 `output[]` 中 `type == "message"` 的 `content[].text` → `json.loads` → 自行驗證結構(不信任 strict mode)。`status != "completed"`、HTTP 非 2xx、JSON 解析失敗、結構不符 → `UpstreamInvalidResponse`/`UpstreamHTTPError`。
-- 過濾:丟掉 `name`/`address` 去空白後為空的項目;剩 0 間 → `NoUsableResults`;超過 5 間取前 5。依序給 `id` = `r1`…`r5`。
-- `sourceUrl` 比對:蒐集 `output[]` 中 `search_results.results[]` 與 message `annotations[]` 的 `url_citation`,以正規化後(去空白、全形轉半形、小寫)的餐廳 `name` 是否出現在來源 `title` 中比對;找不到為 `null`。只使用上游給的 url,不組網址。比對規則的實際命中率於 task 1 實測記錄,必要時調整正規化方式(不改變「只用上游 url」的原則)。
+- HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`timeout=(5, 45)`(connect, read)。
+- 模型設定:`PERPLEXITY_MODEL` 預設 `preset:low`(task 0.2 實測:延遲中位數 24 秒,`medium` 為 57–94 秒會超過 45 秒逾時)。值以 `preset:` 開頭 → 送 `preset` 欄位;否則視為 `provider/model` → 送 `model` 欄位。其他格式在啟動時 `ImproperlyConfigured`。
+- Request:`instructions` = 執行計畫書 §6 System Prompt,但**規則 1 放寬**(見下);移除「輸出純 JSON 不要 markdown」這類由 schema 取代的文字。`input` = §7 User Prompt 樣板;`tools: [{"type": "web_search"}]`;`response_format` = json_schema(`restaurants[]` + `notes`,欄位同 spec,`name`/`address` required,**不含任何 url 欄位**)。
+- System Prompt 規則 1 改為:「只推薦在本次搜尋結果中實際出現的真實餐廳,不可編造店名或地址。無法確認目前是否營業、是否能容納指定人數或是否符合某項條件時,仍可列出,但必須在 `recommendReason` 或 `notes` 具體註明哪一項無法確認;查不到的欄位填 null。」原規則「只能推薦能確認仍在營業的餐廳」在 `preset:low` 下導致過度保守(PRD 標準情境回傳 0 間)。放寬後以 task 0.2 補充重測驗證。
+- 解析(依 task 0.2 實測的真實結構):
+  - `output[]` 只處理 `type == "message"`(取 `content[].text`)與 `type == "search_results"`(`results[]`);其他 type(例如 `fetch_url_results`)忽略,不視為錯誤。一個回應可能有多個 `search_results` 區塊。
+  - message text → `json.loads` → 自行驗證結構(不依賴回應頂層 `text.format`,實測永遠是 `{"type":"text"}`)。
+  - HTTP 非 2xx → `UpstreamHTTPError`(帶 status;429 的 body 為 `{"error":{message,type,code}}`,沒有 `status`/`output`)。`status != "completed"`、JSON 解析失敗、結構不符 → `UpstreamInvalidResponse`。
+  - 回應中的 `model`(例如 `openai/gpt-6-luna`)才是實際使用的模型,寫入 DB `model` 與 log;不使用設定值。
+- 過濾:丟掉 `name`/`address` 去空白後為空的項目;剩 0 間 → `NoUsableResults`(攜帶模型回傳的 `notes`,可為 null);超過 5 間取前 5。依序給 `id` = `r1`…`r5`。
+- `sourceUrl` 比對:只蒐集 `search_results.results[]` 的 `url`/`title`(實測 `annotations` 全部為空,仍一併蒐集以防未來出現,但不依賴)。以正規化後(去空白、全形轉半形、小寫)的餐廳 `name` 是否出現在來源 `title` 中比對;找不到為 `null`。只使用上游給的 url,不組網址。
 - 輸出欄位轉 camelCase 回傳前端。
 
 ### D9. Prompt 組裝與自由文字隔離
@@ -156,11 +162,12 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 
 ### D12. 新增設定
 
-`AI_RECOMMENDATION_QUOTA_PER_USER`(int,預設 20)、`PERPLEXITY_MODEL`、`PERPLEXITY_TIMEOUT_SECONDS`(預設 45)。`RECOMMENDATION_ENGINE` 預設改 `perplexity`,更新註解。`PERPLEXITY_API_KEY` 空字串 → `is_available()` 為 false → 503 / `serviceAvailable: false`,不影響啟動(`prod.py` 不檢查)。
+`AI_RECOMMENDATION_QUOTA_PER_USER`(int,預設 20)、`PERPLEXITY_MODEL`(預設 `preset:low`,格式見 D8)、`PERPLEXITY_TIMEOUT_SECONDS`(預設 45)。`RECOMMENDATION_ENGINE` 預設改 `perplexity`,更新註解。`PERPLEXITY_API_KEY` 空字串 → `is_available()` 為 false → 503 / `serviceAvailable: false`,不影響啟動(`prod.py` 不檢查)。
 
 ## Risks / Trade-offs
 
-- [上游實際延遲常態 > 45 秒] → task 1 先實測;超標則暫停 implement,回頭走 `opsx:update` 重新 grill D10(改非同步)。
+- [上游實際延遲常態 > 45 秒] → task 0.2 實測 `preset:low` 中位數 24 秒、最大 29 秒,通過;`medium` 以上會超標,若之後需要換更強模型,須先回頭重新 grill D10(改非同步)。
+- [`preset:low` 結果數偏少] → 放寬 prompt 規則 1 並重測(task 0.2 補充);重測後一般條件仍常態少於 3 間,則回頭重新 grill 模型選擇與 D10。0 間時 502 帶 `notes`,不計次。
 - [名稱比對 `sourceUrl` 命中率低] → 前端本來就要處理 `null`;task 1 記錄命中率,只調整正規化,不讓模型產生網址。
 - [同步呼叫佔住 gunicorn thread] → gthread 3×4=12 個 thread,加上每人每月 20 次上限,目前流量下可接受;監看 `latency_ms`。
 - [t2.micro 記憶體] → gthread 共用 process,不增加 worker process 數,記憶體增量小。
