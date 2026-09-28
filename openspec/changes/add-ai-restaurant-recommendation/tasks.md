@@ -41,7 +41,9 @@
 - [x] 4.4 [RED→GREEN] 依 4.2 完成後確認的細節補修:① `requests.ConnectionError` 與其他非逾時的 `requests.RequestException` → `UpstreamHTTPError`(status None)、`error_code` `UPSTREAM_CONNECTION_ERROR`、view 回 502 `AI_RECOMMENDATION_UPSTREAM_FAILED` 且不計次、紀錄 `failed`、log `ai_rec.failed` 帶該 code;例外訊息不含 URL 以外的上游內容。② 回應缺少 `model` / `model` 為空字串 / 非字串 → 用設定值 `PERPLEXITY_MODEL`,推薦照常成功(201、DB 與 log 的 `model` 為設定值)。③ 回應含多個 `message` 項目:第一個無法解析、第二個合法 → 成功並取第二個;兩個都合法 → 取第一個;全部不合法 → `UpstreamInvalidResponse`。先寫測試確認 FAIL;既有斷言「缺 model → 502」「多 message 串接」屬使用者 2026-09-28 決定的行為變更,可同步修改並在 commit 說明 — (auto) `pytest apps/recommendations` 全綠
 - [x] 4.5 [RED→GREEN] `model_fallback` log 旗標:引擎回報是否改用設定值(例如結果物件帶 `model_fallback: bool`),view 在 `ai_rec.succeeded` log 帶 `model_fallback: true`(加入 `LOG_FIELD_WHITELIST`,JSON 布林);一般成功路徑不輸出此欄位;`record_missing` 與 `model_fallback` 可同時出現。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
   - RED 結果(2026-09-28):新增/修改 17 則中 13 則 FAIL(結果物件無 `model_fallback` 屬性、view/併發測試 `dataclasses.replace` 不接受該欄位、formatter 未輸出、白名單與 spec 欄位集合不符);「一般成功/失敗 log 不輸出 `model_fallback`」4 則在 RED 即通過——舊實作本來就沒有此欄位,屬「不可誤帶」回歸測試。code-review 後另補 2 則真實引擎 + 假 HTTP 的端到端測試(GREEN 後補,實作未再變動)。
-- [ ] 4.3 本機端到端:本機 `runserver` + 真實 key,用一個已定案、日期未過的活動打 `POST /api/events/{id}/restaurant-recommendations/`(空 body 與帶條件各一次),確認 201、`sourceUrl` 有值或為 null、`GET` quota 的 `used` 增加;再把 key 改錯確認回 502、`used` 不變 — (manual)需要真實 key
+- [x] 4.3 本機端到端:本機 `runserver` + 真實 key,用一個已定案、日期未過的活動打 `POST /api/events/{id}/restaurant-recommendations/`(空 body 與帶條件各一次),確認 201、`sourceUrl` 有值或為 null、`GET` quota 的 `used` 增加;再把 key 改錯確認回 502、`used` 不變 — (manual)需要真實 key
+  - 結果(2026-09-28,`preset:low`):空 body 201/3 間/29.8 秒、帶條件 201/3 間/16.2 秒,quota `used` 0→1→2;錯誤 key 502 `AI_RECOMMENDATION_UPSTREAM_FAILED`、`used` 不變、log `upstream_status: 401` 且無上游原文;6 間 `sourceUrl` 皆有值(食記/Tripadvisor)。發現 POST 回應 `quota` 缺 `serviceAvailable`,由 4.6 修正。
+- [ ] 4.6 [RED→GREEN] POST 成功回應的 `quota` 與 quota API 結構一致:補上 `serviceAvailable`(成功時為 true),確保兩者欄位集合完全相同(以測試比對兩邊的 key 集合)。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
 
 ## 5. 正式環境設定
 
