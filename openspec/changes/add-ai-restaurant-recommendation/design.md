@@ -162,7 +162,7 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 
 ### D12. 新增設定
 
-`AI_RECOMMENDATION_QUOTA_PER_USER`(int,預設 20)、`PERPLEXITY_MODEL`(預設 `preset:low`,格式見 D8)、`PERPLEXITY_TIMEOUT_SECONDS`(預設 45)。`RECOMMENDATION_ENGINE` 預設改 `perplexity`,更新註解。`PERPLEXITY_API_KEY` 空字串 → `is_available()` 為 false → 503 / `serviceAvailable: false`,不影響啟動(`prod.py` 不檢查)。
+`AI_RECOMMENDATION_QUOTA_PER_USER`(int,預設 20)、`PERPLEXITY_MODEL`(預設 `preset:low`,格式見 D8)、`PERPLEXITY_TIMEOUT_SECONDS`(預設 45)。`RECOMMENDATION_ENGINE` 預設改 `perplexity`,更新註解。`PERPLEXITY_API_KEY` 空字串或只有空白 → `is_available()` 為 false → 503 / `serviceAvailable: false`,不影響啟動(`prod.py` 不檢查)。
 
 ## Risks / Trade-offs
 

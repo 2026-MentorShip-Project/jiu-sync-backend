@@ -23,7 +23,7 @@ PRD(前端 repo `docs/auth-&-AI-feature-2026-0901/`)把產品收斂成「成團�
 
 ### Modified Capabilities
 
-(無 — 不改變既有活動、登入、錯誤格式的行為;新錯誤代碼沿用既有 `api-error-format` 的統一形狀)
+(無 — 不改變既有活動、登入、錯誤格式的行為;新錯誤代碼沿用既有的統一錯誤回應形狀)
 
 ## Impact
 
