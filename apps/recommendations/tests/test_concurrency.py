@@ -16,6 +16,7 @@ DB connection(寫法比照 apps/events/tests/test_views.py 的
 所有等待都有逾時,實作有 bug 時測試會失敗而不是卡住。
 """
 
+import json
 import logging
 import threading
 from datetime import timedelta
@@ -30,6 +31,7 @@ from apps.events.models import Event
 from apps.recommendations import quota as quota_module
 from apps.recommendations import views as views_module
 from apps.recommendations.engines import UpstreamTimeout
+from apps.recommendations.logging import JsonFormatter
 from apps.recommendations.models import RestaurantRecommendationRequest
 from apps.recommendations.quota import quota_period_for
 from apps.recommendations.tests.test_views import (
@@ -449,8 +451,19 @@ def _delete_event(event_id):
     return lambda: Event.objects.filter(pk=event_id).delete()
 
 
+# 紀錄消失時 log 的 `event`/等級/`error_code` 與一般情況相同,只另帶布林
+# `record_missing: true`(design.md D4;使用者 2026-09-28 決定,取代原先以
+# `error_code=RECORD_MISSING` 覆蓋並升為 WARNING 的寫法)。
+
+
+def _json_line(record):
+    return json.loads(JsonFormatter().format(record))
+
+
 @pytest.mark.django_db
-def test_record_deleted_during_success_still_returns_201_and_warns(engine, caplog):
+def test_record_deleted_during_success_still_returns_201_and_flags_record_missing(
+    engine, caplog
+):
     user = _create_user()
     event = _create_finalized_event(user)
     engine.side_effect = _delete_event(event.id)
@@ -463,13 +476,18 @@ def test_record_deleted_during_success_still_returns_201_and_warns(engine, caplo
     assert not RestaurantRecommendationRequest.objects.exists()
 
     [record] = _events(caplog, "ai_rec.succeeded")
-    assert record.levelno == logging.WARNING
-    assert record.error_code == "RECORD_MISSING"
-    assert record.request_id == response.json()["id"]
+    assert record.levelno == logging.INFO
+    line = _json_line(record)
+    assert line["record_missing"] is True
+    assert "error_code" not in line
+    assert line["request_id"] == response.json()["id"]
+    assert line["restaurant_count"] == 2
 
 
 @pytest.mark.django_db
-def test_record_deleted_during_upstream_failure_still_returns_error_and_warns(engine, caplog):
+def test_record_deleted_during_upstream_failure_keeps_error_code_and_flags_record_missing(
+    engine, caplog
+):
     user = _create_user()
     event = _create_finalized_event(user)
     engine.side_effect = _delete_event(event.id)
@@ -484,12 +502,16 @@ def test_record_deleted_during_upstream_failure_still_returns_error_and_warns(en
 
     [record] = _events(caplog, "ai_rec.failed")
     assert record.levelno == logging.WARNING
-    assert record.error_code == "RECORD_MISSING"
+    line = _json_line(record)
+    assert line["error_code"] == "UPSTREAM_TIMEOUT"
+    assert line["record_missing"] is True
+    assert line["exc_type"] == "UpstreamTimeout"
 
 
 @pytest.mark.django_db
-def test_record_deleted_during_unexpected_error_still_returns_500_and_logs(engine, caplog):
-    """非預期例外依 spec 維持 ERROR 等級(不因紀錄消失而降級),同樣帶 RECORD_MISSING。"""
+def test_record_deleted_during_unexpected_error_keeps_error_level_and_flags_record_missing(
+    engine, caplog
+):
     user = _create_user()
     event = _create_finalized_event(user)
     engine.side_effect = _delete_event(event.id)
@@ -503,4 +525,32 @@ def test_record_deleted_during_unexpected_error_still_returns_500_and_logs(engin
     assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
     [record] = _events(caplog, "ai_rec.failed")
     assert record.levelno == logging.ERROR
-    assert record.error_code == "RECORD_MISSING"
+    line = _json_line(record)
+    assert line["error_code"] == "UNEXPECTED_ERROR"
+    assert line["record_missing"] is True
+    assert line["exc_type"] == "RuntimeError"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("error", "event_name"),
+    [
+        (None, "ai_rec.succeeded"),
+        (UpstreamTimeout("read timeout"), "ai_rec.failed"),
+        (RuntimeError("boom"), "ai_rec.failed"),
+    ],
+    ids=["success", "upstream-timeout", "unexpected-error"],
+)
+def test_record_missing_is_absent_when_record_still_exists(engine, caplog, error, event_name):
+    user = _create_user()
+    event = _create_finalized_event(user)
+    engine.error = error
+    caplog.set_level(logging.INFO, logger="apps.recommendations")
+    client = _auth_client(user)
+    client.raise_request_exception = False
+
+    client.post(_url(event.id), {}, format="json")
+
+    assert RestaurantRecommendationRequest.objects.count() == 1
+    [record] = _events(caplog, event_name)
+    assert "record_missing" not in _json_line(record)

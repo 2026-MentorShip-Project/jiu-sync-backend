@@ -143,14 +143,14 @@ enum 欄位對應固定的中文描述片段(例如 `同事` → 「同事聚餐
 建議的 Grafana 查詢(寫進 PR 說明,非程式碼):
 
 ```logql
-# 成功次數(每 5 分鐘)
-sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.succeeded" [5m]))
-# 失敗率(1 小時)
-sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.failed" [1h]))
-  / sum(count_over_time({container=~".*app.*"} | json | event=~"ai_rec.(succeeded|failed)" [1h]))
+# 成功次數(每 5 分鐘;排除紀錄已被刪除、未計次的 record_missing="true")
+sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.succeeded" | record_missing!="true" [5m]))
+# 失敗率(1 小時;同樣排除 record_missing="true")
+sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.failed" | record_missing!="true" [1h]))
+  / sum(count_over_time({container=~".*app.*"} | json | event=~"ai_rec.(succeeded|failed)" | record_missing!="true" [1h]))
 # 延遲 P95
 quantile_over_time(0.95, {container=~".*app.*"} | json | event="ai_rec.succeeded" | unwrap latency_ms [1h])
-# 每日費用
+# 每日費用(不排除 record_missing:紀錄消失時上游仍確實收費)
 sum(sum_over_time({container=~".*app.*"} | json | event="ai_rec.succeeded" | unwrap cost_usd [1d]))
 ```
 

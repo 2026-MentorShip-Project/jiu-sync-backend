@@ -32,6 +32,7 @@ LOG_FIELD_WHITELIST = frozenset(
         "used",
         "limit",
         "period",
+        "record_missing",
     }
 )
 

@@ -65,10 +65,6 @@ class AIRecommendationQuotaView(APIView):
 
 ERROR_DETAIL_MAX_LENGTH = 2000
 
-# 條件式 update 更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時,
-# log 帶的 error_code(design.md D4)。不是 DB 的 ErrorCode——此時已沒有紀錄可寫。
-RECORD_MISSING = "RECORD_MISSING"
-
 _NOT_FINALIZED_STATUSES = {"voting_open", "voting_closed_pending", "cancelled"}
 
 # EngineError 子類別 → (HTTP 狀態, API code, 訊息)。
@@ -118,14 +114,20 @@ def _usage_number(usage, *path):
     return value if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
-def _log_extra(event_name, record, **fields):
-    return {
+def _log_extra(event_name, record, *, record_missing=False, **fields):
+    """`record_missing=True`:條件式 update 更新 0 列(紀錄在請求期間因活動或使用者
+    刪除被 cascade 刪除)。log 的 event/等級/error_code 維持原路徑的值,只另帶布林
+    `record_missing: true`(design.md D4);其他情況不輸出此欄位。"""
+    extra = {
         "event": event_name,
         "request_id": str(record.id),
         "user_id": str(record.user_id),
         "event_id": record.event_id,
         **fields,
     }
+    if record_missing:
+        extra["record_missing"] = True
+    return extra
 
 
 class RestaurantRecommendationView(APIView):
@@ -218,19 +220,13 @@ class RestaurantRecommendationView(APIView):
             "cost_usd": _usage_number(result.usage, "cost", "total_cost"),
             "model": result.model,
         }
-        if updated:
-            logger.info(
-                "ai_rec.succeeded",
-                extra=_log_extra("ai_rec.succeeded", record, **success_fields),
-            )
-        else:
-            # 紀錄已被 cascade 刪除:仍回 201 與結果,本次不計次(D4 可接受的極端情況)。
-            logger.warning(
-                "ai_rec.succeeded",
-                extra=_log_extra(
-                    "ai_rec.succeeded", record, error_code=RECORD_MISSING, **success_fields
-                ),
-            )
+        # 紀錄已被 cascade 刪除時仍回 201 與結果,本次不計次(D4 可接受的極端情況)。
+        logger.info(
+            "ai_rec.succeeded",
+            extra=_log_extra(
+                "ai_rec.succeeded", record, record_missing=not updated, **success_fields
+            ),
+        )
         return Response(
             {
                 "id": str(record.id),
@@ -332,11 +328,7 @@ class RestaurantRecommendationView(APIView):
             latency_ms=latency_ms,
             completed_at=timezone.now(),
         )
-        if not updated:
-            # 紀錄已被 cascade 刪除:照常回錯誤,log 改帶 RECORD_MISSING 且至少 WARNING
-            # (非預期例外維持 ERROR,不降級)。
-            error_code = RECORD_MISSING
-            level = max(level, logging.WARNING)
+        # 紀錄已被 cascade 刪除時照常回錯誤,log 保留原等級與 error_code。
         logger.log(
             level,
             "ai_rec.failed",
@@ -347,6 +339,7 @@ class RestaurantRecommendationView(APIView):
                 error_code=error_code,
                 latency_ms=latency_ms,
                 upstream_status=upstream_status,
+                record_missing=not updated,
             ),
         )
 
