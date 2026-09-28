@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 Status = RestaurantRecommendationRequest.Status
 
 
-def serialize_quota(quota):
-    """額度的 API 形狀。推薦成功回應的 ``quota`` 欄位也用這個(spec「查詢當月額度」)。"""
+def serialize_quota(quota, *, service_available):
+    """額度的 API 形狀。推薦成功回應的 ``quota`` 欄位也用這個(spec「查詢當月額度」)。
+
+    兩個端點的欄位集合必須完全相同,所以 ``serviceAvailable`` 一律在這裡組出,
+    呼叫端只提供值(task 4.6)。
+    """
     return {
         "period": quota.period,
         "limit": quota.limit,
@@ -41,6 +45,7 @@ def serialize_quota(quota):
         "remaining": quota.remaining,
         "available": quota.available,
         "resetsAt": quota.resets_at.isoformat(),
+        "serviceAvailable": service_available,
     }
 
 
@@ -54,9 +59,12 @@ class AIRecommendationQuotaView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        body = serialize_quota(compute_quota(request.user))
-        body["serviceAvailable"] = get_engine().is_available()
-        return Response(body)
+        return Response(
+            serialize_quota(
+                compute_quota(request.user),
+                service_available=get_engine().is_available(),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +249,8 @@ class RestaurantRecommendationView(APIView):
                 "id": str(record.id),
                 **result_body,
                 "resolvedPreferences": preferences,
-                "quota": serialize_quota(compute_quota(user, now=now)),
+                # 走到成功路徑代表開頭 is_available() 已為 true。
+                "quota": serialize_quota(compute_quota(user, now=now), service_available=True),
             },
             status=status.HTTP_201_CREATED,
         )

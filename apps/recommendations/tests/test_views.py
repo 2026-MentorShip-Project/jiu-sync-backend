@@ -208,7 +208,10 @@ def test_success_returns_201_with_restaurants_preferences_and_updated_quota(fake
     assert body["resolvedPreferences"]["location"] == "台北車站"
     assert body["quota"]["used"] == 1
     assert body["quota"]["remaining"] == 19
-    assert set(body["quota"]) == {"period", "limit", "used", "remaining", "available", "resetsAt"}
+    assert set(body["quota"]) == {
+        "period", "limit", "used", "remaining", "available", "resetsAt", "serviceAvailable",
+    }
+    assert body["quota"]["serviceAvailable"] is True
     assert len(fake_engine.calls) == 1
 
     record = RestaurantRecommendationRequest.objects.get()
@@ -225,6 +228,19 @@ def test_success_returns_201_with_restaurants_preferences_and_updated_quota(fake
     assert record.created_at >= before
     assert record.quota_period == record.created_at.astimezone(TAIPEI).strftime("%Y-%m")
     assert record.error_code is None
+
+
+def test_success_quota_has_same_shape_and_values_as_quota_api(fake_engine):
+    """spec「查詢當月額度」:推薦成功回應的 `quota` 與 quota API 結構相同(task 4.6)。"""
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    post_quota = client.post(_url(event.id), {}, format="json").json()["quota"]
+    get_quota = client.get(QUOTA_URL).json()
+
+    assert set(post_quota) == set(get_quota)
+    assert post_quota == get_quota
 
 
 # ---------------------------------------------------------------------------

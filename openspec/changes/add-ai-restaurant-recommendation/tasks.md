@@ -43,7 +43,7 @@
   - RED 結果(2026-09-28):新增/修改 17 則中 13 則 FAIL(結果物件無 `model_fallback` 屬性、view/併發測試 `dataclasses.replace` 不接受該欄位、formatter 未輸出、白名單與 spec 欄位集合不符);「一般成功/失敗 log 不輸出 `model_fallback`」4 則在 RED 即通過——舊實作本來就沒有此欄位,屬「不可誤帶」回歸測試。code-review 後另補 2 則真實引擎 + 假 HTTP 的端到端測試(GREEN 後補,實作未再變動)。
 - [x] 4.3 本機端到端:本機 `runserver` + 真實 key,用一個已定案、日期未過的活動打 `POST /api/events/{id}/restaurant-recommendations/`(空 body 與帶條件各一次),確認 201、`sourceUrl` 有值或為 null、`GET` quota 的 `used` 增加;再把 key 改錯確認回 502、`used` 不變 — (manual)需要真實 key
   - 結果(2026-09-28,`preset:low`):空 body 201/3 間/29.8 秒、帶條件 201/3 間/16.2 秒,quota `used` 0→1→2;錯誤 key 502 `AI_RECOMMENDATION_UPSTREAM_FAILED`、`used` 不變、log `upstream_status: 401` 且無上游原文;6 間 `sourceUrl` 皆有值(食記/Tripadvisor)。發現 POST 回應 `quota` 缺 `serviceAvailable`,由 4.6 修正。
-- [ ] 4.6 [RED→GREEN] POST 成功回應的 `quota` 與 quota API 結構一致:補上 `serviceAvailable`(成功時為 true),確保兩者欄位集合完全相同(以測試比對兩邊的 key 集合)。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
+- [x] 4.6 [RED→GREEN] POST 成功回應的 `quota` 與 quota API 結構一致:補上 `serviceAvailable`(成功時為 true),確保兩者欄位集合完全相同(以測試比對兩邊的 key 集合)。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
 
 ## 5. 正式環境設定
 
