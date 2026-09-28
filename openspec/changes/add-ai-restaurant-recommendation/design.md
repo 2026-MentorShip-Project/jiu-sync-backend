@@ -96,6 +96,7 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 - `get_engine() -> RecommendationEngine`:依 `settings.RECOMMENDATION_ENGINE` 回傳實例;目前只有 `perplexity`。
 - `RecommendationEngine.is_available() -> bool`、`recommend(context: RecommendationContext) -> RecommendationResult`。
 - 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
+- **例外訊息不得夾帶外部或使用者文字**:引擎丟出的 `EngineError` 子類別,訊息只能是自行撰寫的摘要(例如 `upstream HTTP 429`、`JSON decode failed at char 1532`、`missing field restaurants`),不得包含上游回應內容、prompt 或使用者輸入。上游原始回應只經由例外的獨立屬性(例如 `raw_detail`)交給 view 寫入 DB `error_detail`(截斷 2,000 字),不進 `str(exc)`。理由:D11 的 formatter 會原樣輸出 `exc_message`/`traceback`;規則由測試守住(task 4.1 ⑬、2.1 ⑲)。第三方例外(`requests.Timeout`/`ConnectionError`)訊息只含 URL 與錯誤類型,維持原樣。
 - `RECOMMENDATION_ENGINE` 為未知值時,在 `RecommendationsConfig.ready()` 丟 `ImproperlyConfigured`(啟動即失敗,不靜默 fallback)。
 - 測試以 `monkeypatch`/fixture 替換 `get_engine()` 回傳的假引擎;Perplexity 引擎本身的解析/比對邏輯另以「假 HTTP 回應」做單元測試(`monkeypatch` 替換 `requests.post`,不新增 mock 套件、不打網路)。
 
@@ -132,8 +133,8 @@ enum 欄位對應固定的中文描述片段(例如 `同事` → 「同事聚餐
 
 目標是讓 Loki 能直接用欄位過濾並以 LogQL 算出指標,不引入 Prometheus(本 change 範圍)。
 
-- 在 `config/settings/base.py` 新增 `LOGGING`:只設定 `apps.recommendations` logger(level INFO、`propagate: False`),handler 為 stdout `StreamHandler`,formatter 為自寫的 `apps.recommendations.logging.JsonFormatter`(繼承內建 `logging.Formatter`,不新增套件)。其他 logger 維持 Django 預設,不改變既有輸出。
-- 呼叫方式固定為 `logger.info("ai_rec.succeeded", extra={"event": "ai_rec.succeeded", ...})`;formatter 輸出 `timestamp`(ISO 8601,含時區)、`level`、`logger`、`event` 與 `extra` 中的白名單欄位;有例外時加上 `exc_type`、`exc_message`、`traceback`。數值欄位保持 JSON 數字。
+- 在 `config/settings/base.py` 新增 `LOGGING`:只設定 `apps.recommendations` logger(level INFO、`propagate: False`),handler 為 `StdoutStreamHandler`(`StreamHandler` 子類別,每次寫入時取當下的 `sys.stdout`),formatter 為自寫的 `apps.recommendations.logging.JsonFormatter`(繼承內建 `logging.Formatter`,不新增套件)。其他 logger 維持 Django 預設,不改變既有輸出。
+- 呼叫方式固定為 `logger.info("ai_rec.succeeded", extra={"event": "ai_rec.succeeded", ...})`;formatter 輸出 `timestamp`(UTC ISO 8601,含時區)、`level`、`logger`、`event` 與 `extra` 中的白名單欄位;有例外時加上 `exc_type`、`exc_message`、`traceback`(內容安全性由 D7 的例外訊息規則保證)。數值欄位保持 JSON 數字;NaN/Infinity 輸出 null;序列化失敗時改輸出只含固定欄位與 `format_error` 的一行,不丟失事件。
 - 事件名稱與欄位見 spec「推薦事件輸出結構化 log」。`cost_usd` 取自上游 `usage.cost.total_cost`,`total_tokens` 取自 `usage.total_tokens`,缺少時為 `null`。
 - 不記 prompt、使用者自由文字、上游原始回應、API key(這些在 DB,用 `request_id` 查)。formatter 採白名單欄位輸出,避免之後有人在 `extra` 塞入敏感資料就直接被印出。
 - 替代:全站改 JSON log——會改變 accounts/events/exceptions 既有輸出格式,屬於跨 app 的觀測性決策,另開 change(已記為待辦)。替代:Prometheus metrics(`/metrics` endpoint)——需新增套件、保護 endpoint、另架收集端,以本功能流量(每人每月 ≤ 20 次)不划算。
