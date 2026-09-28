@@ -77,7 +77,7 @@ else:
 - 鎖只包住「計數 + 建 pending」這一小段,呼叫上游時不持有 DB 鎖與 transaction。
 - `pending` 本身就是預留:同一使用者後續請求在鎖內計數時一定看得到它,所以不會超用。
 - 失敗的補償就是把 `pending` 改成 `failed`(不再計數),不存在「加回去」的算術。
-- 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。
+- 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時:成功路徑仍回 201 與結果,失敗路徑照常回錯誤,兩者都記一筆 WARNING(`event` 沿用 `ai_rec.succeeded`/`ai_rec.failed`,另帶 `error_code=RECORD_MISSING`);此時該次不計次,屬可接受的極端情況。
 - 為什麼鎖 `User` 列而不是鎖紀錄表:要鎖的是「這個使用者的額度」,紀錄表在額度為 0 筆時沒有列可鎖(phantom),`User` 列一定存在。
 - 替代:Redis `SET NX` 鎖——會形成第二份狀態、需要處理解鎖失敗與 TTL,且 Redis 失敗時仍需 DB 兜底,見 grill Q11 討論,不採用。
 - 替代:先扣後不退——上游失敗成本轉嫁給使用者,不採用。
@@ -96,6 +96,7 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 - `get_engine() -> RecommendationEngine`:依 `settings.RECOMMENDATION_ENGINE` 回傳實例;目前只有 `perplexity`。
 - `RecommendationEngine.is_available() -> bool`、`recommend(context: RecommendationContext) -> RecommendationResult`。
 - 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
+- **引擎對外只丟 `EngineError`**:解析上游回應時的任何非預期例外(`KeyError`、`TypeError`、`AttributeError`、`ValueError` 等)都必須在引擎內捕捉並包成 `UpstreamInvalidResponse`(訊息為自寫摘要,原文放 `raw_detail`),避免第三方或內建例外的訊息夾帶上游文字進入 log。
 - **例外訊息不得夾帶外部或使用者文字**:引擎丟出的 `EngineError` 子類別,訊息只能是自行撰寫的摘要(例如 `upstream HTTP 429`、`JSON decode failed at char 1532`、`missing field restaurants`),不得包含上游回應內容、prompt 或使用者輸入。上游原始回應只經由例外的獨立屬性(例如 `raw_detail`)交給 view 寫入 DB `error_detail`(截斷 2,000 字),不進 `str(exc)`。理由:D11 的 formatter 會原樣輸出 `exc_message`/`traceback`;規則由測試守住(task 4.1 ⑬、2.1 ⑲)。第三方例外(`requests.Timeout`/`ConnectionError`)訊息只含 URL 與錯誤類型,維持原樣。
 - `RECOMMENDATION_ENGINE` 為未知值時,在 `RecommendationsConfig.ready()` 丟 `ImproperlyConfigured`(啟動即失敗,不靜默 fallback)。
 - 測試以 `monkeypatch`/fixture 替換 `get_engine()` 回傳的假引擎;Perplexity 引擎本身的解析/比對邏輯另以「假 HTTP 回應」做單元測試(`monkeypatch` 替換 `requests.post`,不新增 mock 套件、不打網路)。
@@ -121,7 +122,7 @@ enum 欄位對應固定的中文描述片段(例如 `同事` → 「同事聚餐
 
 活動資訊帶入:
 - 地點:`request.location` 優先,否則 `event.location`,皆空 → `LOCATION_REQUIRED`。
-- 人數:`request.partySize` 優先,否則 = 定案時段 `availability == "available"` 且未軟刪除的回覆數,轉成人數描述。
+- 人數:`attendeeCount` = 定案時段 `availability == "available"` 且未軟刪除的回覆數(一律回傳)。`partySize` = `request.partySize` 優先,否則由 `attendeeCount` 換算成人數規格字串(算法同前端 `partySizeForCount`);`attendeeCount` 為 0 且未選時 `partySize` 為 null,prompt 不帶人數。`resolvedPreferences.partySize` 型別固定為字串或 null,避免前端處理兩種型別。
 - 用餐時間:定案時段的 `date` +(`time` 或 `label`,皆無則只給日期),要求 AI 確認該時段有營業。
 
 ### D10. 同步呼叫與 gunicorn 設定

@@ -76,7 +76,7 @@
 - `dietary.restrictions`:字串陣列,最多 5 項,每項 1–30 字,可為任意自訂值
 - `customPrompt`:字串,最多 200 字
 
-字串欄位 SHALL 去除前後空白後再驗證,去除後為空字串視同未填。
+字串欄位 SHALL 去除前後空白後再驗證,去除後為空字串視同未填。清單欄位 SHALL 先去除空白項目,再檢查項目數上限與重複。`resolvedPreferences.partySize` 一律為人數規格字串或 null(不會是數字),實際人數另由 `attendeeCount`(整數)提供。
 
 #### Scenario: 完全不填(略過,使用預設推薦)
 - **WHEN** 送出空 body,且活動有設定地點
@@ -92,11 +92,23 @@
 
 #### Scenario: 未選人數時以出席人數帶入
 - **WHEN** 請求未填 `partySize`
-- **THEN** `resolvedPreferences.partySize` 為定案時段中回覆「可以」的參與者人數(與前端預填人數規格的算法一致)
+- **THEN** `resolvedPreferences.attendeeCount` 為定案時段中回覆「可以」的參與者人數,`resolvedPreferences.partySize` 為依該人數換算的人數規格字串(≤2 → `2 人`、≤4 → `3-4 人`、≤8 → `5-8 人`、≤19 → `9 人以上（多人）`、其餘 → `20 人以上（團體）`,與前端預填算法一致)
+
+#### Scenario: 使用者有選人數
+- **WHEN** 請求帶 `partySize: "5-8 人"`
+- **THEN** `resolvedPreferences.partySize` 為 `5-8 人`,`attendeeCount` 仍為活動實際回覆「可以」的人數
+
+#### Scenario: 沒有人回覆可以
+- **WHEN** 請求未填 `partySize`,且定案時段沒有任何「可以」的回覆
+- **THEN** `resolvedPreferences.partySize` 為 null、`attendeeCount` 為 0,推薦條件不包含人數
 
 #### Scenario: 欄位不合法
 - **WHEN** `relationship` 不在允許值內,或 `dietary.cuisines` 超過 5 項,或 `customPrompt` 超過 200 字
 - **THEN** 回傳 400,`errors` 列出每個不合法欄位,不呼叫外部服務、不計次
+
+#### Scenario: 清單含空白項目
+- **WHEN** `dietary.cuisines` 送 6 項,其中 1 項是空白字串
+- **THEN** 空白項目被忽略,視為 5 項,請求被接受
 
 #### Scenario: 自訂料理
 - **WHEN** 送出 `dietary.cuisines: ["泰式", "火鍋"]`
