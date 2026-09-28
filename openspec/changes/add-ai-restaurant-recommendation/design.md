@@ -3,7 +3,7 @@
 - `apps.recommendations` 已註冊、已掛在 `config/urls.py`,但 model/view/serializer 全是空殼。
 - `config/settings/base.py` 已有 `RECOMMENDATION_ENGINE`(預設 `google_places_gemini`,註解寫 Perplexity 為「尚未實作」)與 `PERPLEXITY_API_KEY`。
 - 活動狀態判斷已有純函式 `apps.events.lifecycle.compute_display_status`(`finalized_upcoming` / `finalized_past` / `link_expired` …),`TIME_ZONE = "Asia/Taipei"`、`USE_TZ = True`。
-- 正式環境:gunicorn `--workers 3 --timeout 30`(`Dockerfile`),nginx 為 EC2 host 原生安裝(不在此 repo),**沒有 celery worker**。
+- 正式環境:gunicorn 原為 `--workers 3 --timeout 30`(`Dockerfile`,task 5.1 已改為 gthread,見 D10),nginx 為 EC2 host 原生安裝(不在此 repo),**沒有 celery worker**。
 - 前端偏好表單的選項值定義在前端 `src/mocks/aiRecommendDemo.ts`;Perplexity 串接細節見前端 repo《AI選餐廳_Perplexity串接執行計畫書》(System Prompt、User Prompt 樣板、不讓模型產生網址)。
 - Perplexity Agent API(2026-09-28 查官方文件確認):`POST https://api.perplexity.ai/v1/agent`,`Authorization: Bearer`,body 需 `input` + `model`/`preset` 其一(實際結構差異見 D8 與 `notes/perplexity-benchmark.md`),支援 `instructions`、`tools: [{type: "web_search"}]`、`response_format: {type: "json_schema", json_schema: {name, schema}}`、`max_output_tokens`。回應 `output[]` 內有 `type: "message"`(`content[].text` + `annotations[]` 的 `url_citation`)與 `type: "search_results"`(`results[]` 含 `url`/`title`/`snippet`);`usage` 含 token 數與 `cost.total_cost`;`status` 可能為 `completed`/`failed`/`incomplete`。
 
@@ -82,9 +82,15 @@ else:
 - 替代:Redis `SET NX` 鎖——會形成第二份狀態、需要處理解鎖失敗與 TTL,且 Redis 失敗時仍需 DB 兜底,見 grill Q11 討論,不採用。
 - 替代:先扣後不退——上游失敗成本轉嫁給使用者,不採用。
 
-### D5. `pending` 過期時間 5 分鐘,必須大於任何請求的存活上限
+### D5. `pending` 過期時間 5 分鐘,必須大於任何請求的存活上限(由引擎整體期限保證)
 
-gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,因此活著的請求不可能比自己的 `pending` 活得更久,不會因過期而多放出額度。process 被殺掉留下的 `pending` 5 分鐘後自動不計數,不需要清理排程(紀錄維持 `pending` 狀態,可從資料看出異常終止)。設定集中為常數,並在註解寫明與 gunicorn/上游逾時的不等式關係。
+不變式:活著的請求不可能比自己的 `pending` 活得更久,否則 `pending` 過期後額度被多放出一次,原請求之後又成功計次,造成超用。
+
+- **不依賴 gunicorn**:task 5.1 實測確認,gthread worker 的 `--timeout` 只檢查 worker 心跳,不限制單一請求時長(gunicorn 26.2.0 `config.py`:「not tied to the length of time required to handle a single request」)。`requests` 的 `timeout=(5, 45)` 也只限制「每次讀取」,上游緩慢分段回傳時整體仍可無限延長。
+- **引擎整體期限**:Perplexity 呼叫改用 `stream=True` 逐塊讀取,以 `time.monotonic()` 計算自送出請求起的總耗時,超過 `PERPLEXITY_TIMEOUT_SECONDS`(預設 45)即中斷連線並丟 `UpstreamTimeout`(504、不計次)。connect timeout 5 秒、每次讀取 timeout 也不超過剩餘期限。因此單次請求在引擎內的存活上限 ≈ 整體期限 + 少量解析時間。
+- **啟動時檢查**:`AppConfig.ready()` 檢查 `PENDING_EXPIRY` > `PERPLEXITY_TIMEOUT_SECONDS` + 60 秒緩衝(涵蓋前置檢查、DB、解析),不成立即 `ImproperlyConfigured`。60/45/5 分鐘這組數字的關係由這個檢查綁住,文件與註解只描述、不當作保證。
+- process 被殺掉留下的 `pending` 5 分鐘後自動不計數,不需要清理排程(紀錄維持 `pending` 狀態,可從資料看出異常終止)。
+- gunicorn `--timeout 60` 仍保留,用途改為偵測卡死的 worker,與額度正確性無關。
 
 ### D6. 月份以 `Asia/Taipei` 自然月,歸屬建立時月份
 
@@ -103,7 +109,7 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 
 ### D8. Perplexity 呼叫細節
 
-- HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`timeout=(5, 45)`(connect, read)。
+- HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`stream=True`,connect timeout 5 秒,每次讀取 timeout 取「剩餘整體期限」;整體期限見 D5。
 - 模型設定:`PERPLEXITY_MODEL` 預設 `preset:low`(task 0.2 實測:延遲中位數 24 秒,`medium` 為 57–94 秒會超過 45 秒逾時)。值以 `preset:` 開頭 → 送 `preset` 欄位;否則視為 `provider/model` → 送 `model` 欄位。其他格式在啟動時 `ImproperlyConfigured`。
 - Request:`instructions` = 執行計畫書 §6 System Prompt,但**規則 1 放寬**(見下);移除「輸出純 JSON 不要 markdown」這類由 schema 取代的文字。`input` = §7 User Prompt 樣板;`tools: [{"type": "web_search"}]`;`response_format` = json_schema(`restaurants[]` + `notes`,欄位同 spec,`name`/`address` required,**不含任何 url 欄位**)。
 - System Prompt 規則 1 改為:「只推薦在本次搜尋結果中實際出現的真實餐廳,不可編造店名或地址。無法確認目前是否營業、是否能容納指定人數或是否符合某項條件時,仍可列出,但必須在 `recommend_reason` 或 `notes` 具體註明哪一項無法確認;查不到的欄位填 null。」原規則「只能推薦能確認仍在營業的餐廳」在 `preset:low` 下導致過度保守(PRD 標準情境回傳 0 間)。放寬後以 task 0.2b 重測驗證:C1–C4 有 ≥3 間由 2/4 升為 3/4,延遲中位數 16 秒,人工核對無編造店家。

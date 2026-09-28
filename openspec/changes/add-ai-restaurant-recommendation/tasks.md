@@ -48,6 +48,7 @@
 ## 5. 正式環境設定
 
 - [x] 5.1 `Dockerfile` gunicorn 改為 `--worker-class gthread --workers 3 --threads 4 --timeout 60`(D10);`docker build` 成功且容器內 `gunicorn --check-config` 通過 — (auto)
+- [ ] 5.3 [RED→GREEN] 引擎整體期限(design.md D5 修訂):① 上游以慢速分段回傳(假 response 的 `iter_content` 每塊之間推進 monotonic 時鐘,每塊都在單次讀取 timeout 內,但總和超過 `PERPLEXITY_TIMEOUT_SECONDS`)→ `UpstreamTimeout`,且回應被關閉;② 總時間剛好在期限內 → 正常成功;③ `requests.post` 以 `stream=True` 呼叫、connect timeout 5、read timeout 不超過剩餘期限;④ 回應 body 讀完後再解析,既有 4.x 測試全部仍通過(若既有測試的 mock 只提供 `.json()`/`.text`,可調整 mock 以支援串流——屬實作方式變更、非商業邏輯變更,斷言不得放寬);⑤ `PENDING_EXPIRY` ≤ `PERPLEXITY_TIMEOUT_SECONDS` + 60 秒時 `AppConfig.ready()` 丟 `ImproperlyConfigured`,預設值通過;⑥ view 層:整體期限觸發時回 504、不計次、紀錄 failed。同步修正 `apps/recommendations/quota.py` 的 `PENDING_EXPIRY` 註解,改為引用 D5 的啟動檢查。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
 - [ ] 5.2 EC2 部署前確認:host nginx `proxy_read_timeout` ≥ 60 秒;EC2 `.env` 加上 `PERPLEXITY_API_KEY`(以及 0.2 選定且與預設不同時的 `PERPLEXITY_MODEL`)— (manual,跨 repo / 正式環境)
 
 ## 6. 收尾
