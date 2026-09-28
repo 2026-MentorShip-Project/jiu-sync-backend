@@ -245,6 +245,32 @@ PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
 # 見 openspec/changes/add-ai-restaurant-recommendation/design.md D3/D12。
 AI_RECOMMENDATION_QUOTA_PER_USER = env.int("AI_RECOMMENDATION_QUOTA_PER_USER", default=20)
 
+# 結構化 JSON log:只設定 apps.recommendations(每行一個 JSON 物件到 stdout,供
+# Loki 依欄位過濾)。其他 logger 維持 Django 預設,不改既有輸出格式。
+# disable_existing_loggers 必須為 False,否則會把已建立的其他 logger 靜音。
+# 見 openspec/changes/add-ai-restaurant-recommendation/design.md D11。
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "json": {"()": "apps.recommendations.logging.JsonFormatter"},
+    },
+    "handlers": {
+        "recommendations_stdout": {
+            # StreamHandler 子類別,每次輸出時取當下的 sys.stdout(見該類別說明)。
+            "class": "apps.recommendations.logging.StdoutStreamHandler",
+            "formatter": "json",
+        },
+    },
+    "loggers": {
+        "apps.recommendations": {
+            "handlers": ["recommendations_stdout"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
 # Public origin of the frontend SPA — used to build shareable event links
 # (e.g. f"{FRONTEND_BASE_URL}/events/{event.id}"). dev.py overrides the
 # default; prod.py requires it to be set (fail-fast). See

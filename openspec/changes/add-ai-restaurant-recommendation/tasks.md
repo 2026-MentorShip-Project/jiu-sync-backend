@@ -16,8 +16,8 @@
 
 ## 1B. 結構化 JSON log 輸出(formatter + LOGGING 設定)
 
-- [ ] 1B.1 [RED] 在 `apps/recommendations/tests/test_logging.py` 寫測試,涵蓋:① `JsonFormatter.format()` 對帶 `extra` 的 record 輸出單行、可 `json.loads` 的字串,含 `timestamp`(ISO 8601 含時區)、`level`、`logger`、`event`;② 數值欄位維持 JSON 數字(`latency_ms: 1234` 不是 `"1234"`),`None` 輸出為 `null`;③ 非白名單的 `extra` 欄位不會被輸出;④ 帶 `exc_info` 時輸出 `exc_type`/`exc_message`/`traceback`;⑤ 中文欄位值不被跳脫成 `\uXXXX`(`ensure_ascii=False`);⑥ 經由 Django 設定的 `apps.recommendations` logger 實際輸出到 stdout 的是 JSON(`capsys`),而其他 logger(例如 `apps.events`)的輸出格式不變。確認 FAIL — (auto) `pytest` 顯示 FAIL
-- [ ] 1B.2 [GREEN] 實作:`apps/recommendations/logging.py` 的 `JsonFormatter`(design.md D11)、`config/settings/base.py` 的 `LOGGING`(只設定 `apps.recommendations`,`propagate: False`)。1B.1 轉綠,全套 `pytest -q` 仍全綠 — (auto)
+- [x] 1B.1 [RED] 在 `apps/recommendations/tests/test_logging.py` 寫測試,涵蓋:① `JsonFormatter.format()` 對帶 `extra` 的 record 輸出單行、可 `json.loads` 的字串,含 `timestamp`(ISO 8601 含時區)、`level`、`logger`、`event`;② 數值欄位維持 JSON 數字(`latency_ms: 1234` 不是 `"1234"`),`None` 輸出為 `null`;③ 非白名單的 `extra` 欄位不會被輸出;④ 帶 `exc_info` 時輸出 `exc_type`/`exc_message`/`traceback`;⑤ 中文欄位值不被跳脫成 `\uXXXX`(`ensure_ascii=False`);⑥ 經由 Django 設定的 `apps.recommendations` logger 實際輸出到 stdout 的是 JSON(`capsys`),而其他 logger(例如 `apps.events`)的輸出格式不變。確認 FAIL — (auto) `pytest` 顯示 FAIL
+- [x] 1B.2 [GREEN] 實作:`apps/recommendations/logging.py` 的 `JsonFormatter`(design.md D11)、`config/settings/base.py` 的 `LOGGING`(只設定 `apps.recommendations`,`propagate: False`)。1B.1 轉綠,全套 `pytest -q` 仍全綠 — (auto)
 
 ## 2. 推薦 API 主流程(假引擎;前置檢查 + 條件解析 + 預留/確認/釋放)
 
