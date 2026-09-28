@@ -1,6 +1,7 @@
 import logging
 import time
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
@@ -9,6 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.models import User
 from apps.events.lifecycle import compute_display_status
 from apps.events.views import _get_event_or_404
 from config.exceptions import ApiError, Gone
@@ -22,7 +24,7 @@ from .engines import (
 )
 from .models import RestaurantRecommendationRequest
 from .preferences import resolve_preferences
-from .quota import compute_quota, quota_period_for
+from .quota import PENDING_EXPIRY, compute_quota, count_used, quota_period_for
 from .serializers import RecommendationRequestSerializer, flatten_errors
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,10 @@ class AIRecommendationQuotaView(APIView):
 # ---------------------------------------------------------------------------
 
 ERROR_DETAIL_MAX_LENGTH = 2000
+
+# 條件式 update 更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時,
+# log 帶的 error_code(design.md D4)。不是 DB 的 ErrorCode——此時已沒有紀錄可寫。
+RECORD_MISSING = "RECORD_MISSING"
 
 _NOT_FINALIZED_STATUSES = {"voting_open", "voting_closed_pending", "cancelled"}
 
@@ -130,7 +136,7 @@ class RestaurantRecommendationView(APIView):
     把 ``pending`` 轉成 ``failed``(不再計數)。狀態轉換用
     ``filter(pk=..., status=pending).update(...)``,確保只會轉換一次。
 
-    額度上限(403)與同活動進行中(409)的鎖內檢查由 tasks.md section 3 補上。
+    額度上限(403)與同活動進行中(409)在 ``_reserve`` 的 ``User`` 列鎖內檢查。
     """
 
     permission_classes = [IsAuthenticated]
@@ -162,16 +168,7 @@ class RestaurantRecommendationView(APIView):
         preferences = resolve_preferences(event, serializer.validated_data)
 
         now = timezone.now()
-        with transaction.atomic():
-            record = RestaurantRecommendationRequest.objects.create(
-                user=user,
-                event=event,
-                quota_period=quota_period_for(now),
-                status=Status.PENDING,
-                preferences=preferences,
-                model=engine.model_name,
-                created_at=now,
-            )
+        record = self._reserve(user, event, preferences, engine.model_name, now)
 
         started = time.monotonic()
         try:
@@ -194,7 +191,7 @@ class RestaurantRecommendationView(APIView):
             # savepoint:寫入失敗時只回滾這一步,外層若有 transaction 仍可繼續
             # 把紀錄標成 failed。
             with transaction.atomic():
-                RestaurantRecommendationRequest.objects.filter(
+                updated = RestaurantRecommendationRequest.objects.filter(
                     pk=record.pk, status=Status.PENDING
                 ).update(
                     status=Status.SUCCEEDED,
@@ -214,18 +211,26 @@ class RestaurantRecommendationView(APIView):
                 level=logging.ERROR,
             )
             raise
-        logger.info(
-            "ai_rec.succeeded",
-            extra=_log_extra(
+        success_fields = {
+            "latency_ms": latency_ms,
+            "restaurant_count": len(result.restaurants),
+            "total_tokens": _usage_number(result.usage, "total_tokens"),
+            "cost_usd": _usage_number(result.usage, "cost", "total_cost"),
+            "model": result.model,
+        }
+        if updated:
+            logger.info(
                 "ai_rec.succeeded",
-                record,
-                latency_ms=latency_ms,
-                restaurant_count=len(result.restaurants),
-                total_tokens=_usage_number(result.usage, "total_tokens"),
-                cost_usd=_usage_number(result.usage, "cost", "total_cost"),
-                model=result.model,
-            ),
-        )
+                extra=_log_extra("ai_rec.succeeded", record, **success_fields),
+            )
+        else:
+            # 紀錄已被 cascade 刪除:仍回 201 與結果,本次不計次(D4 可接受的極端情況)。
+            logger.warning(
+                "ai_rec.succeeded",
+                extra=_log_extra(
+                    "ai_rec.succeeded", record, error_code=RECORD_MISSING, **success_fields
+                ),
+            )
         return Response(
             {
                 "id": str(record.id),
@@ -235,6 +240,64 @@ class RestaurantRecommendationView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    def _reserve(self, user, event, preferences, model_name, now):
+        """D4 預留:以 ``User`` 列鎖序列化同一使用者的「檢查 + 建立 pending」。
+
+        鎖只包住這一小段(呼叫上游時不持有鎖與 transaction)。同一使用者的後續請求
+        在鎖內計數時一定看得到這筆 ``pending``,所以不會超用;不同使用者鎖的是不同
+        列,互不阻擋。鎖 ``User`` 列而不是紀錄表:額度為 0 筆時紀錄表沒有列可鎖。
+        """
+        period = quota_period_for(now)
+        with transaction.atomic():
+            User.objects.select_for_update().only("pk").get(pk=user.pk)
+            in_progress = RestaurantRecommendationRequest.objects.filter(
+                user=user,
+                event=event,
+                status=Status.PENDING,
+                created_at__gt=now - PENDING_EXPIRY,
+            ).exists()
+            if in_progress:
+                logger.info(
+                    "ai_rec.in_progress_denied",
+                    extra={
+                        "event": "ai_rec.in_progress_denied",
+                        "user_id": str(user.id),
+                        "event_id": event.id,
+                    },
+                )
+                raise ApiError(
+                    "此活動已有進行中的推薦請求，請稍候",
+                    code="AI_RECOMMENDATION_IN_PROGRESS",
+                    status_code=409,
+                )
+            limit = settings.AI_RECOMMENDATION_QUOTA_PER_USER
+            used = count_used(user, now=now)
+            if used >= limit:
+                logger.info(
+                    "ai_rec.quota_denied",
+                    extra={
+                        "event": "ai_rec.quota_denied",
+                        "user_id": str(user.id),
+                        "used": used,
+                        "limit": limit,
+                        "period": period,
+                    },
+                )
+                raise ApiError(
+                    "本月 AI 推薦次數已用完",
+                    code="AI_RECOMMENDATION_QUOTA_EXCEEDED",
+                    status_code=403,
+                )
+            return RestaurantRecommendationRequest.objects.create(
+                user=user,
+                event=event,
+                quota_period=period,
+                status=Status.PENDING,
+                preferences=preferences,
+                model=model_name,
+                created_at=now,
+            )
 
     def _handle_engine_error(self, record, exc, started):
         detail = exc.raw_detail if exc.raw_detail is not None else str(exc)
@@ -260,13 +323,20 @@ class RestaurantRecommendationView(APIView):
         self, record, error_code, detail, started, *, level, upstream_status=None, exc=None
     ):
         latency_ms = _elapsed_ms(started)
-        RestaurantRecommendationRequest.objects.filter(pk=record.pk, status=Status.PENDING).update(
+        updated = RestaurantRecommendationRequest.objects.filter(
+            pk=record.pk, status=Status.PENDING
+        ).update(
             status=Status.FAILED,
             error_code=error_code,
             error_detail=str(detail)[:ERROR_DETAIL_MAX_LENGTH],
             latency_ms=latency_ms,
             completed_at=timezone.now(),
         )
+        if not updated:
+            # 紀錄已被 cascade 刪除:照常回錯誤,log 改帶 RECORD_MISSING 且至少 WARNING
+            # (非預期例外維持 ERROR,不降級)。
+            error_code = RECORD_MISSING
+            level = max(level, logging.WARNING)
         logger.log(
             level,
             "ai_rec.failed",
