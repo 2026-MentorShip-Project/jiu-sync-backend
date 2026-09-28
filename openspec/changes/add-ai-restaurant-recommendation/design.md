@@ -95,7 +95,7 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
 `apps/recommendations/engines/__init__.py`:
 - `get_engine() -> RecommendationEngine`:依 `settings.RECOMMENDATION_ENGINE` 回傳實例;目前只有 `perplexity`。
 - `RecommendationEngine.is_available() -> bool`、`recommend(context: RecommendationContext) -> RecommendationResult`。
-- 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
+- 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`(子類別 `UpstreamConnectionError`:連線層失敗,status None,`error_code` `UPSTREAM_CONNECTION_ERROR`,訊息為固定文字)、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
 - **引擎對外只丟 `EngineError`**:解析上游回應時的任何非預期例外(`KeyError`、`TypeError`、`AttributeError`、`ValueError` 等)都必須在引擎內捕捉並包成 `UpstreamInvalidResponse`(訊息為自寫摘要,原文放 `raw_detail`),避免第三方或內建例外的訊息夾帶上游文字進入 log。
 - **例外訊息不得夾帶外部或使用者文字**:引擎丟出的 `EngineError` 子類別,訊息只能是自行撰寫的摘要(例如 `upstream HTTP 429`、`JSON decode failed at char 1532`、`missing field restaurants`),不得包含上游回應內容、prompt 或使用者輸入。上游原始回應只經由例外的獨立屬性(例如 `raw_detail`)交給 view 寫入 DB `error_detail`(截斷 2,000 字),不進 `str(exc)`。理由:D11 的 formatter 會原樣輸出 `exc_message`/`traceback`;規則由測試守住(task 4.1 ⑬、2.1 ⑲)。第三方例外(`requests.Timeout`/`ConnectionError`)訊息只含 URL 與錯誤類型,維持原樣。
 - `RECOMMENDATION_ENGINE` 為未知值時,在 `RecommendationsConfig.ready()` 丟 `ImproperlyConfigured`(啟動即失敗,不靜默 fallback)。
@@ -112,7 +112,7 @@ gunicorn `--timeout 60` 會直接殺掉超時 worker,上游 HTTP timeout 45 秒,
   - message text → `json.loads` → 自行驗證結構(不依賴回應頂層 `text.format`,實測永遠是 `{"type":"text"}`)。有多個 `message` 項目時依序逐一嘗試(每個 message 的 `content[].text` 各自串接),取第一個能解析且通過結構驗證的;全部失敗才算 `UpstreamInvalidResponse`。不把多個 message 的文字串在一起解析。
   - 連線層失敗(`requests.ConnectionError` 及 `requests.Timeout` 以外的其他 `requests.RequestException`,例如 DNS 失敗、連線被拒)→ `UpstreamHTTPError`(status 為 None),`error_code` 為 `UPSTREAM_CONNECTION_ERROR`,回 502 `AI_RECOMMENDATION_UPSTREAM_FAILED`,不計次;與上游回 5xx 的 `UPSTREAM_HTTP_ERROR` 分開以便監控。
   - HTTP 非 2xx → `UpstreamHTTPError`(帶 status;429 的 body 為 `{"error":{message,type,code}}`,沒有 `status`/`output`)。`status != "completed"`、JSON 解析失敗、結構不符 → `UpstreamInvalidResponse`。
-  - 回應中的 `model`(例如 `openai/gpt-6-luna`)才是實際使用的模型,寫入 DB `model` 與 log。回應缺少 `model` 或不是非空字串時,改用設定值(`PERPLEXITY_MODEL`)並照常成功——`model` 只是紀錄用欄位,不因此讓已付費且結果正常的推薦失敗。超過 DB 欄位長度時截斷。
+  - 回應中的 `model`(例如 `openai/gpt-6-luna`)才是實際使用的模型,寫入 DB `model` 與 log。回應缺少 `model` 或不是非空字串時,改用設定值(`PERPLEXITY_MODEL`)並照常成功——`model` 只是紀錄用欄位,不因此讓已付費且結果正常的推薦失敗。改用設定值時,`ai_rec.succeeded` log 額外帶布林欄位 `model_fallback: true`(列入白名單,一般情況不輸出),以便監控上游是否停止回報 `model`。超過 DB 欄位長度時截斷。
 - 過濾:丟掉 `name`/`address` 去空白後為空的項目;剩 0 間 → `NoUsableResults`(攜帶模型回傳的 `notes`,可為 null);超過 5 間取前 5。依序給 `id` = `r1`…`r5`。
 - `sourceUrl` 比對:只蒐集 `search_results.results[]` 的 `url`/`title`/`snippet`(實測 `annotations` 全部為空,仍一併蒐集以防未來出現,但不依賴)。以正規化後(去空白、全形轉半形、小寫)的餐廳 `name` 比對:先找 `title` 含店名的來源,找不到再找 `snippet` 含店名的來源(放寬規則 1 後模型常從彙整文章的摘要中取店,只比 title 時命中率由 90% 降到 73%);皆無為 `null`。只使用上游給的 url,不組網址。因此 `sourceUrl` 可能是提及該店的文章而非店家官方頁面,前端應以「參考來源」呈現。
 - 輸出欄位轉 camelCase 回傳前端。

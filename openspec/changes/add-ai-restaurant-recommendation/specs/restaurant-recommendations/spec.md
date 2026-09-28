@@ -162,6 +162,14 @@
 - **WHEN** 外部服務在設定的逾時時間內沒有回應
 - **THEN** 回傳 504,`code` 為 `AI_RECOMMENDATION_UPSTREAM_TIMEOUT`,不計次
 
+#### Scenario: 無法連線到外部服務
+- **WHEN** 連線外部服務時發生 DNS 失敗或連線被拒
+- **THEN** 回傳 502,`code` 為 `AI_RECOMMENDATION_UPSTREAM_FAILED`,不計次
+
+#### Scenario: 外部服務未回報使用的模型
+- **WHEN** 外部服務的回應結果正常,但沒有提供所使用的模型名稱
+- **THEN** 推薦照常成功(201),紀錄的模型為伺服器設定的模型,成功 log 帶 `model_fallback: true`
+
 #### Scenario: 外部服務錯誤或回應格式不符
 - **WHEN** 外部服務回傳非成功狀態或回應不符合預期結構
 - **THEN** 回傳 502,`code` 為 `AI_RECOMMENDATION_UPSTREAM_FAILED`,不計次
@@ -181,6 +189,7 @@
 - `ai_rec.in_progress_denied`(INFO):`user_id`、`event_id`
 - `ai_rec.unavailable`(ERROR):`user_id`、`event_id`
 - `ai_rec.succeeded`/`ai_rec.failed` 在推薦紀錄於請求期間被刪除時,額外帶布林欄位 `record_missing: true`
+- `ai_rec.succeeded` 在外部服務未回報模型、改用伺服器設定值時,額外帶布林欄位 `model_fallback: true`
 
 #### Scenario: 成功事件
 - **WHEN** 一次推薦成功
