@@ -441,7 +441,7 @@ def _find_restaurant(recommendation, restaurant_ref):
     )
 
 
-def serialize_selection(selection):
+def _serialize_selection(selection):
     datetime_field = serializers.DateTimeField()
     return {
         "recommendationId": str(selection.recommendation_id),
@@ -541,7 +541,7 @@ class SelectedRestaurantView(APIView):
                 "is_change": is_change,
             },
         )
-        return Response(serialize_selection(selection))
+        return Response(_serialize_selection(selection))
 
 
 def _elapsed_ms(started):
