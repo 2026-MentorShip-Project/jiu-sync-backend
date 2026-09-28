@@ -531,6 +531,44 @@ def test_fallback_model_is_preset_setting_as_is(post):
     assert _recommend(post, body).model == "preset:low"
 
 
+# 4.5:引擎回報是否改用設定值,供 view 在 `ai_rec.succeeded` 帶 `model_fallback: true`(D8)。
+
+
+def test_model_fallback_is_false_when_response_reports_model(post):
+    assert _recommend(post, _body(model="openai/gpt-6-luna")).model_fallback is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b.pop("model"),
+        lambda b: b.update(model=None),
+        lambda b: b.update(model=""),
+        lambda b: b.update(model="   "),
+        lambda b: b.update(model=5),
+        lambda b: b.update(model=["openai/gpt-6-luna"]),
+    ],
+    ids=["missing", "null", "empty", "blank", "number", "list"],
+)
+def test_model_fallback_is_true_when_setting_is_used(post, mutate):
+    body = _body()
+    mutate(body)
+    assert _recommend(post, body).model_fallback is True
+
+
+def test_model_fallback_is_false_when_response_model_equals_setting(post, settings):
+    """上游回報的 model 剛好等於設定值,仍是「上游回報」而非回退。"""
+    settings.PERPLEXITY_MODEL = "openai/gpt-6-luna"
+    assert _recommend(post, _body(model="openai/gpt-6-luna")).model_fallback is False
+
+
+def test_model_fallback_is_false_when_long_model_is_truncated(post):
+    """超過欄位長度被截斷不算回退。"""
+    result = _recommend(post, _body(model="openai/" + "x" * 200))
+    assert result.model_fallback is False
+    assert len(result.model) == 100
+
+
 def _obj_text(names, notes=None):
     restaurants = [_restaurant(n, f"{n} 的地址") for n in names]
     return json.dumps({"restaurants": restaurants, "notes": notes}, ensure_ascii=False)

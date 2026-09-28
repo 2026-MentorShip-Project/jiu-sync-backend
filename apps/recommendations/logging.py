@@ -33,6 +33,7 @@ LOG_FIELD_WHITELIST = frozenset(
         "limit",
         "period",
         "record_missing",
+        "model_fallback",
     }
 )
 

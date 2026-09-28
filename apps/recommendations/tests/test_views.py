@@ -8,6 +8,7 @@ Seam:HTTP(DRF `APIClient`)。引擎以 `fake_engine` fixture 替換 view 用的
 與 design.md D2/D4/D7/D9/D11。併發與額度上限(403/409 in-progress)在 section 3。
 """
 
+import dataclasses
 import json
 import logging
 from datetime import time, timedelta
@@ -835,6 +836,60 @@ def test_success_log_with_missing_usage_has_null_cost(fake_engine, caplog):
     assert line["total_tokens"] is None
 
 
+def test_success_log_flags_model_fallback_when_engine_used_setting(fake_engine, caplog):
+    """4.5:引擎改用設定值時,`ai_rec.succeeded` 帶 JSON 布林 `model_fallback: true`,
+    其餘欄位與一般成功相同(D8/D11)。"""
+    caplog.set_level(logging.INFO)
+    fake_engine.result = dataclasses.replace(
+        _default_result(), model="preset:low", model_fallback=True
+    )
+    user = _create_user()
+    event = _create_finalized_event(user)
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    [record] = _events(caplog, "ai_rec.succeeded")
+    assert record.levelno == logging.INFO
+    raw = JsonFormatter().format(record)
+    line = json.loads(raw)
+    assert line["model_fallback"] is True
+    assert '"model_fallback": true' in raw
+    assert line["model"] == "preset:low"
+    assert "record_missing" not in line
+    assert RestaurantRecommendationRequest.objects.get().model == "preset:low"
+
+
+def test_success_log_has_no_model_fallback_when_upstream_reported_model(fake_engine, caplog):
+    caplog.set_level(logging.INFO)
+    user = _create_user()
+    event = _create_finalized_event(user)
+
+    _auth_client(user).post(_url(event.id), {}, format="json")
+
+    [record] = _events(caplog, "ai_rec.succeeded")
+    assert "model_fallback" not in json.loads(JsonFormatter().format(record))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [UpstreamTimeout("read timeout"), UpstreamHTTPError(503), RuntimeError("boom")],
+    ids=["timeout", "http-error", "unexpected"],
+)
+def test_failure_log_never_has_model_fallback(fake_engine, caplog, error):
+    caplog.set_level(logging.INFO)
+    fake_engine.error = error
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+    client.raise_request_exception = False
+
+    client.post(_url(event.id), {}, format="json")
+
+    [record] = _events(caplog, "ai_rec.failed")
+    assert "model_fallback" not in json.loads(JsonFormatter().format(record))
+
+
 def test_timeout_logs_ai_rec_failed_with_exception_info(fake_engine, caplog):
     caplog.set_level(logging.INFO)
     fake_engine.error = UpstreamTimeout("read timeout")
@@ -1108,3 +1163,39 @@ def test_response_without_model_succeeds_with_configured_model(perplexity_http, 
     line = json.loads(JsonFormatter().format(_events(caplog, "ai_rec.succeeded")[0]))
     assert line["model"] == "openai/gpt-6-luna-configured"
     assert _events(caplog, "ai_rec.failed") == []
+
+
+# 4.5 端到端:真實引擎解析 → view log(spec 情境「外部服務未回報使用的模型」)。
+
+
+def test_response_without_model_logs_model_fallback_end_to_end(perplexity_http, caplog):
+    caplog.set_level(logging.INFO)
+    perplexity_http["body"] = _perplexity_body_without_model()
+    user = _create_user()
+    event = _create_finalized_event(user)
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert RestaurantRecommendationRequest.objects.get().model == "preset:low"
+    [record] = _events(caplog, "ai_rec.succeeded")
+    line = json.loads(JsonFormatter().format(record))
+    assert line["model_fallback"] is True
+    assert line["model"] == "preset:low"
+
+
+def test_response_with_model_has_no_model_fallback_end_to_end(perplexity_http, caplog):
+    caplog.set_level(logging.INFO)
+    body = _perplexity_body_without_model()
+    body["model"] = "openai/gpt-6-luna"
+    perplexity_http["body"] = body
+    user = _create_user()
+    event = _create_finalized_event(user)
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    [record] = _events(caplog, "ai_rec.succeeded")
+    line = json.loads(JsonFormatter().format(record))
+    assert "model_fallback" not in line
+    assert line["model"] == "openai/gpt-6-luna"

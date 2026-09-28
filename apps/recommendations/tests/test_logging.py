@@ -40,6 +40,7 @@ SPEC_EVENT_FIELDS = {
     "limit",
     "period",
     "record_missing",
+    "model_fallback",
 }
 
 
@@ -238,15 +239,16 @@ def test_non_ascii_values_are_not_escaped():
     assert data["model"] == "模型-中文"
 
 
-def test_boolean_whitelisted_field_is_emitted_as_json_true():
-    """`record_missing` 為布林欄位,需輸出 JSON `true`(不是字串 "True"),Loki 才能以
-    `record_missing="true"` 過濾。"""
-    record = _record(extra={"event": "ai_rec.succeeded", "record_missing": True})
+@pytest.mark.parametrize("field", ["record_missing", "model_fallback"])
+def test_boolean_whitelisted_field_is_emitted_as_json_true(field):
+    """布林旗標(`record_missing`、4.5 的 `model_fallback`)需輸出 JSON `true`(不是字串
+    "True"),Loki 才能以 `<field>="true"` 過濾。"""
+    record = _record(extra={"event": "ai_rec.succeeded", field: True})
 
     raw, data = _format(record)
 
-    assert data["record_missing"] is True
-    assert '"record_missing": true' in raw
+    assert data[field] is True
+    assert f'"{field}": true' in raw
 
 
 def test_whitelist_matches_spec_event_fields():

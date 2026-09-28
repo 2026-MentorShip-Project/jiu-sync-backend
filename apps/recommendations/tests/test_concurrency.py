@@ -16,6 +16,7 @@ DB connection(寫法比照 apps/events/tests/test_views.py 的
 所有等待都有逾時,實作有 bug 時測試會失敗而不是卡住。
 """
 
+import dataclasses
 import json
 import logging
 import threading
@@ -55,8 +56,9 @@ class ConcurrentFakeEngine:
 
     model_name = "preset:low"
 
-    def __init__(self, *, gate=None, side_effect=None, error=None):
+    def __init__(self, *, gate=None, side_effect=None, error=None, result=None):
         self.gate = gate
+        self.result = result if result is not None else _default_result()
         self.side_effect = side_effect
         self.error = error
         self.calls = 0
@@ -74,7 +76,7 @@ class ConcurrentFakeEngine:
             self.side_effect()
         if self.error is not None:
             raise self.error
-        return _default_result()
+        return self.result
 
 
 @pytest.fixture
@@ -529,6 +531,28 @@ def test_record_deleted_during_unexpected_error_keeps_error_level_and_flags_reco
     assert line["error_code"] == "UNEXPECTED_ERROR"
     assert line["record_missing"] is True
     assert line["exc_type"] == "RuntimeError"
+
+
+@pytest.mark.django_db
+def test_record_missing_and_model_fallback_can_both_be_flagged(engine, caplog):
+    """4.5:紀錄消失與 model 回退互不排斥,`ai_rec.succeeded` 兩個旗標同時為 true。"""
+    user = _create_user()
+    event = _create_finalized_event(user)
+    engine.side_effect = _delete_event(event.id)
+    engine.result = dataclasses.replace(
+        _default_result(), model="preset:low", model_fallback=True
+    )
+    caplog.set_level(logging.INFO, logger="apps.recommendations")
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    [record] = _events(caplog, "ai_rec.succeeded")
+    assert record.levelno == logging.INFO
+    line = _json_line(record)
+    assert line["record_missing"] is True
+    assert line["model_fallback"] is True
+    assert line["model"] == "preset:low"
 
 
 @pytest.mark.django_db

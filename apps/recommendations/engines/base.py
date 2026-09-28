@@ -14,12 +14,14 @@ class RecommendationContext:
 @dataclass(frozen=True)
 class RecommendationResult:
     """引擎成功回傳。``restaurants`` 已過濾、截斷、給好 ``id`` 並轉成 camelCase(D8);
-    ``model`` 為上游回應中實際使用的模型。"""
+    ``model`` 為上游回應中實際使用的模型;``model_fallback`` 為 True 表示上游未回報
+    可用的 ``model``、改用設定值(D8),view 據此在成功 log 帶 ``model_fallback: true``。"""
 
     restaurants: list
     notes: str | None
     usage: dict | None
     model: str
+    model_fallback: bool = False
 
 
 class EngineError(Exception):

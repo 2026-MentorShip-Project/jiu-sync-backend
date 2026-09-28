@@ -114,10 +114,13 @@ def _usage_number(usage, *path):
     return value if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
-def _log_extra(event_name, record, *, record_missing=False, **fields):
+def _log_extra(event_name, record, *, record_missing=False, model_fallback=False, **fields):
     """`record_missing=True`:條件式 update 更新 0 列(紀錄在請求期間因活動或使用者
     刪除被 cascade 刪除)。log 的 event/等級/error_code 維持原路徑的值,只另帶布林
-    `record_missing: true`(design.md D4);其他情況不輸出此欄位。"""
+    `record_missing: true`(design.md D4);其他情況不輸出此欄位。
+
+    `model_fallback=True`:上游未回報 `model`、引擎改用設定值(D8),只在
+    `ai_rec.succeeded` 傳入,另帶布林 `model_fallback: true`;其他情況不輸出此欄位。"""
     extra = {
         "event": event_name,
         "request_id": str(record.id),
@@ -127,6 +130,8 @@ def _log_extra(event_name, record, *, record_missing=False, **fields):
     }
     if record_missing:
         extra["record_missing"] = True
+    if model_fallback:
+        extra["model_fallback"] = True
     return extra
 
 
@@ -224,7 +229,11 @@ class RestaurantRecommendationView(APIView):
         logger.info(
             "ai_rec.succeeded",
             extra=_log_extra(
-                "ai_rec.succeeded", record, record_missing=not updated, **success_fields
+                "ai_rec.succeeded",
+                record,
+                record_missing=not updated,
+                model_fallback=result.model_fallback,
+                **success_fields,
             ),
         )
         return Response(

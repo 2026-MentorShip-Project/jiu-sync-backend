@@ -444,7 +444,8 @@ class PerplexityEngine(RecommendationEngine):
         if data.get("status") != "completed":
             raise _ParseFailure("response status is not completed", raw_body)
         model = data.get("model")
-        if not _has_text(model):
+        model_fallback = not _has_text(model)
+        if model_fallback:
             # model 只是紀錄用欄位:缺少/非字串時改用設定值,不讓已付費的推薦失敗(D8)。
             model = settings.PERPLEXITY_MODEL
         usage = data.get("usage")
@@ -492,6 +493,7 @@ class PerplexityEngine(RecommendationEngine):
             notes=notes,
             usage=usage,
             model=model[:MODEL_MAX_LENGTH],
+            model_fallback=model_fallback,
         )
 
 
