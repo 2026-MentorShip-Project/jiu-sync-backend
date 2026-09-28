@@ -18,6 +18,7 @@ from django.contrib import admin
 from django.urls import include, path
 
 from apps.accounts.views import MeView
+from apps.recommendations.views import AIRecommendationQuotaView
 from config.health import healthz
 
 admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
@@ -25,6 +26,11 @@ admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/me/', MeView.as_view(), name='me'),
+    path(
+        'api/me/ai-recommendation-quota/',
+        AIRecommendationQuotaView.as_view(),
+        name='ai-recommendation-quota',
+    ),
     path('healthz/', healthz, name='healthz'),
     path('api/auth/', include('apps.accounts.urls')),
     path('api/events/', include('apps.events.urls')),

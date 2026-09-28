@@ -241,6 +241,9 @@ RECOMMENDATION_ENGINE = env("RECOMMENDATION_ENGINE", default="google_places_gemi
 GOOGLE_PLACES_API_KEY = env("GOOGLE_PLACES_API_KEY", default="")
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
+# 每位使用者每個台灣時間自然月可成功取得 AI 推薦的次數上限;失敗/逾時不計次。
+# 見 openspec/changes/add-ai-restaurant-recommendation/design.md D3/D12。
+AI_RECOMMENDATION_QUOTA_PER_USER = env.int("AI_RECOMMENDATION_QUOTA_PER_USER", default=20)
 
 # Public origin of the frontend SPA — used to build shareable event links
 # (e.g. f"{FRONTEND_BASE_URL}/events/{event.id}"). dev.py overrides the

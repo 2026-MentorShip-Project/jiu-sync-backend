@@ -11,8 +11,8 @@
 
 ## 1. 額度查詢 API(資料表 + 計次規則 + `GET /api/me/ai-recommendation-quota/`)
 
-- [ ] 1.1 [RED] 在 `apps/recommendations/tests/test_quota.py` 寫測試(直接建 `RestaurantRecommendationRequest` 紀錄當前置資料),涵蓋:① 無紀錄 → `limit 20, used 0, remaining 20, available true`、`period` 為台灣時間當月、`resetsAt` 為下月 1 日 00:00+08:00;② 3 筆當月 `succeeded` → `used 3`;③ `failed` 不計;④ 建立 < 5 分鐘的 `pending` 計入,> 5 分鐘不計;⑤ 上月的 `succeeded` 不計(含台灣時間 9/30 23:59 vs 10/1 00:00 邊界,用固定時間);⑥ 20 筆 → `remaining 0, available false`;⑦ 別的使用者的紀錄不計;⑧ `override_settings(AI_RECOMMENDATION_QUOTA_PER_USER=5)` 生效;⑨ `PERPLEXITY_API_KEY=""` → `serviceAvailable false` 且仍 200;⑩ 未登入 → 401。確認 FAIL — (auto) `pytest` 顯示 FAIL
-- [ ] 1.2 [GREEN] 實作:`RestaurantRecommendationRequest` model + migration(design.md D3 欄位與索引)、額度計算函式(D3/D5/D6)、quota view 與 `config/urls.py` 路由、`AI_RECOMMENDATION_QUOTA_PER_USER` 設定、引擎 `is_available()` 的最小版本(只判斷 key 是否為空)。1.1 轉綠 — (auto) `pytest apps/recommendations` 全綠、`makemigrations --check` 無遺漏
+- [x] 1.1 [RED] 在 `apps/recommendations/tests/test_quota.py` 寫測試(直接建 `RestaurantRecommendationRequest` 紀錄當前置資料),涵蓋:① 無紀錄 → `limit 20, used 0, remaining 20, available true`、`period` 為台灣時間當月、`resetsAt` 為下月 1 日 00:00+08:00;② 3 筆當月 `succeeded` → `used 3`;③ `failed` 不計;④ 建立 < 5 分鐘的 `pending` 計入,> 5 分鐘不計;⑤ 上月的 `succeeded` 不計(含台灣時間 9/30 23:59 vs 10/1 00:00 邊界,用固定時間);⑥ 20 筆 → `remaining 0, available false`;⑦ 別的使用者的紀錄不計;⑧ `override_settings(AI_RECOMMENDATION_QUOTA_PER_USER=5)` 生效;⑨ `PERPLEXITY_API_KEY=""` → `serviceAvailable false` 且仍 200;⑩ 未登入 → 401。確認 FAIL — (auto) `pytest` 顯示 FAIL
+- [x] 1.2 [GREEN] 實作:`RestaurantRecommendationRequest` model + migration(design.md D3 欄位與索引)、額度計算函式(D3/D5/D6)、quota view 與 `config/urls.py` 路由、`AI_RECOMMENDATION_QUOTA_PER_USER` 設定、引擎 `is_available()` 的最小版本(只判斷 key 是否為空)。1.1 轉綠 — (auto) `pytest apps/recommendations` 全綠、`makemigrations --check` 無遺漏
 
 ## 1B. 結構化 JSON log 輸出(formatter + LOGGING 設定)
 
