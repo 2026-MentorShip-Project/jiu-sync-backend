@@ -209,6 +209,11 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 
 檢查順序:1. 認證(401)→ 2. 活動存在(404 `EVENT_NOT_FOUND`)→ 3. 擁有者(403)→ 4. body 驗證(400,缺欄位或型別錯)→ 5. 鎖內:活動狀態(同 D2 第 4 步:409 `EVENT_NOT_FINALIZED` / 409 `EVENT_ALREADY_PAST` / 410 `LINK_EXPIRED`)→ 6. 推薦紀錄不存在、不屬於此活動、或 `status != succeeded`(含有 `result` 的 `QUOTA_EXCEEDED_AT_CONFIRM`)→ 400 `INVALID_RECOMMENDATION`(統一代碼,不透露其他活動的紀錄是否存在)→ 7. `restaurantId` 不在該次 `result.restaurants` → 400 `INVALID_RESTAURANT` → 8. 寫入。
 
+**補充行為**(task 6.2 實作時確認,2026-09-29 寫回):
+- body 驗證(第 4 步)沿用 DRF 預設的欄位錯誤代碼(`required` / `invalid` / `null`,經統一錯誤格式輸出),不另訂專屬代碼;型別嚴格,`recommendationId`/`restaurantId` 傳數字即 400。
+- `restaurantId` 不去除前後空白,須與推薦結果的 `id` 完全相同(`" r1"` → 400 `INVALID_RESTAURANT`)。`restaurantId` 由前端從推薦回應原樣帶回,不是使用者輸入的文字。
+- 換選時 `selectedAt` 維持首次選定時間,只有 `updatedAt` 更新;重送同一間兩者皆不變。
+
 **併發與冪等**:
 ```
 with transaction.atomic():
