@@ -24,12 +24,19 @@ from .engines import (
 )
 from .models import RestaurantRecommendationRequest
 from .preferences import resolve_preferences
-from .quota import PENDING_EXPIRY, compute_quota, count_used, quota_period_for
+from .quota import (
+    PENDING_EXPIRY,
+    compute_quota,
+    count_used,
+    exceeds_quota_at_confirm,
+    quota_period_for,
+)
 from .serializers import RecommendationRequestSerializer, flatten_errors
 
 logger = logging.getLogger(__name__)
 
 Status = RestaurantRecommendationRequest.Status
+ErrorCode = RestaurantRecommendationRequest.ErrorCode
 
 
 def serialize_quota(quota, *, service_available):
@@ -113,6 +120,31 @@ def _check_event_recommendable(event):
         raise Gone("此活動連結已失效（活動結束超過7天）", code="LINK_EXPIRED")
 
 
+def _quota_exceeded_error():
+    """預留時與確認時(D4 確認時兜底)共用,兩者 body 必須完全相同。"""
+    return ApiError(
+        "本月 AI 推薦次數已用完",
+        code="AI_RECOMMENDATION_QUOTA_EXCEEDED",
+        status_code=403,
+    )
+
+
+def _lock_for_confirm(record):
+    """確認時兜底(D4)的鎖:先鎖自己的紀錄、再鎖 ``User`` 列,``now`` 須在此之後取。
+
+    順序必須與 Django cascade 刪除使用者一致(先刪依附紀錄、最後刪 ``User``),
+    反過來會互鎖、確認端被 Postgres 中止而變成 500(task 5.4 code-review)。
+    兩者都用 ``filter`` 而非 ``get``:紀錄或使用者在請求期間被刪除時不丟例外,
+    沿用 ``record_missing`` 規則。額度仍由 ``User`` 列鎖序列化。
+    """
+    list(
+        RestaurantRecommendationRequest.objects.select_for_update()
+        .filter(pk=record.pk)
+        .only("pk")
+    )
+    list(User.objects.select_for_update().filter(pk=record.user_id).only("pk"))
+
+
 def _usage_number(usage, *path):
     value = usage
     for key in path:
@@ -151,7 +183,9 @@ class RestaurantRecommendationView(APIView):
     把 ``pending`` 轉成 ``failed``(不再計數)。狀態轉換用
     ``filter(pk=..., status=pending).update(...)``,確保只會轉換一次。
 
-    額度上限(403)與同活動進行中(409)在 ``_reserve`` 的 ``User`` 列鎖內檢查。
+    額度上限(403)與同活動進行中(409)在 ``_reserve`` 的 ``User`` 列鎖內檢查;
+    轉 ``succeeded`` 前再於同一把鎖內做確認時兜底(D4):自己的 ``pending`` 已過期且
+    該月額度已滿 → ``failed``/``QUOTA_EXCEEDED_AT_CONFIRM``,回相同的 403。
     """
 
     permission_classes = [IsAuthenticated]
@@ -203,18 +237,27 @@ class RestaurantRecommendationView(APIView):
         try:
             latency_ms = _elapsed_ms(started)
             result_body = {"restaurants": result.restaurants, "notes": result.notes}
-            # savepoint:寫入失敗時只回滾這一步,外層若有 transaction 仍可繼續
-            # 把紀錄標成 failed。
+            # 寫入失敗時整段回滾(外層若有 transaction 則為 savepoint),之後由
+            # except 把紀錄標成 failed。
             with transaction.atomic():
+                _lock_for_confirm(record)
+                confirmed_at = timezone.now()
+                exceeded = exceeds_quota_at_confirm(record, now=confirmed_at)
+                outcome = (
+                    {"status": Status.FAILED, "error_code": ErrorCode.QUOTA_EXCEEDED_AT_CONFIRM}
+                    if exceeded
+                    else {"status": Status.SUCCEEDED}
+                )
+                # 超額時 result/usage 仍保存,方便追查(上游已收費)。
                 updated = RestaurantRecommendationRequest.objects.filter(
                     pk=record.pk, status=Status.PENDING
                 ).update(
-                    status=Status.SUCCEEDED,
+                    **outcome,
                     result=result_body,
                     usage=result.usage,
                     model=result.model,
                     latency_ms=latency_ms,
-                    completed_at=timezone.now(),
+                    completed_at=confirmed_at,
                 )
         except Exception as exc:
             # 上游成功但結果寫不進 DB(例如無法序列化)——不可殘留 pending 佔用額度。
@@ -226,11 +269,27 @@ class RestaurantRecommendationView(APIView):
                 level=logging.ERROR,
             )
             raise
+        cost_usd = _usage_number(result.usage, "cost", "total_cost")
+        if exceeded:
+            # pending 已過期、期間額度被用滿:不計次,回與一般額度用完相同的 403。
+            logger.warning(
+                "ai_rec.failed",
+                extra=_log_extra(
+                    "ai_rec.failed",
+                    record,
+                    record_missing=not updated,
+                    error_code=ErrorCode.QUOTA_EXCEEDED_AT_CONFIRM.value,
+                    latency_ms=latency_ms,
+                    upstream_status=None,
+                    cost_usd=cost_usd,
+                ),
+            )
+            raise _quota_exceeded_error()
         success_fields = {
             "latency_ms": latency_ms,
             "restaurant_count": len(result.restaurants),
             "total_tokens": _usage_number(result.usage, "total_tokens"),
-            "cost_usd": _usage_number(result.usage, "cost", "total_cost"),
+            "cost_usd": cost_usd,
             "model": result.model,
         }
         # 紀錄已被 cascade 刪除時仍回 201 與結果,本次不計次(D4 可接受的極端情況)。
@@ -298,11 +357,7 @@ class RestaurantRecommendationView(APIView):
                         "period": period,
                     },
                 )
-                raise ApiError(
-                    "本月 AI 推薦次數已用完",
-                    code="AI_RECOMMENDATION_QUOTA_EXCEEDED",
-                    status_code=403,
-                )
+                raise _quota_exceeded_error()
             return RestaurantRecommendationRequest.objects.create(
                 user=user,
                 event=event,

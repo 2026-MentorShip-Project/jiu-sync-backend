@@ -578,3 +578,63 @@ def test_record_missing_is_absent_when_record_still_exists(engine, caplog, error
     assert RestaurantRecommendationRequest.objects.count() == 1
     [record] = _events(caplog, event_name)
     assert "record_missing" not in _json_line(record)
+
+
+# ---------------------------------------------------------------------------
+# 5.4 確認時兜底的鎖順序:與 cascade 刪除使用者不可互鎖(deadlock)
+# ---------------------------------------------------------------------------
+
+LOCK_WAIT_TIMEOUT = 3.0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_confirm_lock_does_not_deadlock_with_user_cascade_delete(engine, monkeypatch):
+    """Django 刪除使用者時先刪依附的推薦紀錄、最後才刪 `User` 列。確認時若先鎖
+    `User` 列再更新紀錄,兩者鎖順序相反會互鎖,確認端被 Postgres 中止而變成 500
+    (D4 要求紀錄在請求期間被刪除時沿用 record_missing 規則,成功路徑回 201)。
+
+    以 hook 讓「刪除端已刪掉紀錄、正要刪 `User`」與「確認端已拿到鎖、正要更新紀錄」
+    交錯;鎖順序一致時刪除端會卡在紀錄鎖上,hook 逾時後確認端照常完成。
+    """
+    user = _create_user()
+    event = _create_finalized_event(user)
+    confirm_locked = threading.Event()
+    records_deleted = threading.Event()
+    real_check = views_module.exceeds_quota_at_confirm
+    deleter_errors = []
+
+    def check_after_interleaving(record, *, now):
+        confirm_locked.set()
+        records_deleted.wait(timeout=LOCK_WAIT_TIMEOUT)
+        return real_check(record, now=now)
+
+    monkeypatch.setattr(views_module, "exceeds_quota_at_confirm", check_after_interleaving)
+
+    def delete_user_like_cascade():
+        try:
+            assert confirm_locked.wait(timeout=JOIN_TIMEOUT)
+            from django.db import transaction
+
+            from apps.accounts.models import User
+
+            with transaction.atomic():
+                RestaurantRecommendationRequest.objects.filter(user_id=user.pk).delete()
+                records_deleted.set()
+                User.objects.filter(pk=user.pk).delete()
+        except Exception as exc:  # noqa: BLE001 — 轉交主執行緒斷言,不吞掉
+            deleter_errors.append(exc)
+        finally:
+            records_deleted.set()
+            connection.close()
+
+    deleter = threading.Thread(target=delete_user_like_cascade)
+    deleter.start()
+    client = _auth_client(user)
+    client.raise_request_exception = False
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    deleter.join(timeout=JOIN_TIMEOUT)
+    assert not deleter.is_alive(), "deleter thread hung"
+    assert deleter_errors == []
+    assert response.status_code == status.HTTP_201_CREATED

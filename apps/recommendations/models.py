@@ -26,6 +26,9 @@ class RestaurantRecommendationRequest(models.Model):
         UPSTREAM_INVALID_RESPONSE = "UPSTREAM_INVALID_RESPONSE"
         NO_USABLE_RESULTS = "NO_USABLE_RESULTS"
         UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+        # 上游已成功,但確認時自己的 pending 已過期且該月額度已滿(D4 確認時兜底);
+        # result/usage 仍保存。
+        QUOTA_EXCEEDED_AT_CONFIRM = "QUOTA_EXCEEDED_AT_CONFIRM"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
