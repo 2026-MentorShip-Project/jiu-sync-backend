@@ -113,7 +113,7 @@ else:
 - `RecommendationEngine.is_available() -> bool`、`recommend(context: RecommendationContext) -> RecommendationResult`。
 - 例外階層:`EngineError` → `UpstreamTimeout`、`UpstreamHTTPError`(子類別 `UpstreamConnectionError`:連線層失敗,status None,`error_code` `UPSTREAM_CONNECTION_ERROR`,訊息為固定文字)、`UpstreamInvalidResponse`、`NoUsableResults`。view 依類型對應 504/502,並寫入 `error_code`;`NoUsableResults` 的 502 回應 body 額外帶 `notes`(模型說明找不到的原因,可為 null),讓前端提示使用者放寬條件。
 - **引擎對外只丟 `EngineError`**:解析上游回應時的任何非預期例外(`KeyError`、`TypeError`、`AttributeError`、`ValueError` 等)都必須在引擎內捕捉並包成 `UpstreamInvalidResponse`(訊息為自寫摘要,原文放 `raw_detail`),避免第三方或內建例外的訊息夾帶上游文字進入 log。
-- **例外訊息不得夾帶外部或使用者文字**:引擎丟出的 `EngineError` 子類別,訊息只能是自行撰寫的摘要(例如 `upstream HTTP 429`、`JSON decode failed at char 1532`、`missing field restaurants`),不得包含上游回應內容、prompt 或使用者輸入。上游原始回應只經由例外的獨立屬性(例如 `raw_detail`)交給 view 寫入 DB `error_detail`(截斷 2,000 字),不進 `str(exc)`。理由:D11 的 formatter 會原樣輸出 `exc_message`/`traceback`;規則由測試守住(task 4.1 ⑬、2.1 ⑲)。第三方例外(`requests.Timeout`/`ConnectionError`)訊息只含 URL 與錯誤類型,維持原樣。
+- **例外訊息不得夾帶外部或使用者文字**:引擎丟出的 `EngineError` 子類別,訊息只能是自行撰寫的摘要(例如 `upstream HTTP 429`、`JSON decode failed at char 1532`、`missing field restaurants`),不得包含上游回應內容、prompt 或使用者輸入。上游原始回應只經由例外的獨立屬性(例如 `raw_detail`)交給 view 寫入 DB `error_detail`(截斷 2,000 字),不進 `str(exc)`。理由:D11 的 formatter 會原樣輸出 `exc_message`/`traceback`;規則由測試守住(task 4.1 ⑬、2.1 ⑲)。第三方例外(`requests.Timeout`/`ConnectionError` 等)一律以 `from None` 切斷例外鏈,不進 traceback/log,DB 只記例外類型:task 7.2 實測格式錯誤的狀態列會以 `BadStatusLine('<上游文字>')` 原樣出現在例外訊息中,原先「只含 URL 與錯誤類型、維持原樣串接」的假設不成立(送出階段與串流階段一致)。
 - `RECOMMENDATION_ENGINE` 為未知值時,在 `RecommendationsConfig.ready()` 丟 `ImproperlyConfigured`(啟動即失敗,不靜默 fallback)。
 - 測試以 `monkeypatch`/fixture 替換 `get_engine()` 回傳的假引擎;Perplexity 引擎本身的解析/比對邏輯另以「假 HTTP 回應」做單元測試(`monkeypatch` 替換 `requests.post`,不新增 mock 套件、不打網路)。
 
@@ -154,7 +154,8 @@ enum 欄位對應固定的中文描述片段(例如 `同事` → 「同事聚餐
 - 在 `config/settings/base.py` 新增 `LOGGING`:只設定 `apps.recommendations` logger(level INFO、`propagate: False`),handler 為 `StdoutStreamHandler`(`StreamHandler` 子類別,每次寫入時取當下的 `sys.stdout`),formatter 為自寫的 `apps.recommendations.logging.JsonFormatter`(繼承內建 `logging.Formatter`,不新增套件)。其他 logger 維持 Django 預設,不改變既有輸出。
 - 呼叫方式固定為 `logger.info("ai_rec.succeeded", extra={"event": "ai_rec.succeeded", ...})`;formatter 輸出 `timestamp`(UTC ISO 8601,含時區)、`level`、`logger`、`event` 與 `extra` 中的白名單欄位;有例外時加上 `exc_type`、`exc_message`、`traceback`(內容安全性由 D7 的例外訊息規則保證)。數值欄位保持 JSON 數字;NaN/Infinity 輸出 null;序列化失敗時改輸出只含固定欄位與 `format_error` 的一行,不丟失事件。
 - 事件名稱與欄位見 spec「推薦事件輸出結構化 log」。`cost_usd` 取自上游 `usage.cost.total_cost`,`total_tokens` 取自 `usage.total_tokens`,缺少時為 `null`。`error_code` 為 `QUOTA_EXCEEDED_AT_CONFIRM` 的 `ai_rec.failed` 也帶 `cost_usd`(上游已收費,D4)。
-- 不記 prompt、使用者自由文字、上游原始回應、API key(這些在 DB,用 `request_id` 查)。formatter 採白名單欄位輸出,避免之後有人在 `extra` 塞入敏感資料就直接被印出。
+- 不記 prompt、使用者自由文字、上游原始回應、API key(這些在 DB,用 `request_id` 查)。
+- 寫入 DB 前移除上游文字中的 NUL 字元(`\u0000`,Postgres text/jsonb 不接受):範圍為 `result`、`usage`、`model`、`error_detail`。否則成功路徑的確認寫入會失敗成 500 且錯誤訊息夾帶上游 JSON 片段,失敗路徑則會殘留 `pending` 佔用額度(task 7.2)。使用者輸入已由 DRF serializer 拒絕 NUL,不需處理。formatter 採白名單欄位輸出,避免之後有人在 `extra` 塞入敏感資料就直接被印出。
 - 替代:全站改 JSON log——會改變 accounts/events/exceptions 既有輸出格式,屬於跨 app 的觀測性決策,另開 change(已記為待辦)。替代:Prometheus metrics(`/metrics` endpoint)——需新增套件、保護 endpoint、另架收集端,以本功能流量(每人每月 ≤ 20 次)不划算。
 
 建議的 Grafana 查詢(寫進 PR 說明,非程式碼):
@@ -217,13 +218,13 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 **併發與冪等**:
 ```
 with transaction.atomic():
-    event = Event.objects.select_for_update().get(pk=...)
+    event = Event.objects.select_for_update(of=("self",), no_key=True).get(pk=...)
     狀態檢查、推薦紀錄與餐廳驗證
     current = EventRestaurantSelection 目前這筆(可能不存在)
     if current 指向同一 (recommendation, restaurant_ref): 不寫入,is_change=false
     else: update_or_create(event=event, defaults=...),is_change = current 存在
 ```
-- 鎖 `Event` 列:兩個分頁同時選不同間時不會撞 OneToOne unique 變 500,結果為最後寫入者勝(兩者都 200、各自回傳自己寫入的內容);狀態檢查在鎖內,避免與 reopen/cancel(同樣更新該列)競態。
+- 鎖 `Event` 列:兩個分頁同時選不同間時不會撞 OneToOne unique 變 500,結果為最後寫入者勝(兩者都 200、各自回傳自己寫入的內容);狀態檢查在鎖內,避免與 reopen/cancel(同樣更新該列)競態。使用 `FOR NO KEY UPDATE`(`no_key=True`,task 7.2 決策):與 reopen/cancel 的 UPDATE 仍互斥,但不阻擋同活動推薦紀錄 INSERT 對 `Event` 取的 FK `KEY SHARE` 鎖。
 - 重送同一間:不寫入,`updatedAt` 不變,回 200 同內容。
 - 替代:不鎖、捕捉 `IntegrityError` 重試——狀態檢查與寫入之間仍有競態;樂觀鎖(版本號 409)——對主揪改自己的選擇過重。皆不採用。
 
@@ -241,6 +242,7 @@ with transaction.atomic():
 - [同步呼叫佔住 gunicorn thread] → gthread 3×4=12 個 thread,加上每人每月 20 次上限,目前流量下可接受;監看 `latency_ms`。
 - [t2.micro 記憶體] → gthread 共用 process,不增加 worker process 數,記憶體增量小。
 - [確認時才發現超額,浪費一次上游費用] → 只在請求活得比 `pending`(5 分鐘)久且額度同時被用滿時發生;以 `error_code = QUOTA_EXCEEDED_AT_CONFIRM` 的 log 監控頻率(D11)。
+- [選定 PUT 與 cascade 刪除活動/使用者的鎖順序相反,可能互鎖] → PUT 先鎖 `Event` 再寫選擇列,cascade 刪除則先刪選擇列、最後刪 `Event`。目前沒有刪除活動/使用者的 API,admin 也未註冊這些 model,只有手動操作 DB 才可能觸發;Postgres 會偵測 deadlock 並中止其中一方,兩邊都在 transaction 內、資料不會不一致(task 7.2 決策:記錄為已知風險)。**新增任何刪除 API 時必須一併處理鎖順序**(做法同 D4:先鎖依附列再鎖上層列)。
 - [reopen 後已選餐廳可能不再適合新時段] → 推薦依舊時段與人數產生;保留選擇,由主揪重新定案後自行更換,前端可依活動狀態淡化顯示(D13)。
 - [跨月請求的 201 `quota` 顯示上個月] → 月底開始、跨午夜才確認的請求,成功回應的 `quota` 以請求開始時間計算,顯示的是建立月份(與計次歸屬一致,D6),下一次查詢即為新月份;只影響該次顯示,不處理。
 - [`pending` 殘留] → 5 分鐘後不計數;若 log 看到大量殘留代表 worker 被殺,需調查逾時設定。

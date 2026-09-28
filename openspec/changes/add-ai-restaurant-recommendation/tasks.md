@@ -70,4 +70,5 @@
   - 結果:修 2 項真問題(先 RED 再修,29ad114):上游文字含 NUL 時 DB 拒收→殘留 pending/500 且上游文字進 log;送出階段 requests 例外 `from exc` 帶上游 status line 進 traceback。選定 PUT 與 cascade 刪除的鎖順序、`_read_body` 捕捉所有例外等列為待決事項,未自行拍板。
 - [x] 7.3 `spectra analyze` + `spectra drift` 確認實作與 design.md 一致、無落差;有落差先修正或 `ingest` — (auto)
   - 結果:analyze 0.04 秒(24 則:9 requirement/13 design 主題「無對應 task」與 2 則 SUGGEST,皆為 tasks 以 Dx/情境描述引用而非標題文字的誤報,逐項對照已有實作與 task)、drift 0.32 秒(5 個斷裂 anchor:前端檔在前端 repo `that-is-so-sweet/src/mocks/`、gunicorn 參數在 `gunicorn --help` 皆存在,屬誤報);無真實落差,未改規劃文件。
+- [ ] 7.5 [RED→GREEN] 選定 PUT 的 `Event` 鎖改為 `FOR NO KEY UPDATE`(design.md D13「併發與冪等」):測試同活動在 PUT 持鎖期間(`transaction=True`,thread + 同步點),另一連線對該活動 INSERT 推薦紀錄不被阻擋(以 `lock_timeout` 或逾時判斷);reopen/cancel 的 UPDATE 仍會等待 PUT 釋放鎖。既有 section 6 測試全綠。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
 - [ ] 7.4 整理給前端的串接說明(request/response 範例、錯誤碼表、`restrictions` 新欄位、quota API、進行中停用按鈕、「重新推薦也計次」、`PUT selected-restaurant` 與活動詳情 `selectedRestaurant`、「確認時才發現超額也回 403」),以及 design.md D11 的 LogQL/SQL 查詢,放在 PR 描述 — (manual)我確認後再轉給前端
