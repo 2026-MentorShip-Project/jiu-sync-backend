@@ -7,6 +7,7 @@
 - 「聚會日期是否已過」改以台灣時間(`TIME_ZONE = Asia/Taipei`)的當天日期判斷
 - 補上 00:00–08:00 時段與日界邊界的測試
 - 呼叫端、API 形狀、錯誤代碼皆不變
+- 測試中寫死的未來日期(例如 `2026-10-01`)改為相對今天的日期,避免 2026-10-02 起 CI 因日期過期而失敗(task 1.1 code-review 發現)
 
 ## Capabilities
 
@@ -22,4 +23,5 @@
 
 - `apps/events/lifecycle.py`:`compute_display_status` 的日期比較
 - `apps/events/tests/test_lifecycle.py`:新增時區測試
+- `apps/events/tests/test_views.py`、`apps/notifications/tests/test_tasks.py`:寫死日期改為相對日期
 - 間接修正:活動詳情/列表 `displayStatus`、以其為前置檢查的 API(不需改動呼叫端)

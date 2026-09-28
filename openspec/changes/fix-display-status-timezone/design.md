@@ -19,6 +19,8 @@
   - 替代:呼叫端改傳本地日期——需改所有呼叫端,之後新增的呼叫端仍可能再犯,不採用。
 - **D2. naive `now` 不另外處理**:`timezone.localdate` 對 naive datetime 會丟 `ValueError`,沿用此行為(`USE_TZ=True` 下 `timezone.now()` 必為 aware),以測試固定此行為,避免被默默當成 UTC。
 - **D3. 分支**:從 `develop` 開 `fix/display-status-timezone`(grill Q-a),PR 進 `develop`,之後 merge 回 `feature/ai-pick`。
+- **D4. 測試資料日期相對「台灣時間今天」產生**:結果會隨今天改變的測試(定案/poll/reopen 等依 `displayStatus` 判斷者)不得寫死日期字串,改由共用 helper 以 `timezone.localdate() + timedelta(days=N)` 產生;與今天無關的寫死日期維持不動。驗證方式為把時鐘平移到未來日期重跑。
+  - 替代:整個測試套件固定時鐘(freezegun 等)——需新增依賴,且會影響依賴時間前進的測試(`updated_at`、token 過期),不採用。
 
 ## Risks / Trade-offs
 
