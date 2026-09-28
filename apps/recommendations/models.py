@@ -67,3 +67,36 @@ class RestaurantRecommendationRequest(models.Model):
 
     def __str__(self):
         return f"{self.user_id} {self.quota_period} {self.status}"
+
+
+class EventRestaurantSelection(models.Model):
+    """主揪從推薦結果選定、綁定到活動的餐廳(design.md D13)。
+
+    每個活動最多一筆(OneToOne);換一間就覆蓋同一列,不保留歷史(分析改用
+    ``ai_rec.restaurant_selected`` log)。``restaurant`` 是選定當下從推薦紀錄
+    ``result`` 複製的快照,活動詳情直接讀它,不解析推薦 JSON。
+
+    events app 只透過 ``related_name="restaurant_selection"`` 字串讀取本表,
+    不 import 本模組(避免循環依賴)。
+    """
+
+    event = models.OneToOneField(
+        "events.Event", on_delete=models.CASCADE, related_name="restaurant_selection"
+    )
+    # 來源推薦紀錄(追溯用)。
+    recommendation = models.ForeignKey(
+        RestaurantRecommendationRequest,
+        on_delete=models.CASCADE,
+        related_name="selections",
+    )
+    # 該次推薦內的餐廳 `id`(`r1`…`r5`),可分析主揪選第幾名。
+    restaurant_ref = models.CharField(max_length=20)
+    # 選定當下複製的完整餐廳物件(與推薦回應同 camelCase 形狀)。
+    restaurant = models.JSONField()
+    # 首次選定 / 最後一次換選;由 view 以同一個 `now` 明確指定,
+    # 首次選定時兩者相等。
+    selected_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    def __str__(self):
+        return f"{self.event_id} {self.restaurant_ref}"

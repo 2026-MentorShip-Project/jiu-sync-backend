@@ -41,6 +41,9 @@ SPEC_EVENT_FIELDS = {
     "period",
     "record_missing",
     "model_fallback",
+    # ai_rec.restaurant_selected(section 6,design.md D13)
+    "restaurant_ref",
+    "is_change",
 }
 
 

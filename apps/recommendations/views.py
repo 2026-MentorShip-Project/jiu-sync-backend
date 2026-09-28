@@ -4,7 +4,7 @@ import time
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import User
 from apps.events.lifecycle import compute_display_status
+from apps.events.models import Event
 from apps.events.views import _get_event_or_404
 from config.exceptions import ApiError, Gone
 
@@ -22,7 +23,7 @@ from .engines import (
     UpstreamTimeout,
     get_engine,
 )
-from .models import RestaurantRecommendationRequest
+from .models import EventRestaurantSelection, RestaurantRecommendationRequest
 from .preferences import resolve_preferences
 from .quota import (
     PENDING_EXPIRY,
@@ -31,7 +32,11 @@ from .quota import (
     exceeds_quota_at_confirm,
     quota_period_for,
 )
-from .serializers import RecommendationRequestSerializer, flatten_errors
+from .serializers import (
+    RecommendationRequestSerializer,
+    RestaurantSelectionSerializer,
+    flatten_errors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +103,11 @@ _DEFAULT_ENGINE_ERROR_RESPONSE = (
 )
 
 
-def _check_event_recommendable(event):
-    """D2 第 4 步:只有已定案、定案日期未過、連結未失效的活動可以推薦。"""
+def _check_event_recommendable(event, action="取得餐廳推薦"):
+    """D2 第 4 步:只有已定案、定案日期未過、連結未失效的活動可以推薦。
+
+    選定推薦餐廳(D13 第 5 步)沿用同一組狀態規則,只換訊息中的動作文字。
+    """
     display_status = compute_display_status(
         event.status,
         event.response_deadline,
@@ -110,11 +118,11 @@ def _check_event_recommendable(event):
     )
     if display_status in _NOT_FINALIZED_STATUSES:
         raise ApiError(
-            "活動尚未定案，無法取得餐廳推薦", code="EVENT_NOT_FINALIZED", status_code=409
+            f"活動尚未定案，無法{action}", code="EVENT_NOT_FINALIZED", status_code=409
         )
     if display_status == "finalized_past":
         raise ApiError(
-            "聚會日期已過，無法取得餐廳推薦", code="EVENT_ALREADY_PAST", status_code=409
+            f"聚會日期已過，無法{action}", code="EVENT_ALREADY_PAST", status_code=409
         )
     if display_status == "link_expired":
         raise Gone("此活動連結已失效（活動結束超過7天）", code="LINK_EXPIRED")
@@ -415,6 +423,125 @@ class RestaurantRecommendationView(APIView):
                 record_missing=not updated,
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/events/{id}/selected-restaurant/
+# ---------------------------------------------------------------------------
+
+
+def _find_restaurant(recommendation, restaurant_ref):
+    result = recommendation.result if isinstance(recommendation.result, dict) else {}
+    restaurants = result.get("restaurants")
+    if not isinstance(restaurants, list):
+        return None
+    return next(
+        (r for r in restaurants if isinstance(r, dict) and r.get("id") == restaurant_ref),
+        None,
+    )
+
+
+def serialize_selection(selection):
+    datetime_field = serializers.DateTimeField()
+    return {
+        "recommendationId": str(selection.recommendation_id),
+        "restaurantId": selection.restaurant_ref,
+        "restaurant": selection.restaurant,
+        "selectedAt": datetime_field.to_representation(selection.selected_at),
+        "updatedAt": datetime_field.to_representation(selection.updated_at),
+    }
+
+
+class SelectedRestaurantView(APIView):
+    """``PUT /api/events/{id}/selected-restaurant/`` — 主揪從推薦結果選定一間餐廳。
+
+    檢查順序見 design.md D13:認證 → 活動存在 → 擁有者 → body 驗證 → 鎖內(狀態 →
+    推薦紀錄 → 餐廳)→ 寫入。狀態檢查、驗證與寫入都在 ``Event`` 列的
+    ``select_for_update`` 內:兩個分頁同時選不同間時由鎖序列化(最後寫入者勝、
+    兩者皆 200),也不會與 reopen/cancel(同樣更新該列)競態。
+
+    冪等:目前選擇已是同一 ``(recommendation, restaurant_ref)`` 時不寫入,
+    ``updatedAt`` 不變、log ``is_change: false``。不修改 ``Event.location``。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, id):
+        user = request.user
+        event = _get_event_or_404(id)
+        if user != event.owner:
+            raise PermissionDenied("僅活動擁有者可選定餐廳")
+        serializer = RestaurantSelectionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        recommendation_id = serializer.validated_data["recommendationId"]
+        restaurant_ref = serializer.validated_data["restaurantId"]
+
+        with transaction.atomic():
+            # of=("self",):只鎖活動列;final_slot 是 nullable 外鍵(LEFT JOIN),
+            # Postgres 不允許對 outer join 的 nullable 端加 FOR UPDATE。
+            event = (
+                Event.objects.select_for_update(of=("self",))
+                .select_related("final_slot")
+                .filter(pk=event.pk)
+                .first()
+            )
+            if event is None:
+                # 取得鎖之前活動已被刪除 → 與一開始就不存在相同的 404。
+                _get_event_or_404(id)
+            _check_event_recommendable(event, action="選定餐廳")
+
+            # 不存在、屬於其他活動、未成功(含有 result 的 QUOTA_EXCEEDED_AT_CONFIRM)
+            # 一律同一代碼,不透露其他活動的紀錄是否存在。
+            recommendation = RestaurantRecommendationRequest.objects.filter(
+                pk=recommendation_id, event=event, status=Status.SUCCEEDED
+            ).first()
+            if recommendation is None:
+                raise ApiError(
+                    "推薦紀錄無效，請重新取得推薦",
+                    code="INVALID_RECOMMENDATION",
+                    status_code=400,
+                )
+            restaurant = _find_restaurant(recommendation, restaurant_ref)
+            if restaurant is None:
+                raise ApiError(
+                    "此餐廳不在該次推薦結果中", code="INVALID_RESTAURANT", status_code=400
+                )
+
+            current = EventRestaurantSelection.objects.filter(event=event).first()
+            if (
+                current is not None
+                and current.recommendation_id == recommendation.id
+                and current.restaurant_ref == restaurant_ref
+            ):
+                selection, is_change = current, False
+            else:
+                now = timezone.now()
+                is_change = current is not None
+                fields = {
+                    "recommendation": recommendation,
+                    "restaurant_ref": restaurant_ref,
+                    "restaurant": restaurant,
+                    "updated_at": now,
+                }
+                # selected_at 只在首次選定時寫入;換選只更新 updated_at。
+                selection, _ = EventRestaurantSelection.objects.update_or_create(
+                    event=event,
+                    defaults=fields,
+                    create_defaults={**fields, "selected_at": now},
+                )
+
+        logger.info(
+            "ai_rec.restaurant_selected",
+            extra={
+                "event": "ai_rec.restaurant_selected",
+                "user_id": str(user.id),
+                "event_id": event.id,
+                "request_id": str(recommendation.id),
+                "restaurant_ref": restaurant_ref,
+                "is_change": is_change,
+            },
+        )
+        return Response(serialize_selection(selection))
 
 
 def _elapsed_ms(started):

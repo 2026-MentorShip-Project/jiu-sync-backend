@@ -225,7 +225,11 @@ def _event_with_responses_queryset():
     多加一次 ``.filter()`` 不會命中 prefetch cache（只有原封不動的 ``.all()``
     才吃快取），會變成另開一條 N+1 query，等於白做這層防護。
     """
-    return Event.objects.select_related("owner", "final_slot").prefetch_related(
+    # restaurant_selection:``EventDetailSerializer.selectedRestaurant`` 讀取的
+    # 反向 OneToOne(由 apps.recommendations 定義),JOIN 進同一個查詢,不另外查。
+    return Event.objects.select_related(
+        "owner", "final_slot", "restaurant_selection"
+    ).prefetch_related(
         "slots",
         Prefetch(
             "responses",

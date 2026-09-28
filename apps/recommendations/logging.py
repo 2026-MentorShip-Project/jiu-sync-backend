@@ -34,6 +34,8 @@ LOG_FIELD_WHITELIST = frozenset(
         "period",
         "record_missing",
         "model_fallback",
+        "restaurant_ref",
+        "is_change",
     }
 )
 

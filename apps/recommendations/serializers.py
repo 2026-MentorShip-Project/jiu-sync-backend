@@ -143,3 +143,35 @@ def _first_detail(value):
 def _with_code(detail, field):
     code = FIELD_ERROR_CODES.get(field, getattr(detail, "code", None))
     return ErrorDetail(str(detail), code=code)
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/events/{id}/selected-restaurant/(design.md D13)
+# ---------------------------------------------------------------------------
+
+
+class _StrictUUIDField(serializers.UUIDField):
+    """只接受 JSON 字串。DRF 內建 ``UUIDField`` 會把整數轉成 ``UUID(int=...)``,
+    這裡視為型別錯誤。"""
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid", value=data)
+        return super().to_internal_value(data)
+
+
+class _StrictCharField(serializers.CharField):
+    """只接受 JSON 字串。DRF 內建 ``CharField`` 會把數字轉成字串(``1`` → ``"1"``),
+    這裡視為型別錯誤。"""
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
+class RestaurantSelectionSerializer(serializers.Serializer):
+    recommendationId = _StrictUUIDField()
+    # 空字串不是 body 錯誤:它只是不在推薦結果內 → 400 INVALID_RESTAURANT(D13 第 7 步)。
+    # 不去空白:餐廳 id 是機器值,必須與推薦結果完全相同。
+    restaurantId = _StrictCharField(allow_blank=True, trim_whitespace=False)

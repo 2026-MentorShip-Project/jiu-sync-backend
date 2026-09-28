@@ -1231,6 +1231,8 @@ def test_participant_can_submit_first_vote_successfully():
         "finalSlotId",
         "finalNote",
         "finalAttendees",
+        # add-ai-restaurant-recommendation design.md D13:活動詳情新增選定餐廳。
+        "selectedRestaurant",
     }
     assert body["id"] == str(event.id)
     assert body["finalSlotId"] is None

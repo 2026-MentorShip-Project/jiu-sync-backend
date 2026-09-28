@@ -1,6 +1,6 @@
 from django.urls import path, register_converter
 
-from apps.recommendations.views import RestaurantRecommendationView
+from apps.recommendations.views import RestaurantRecommendationView, SelectedRestaurantView
 
 from .views import (
     CommentDetailView,
@@ -84,6 +84,11 @@ urlpatterns = [
         "<shortid:id>/restaurant-recommendations/",
         RestaurantRecommendationView.as_view(),
         name="restaurant-recommendations",
+    ),
+    path(
+        "<shortid:id>/selected-restaurant/",
+        SelectedRestaurantView.as_view(),
+        name="selected-restaurant",
     ),
     path(
         "<shortid:id>/poll/",
