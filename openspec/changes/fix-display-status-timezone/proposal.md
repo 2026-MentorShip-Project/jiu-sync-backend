@@ -23,5 +23,5 @@
 
 - `apps/events/lifecycle.py`:`compute_display_status` 的日期比較
 - `apps/events/tests/test_lifecycle.py`:新增時區測試
-- `apps/events/tests/test_views.py`、`apps/notifications/tests/test_tasks.py`:寫死日期改為相對日期
+- `apps/events/tests/test_views.py`:依今天判斷的寫死日期改為相對日期(新增共用 helper `apps/events/tests/helpers.py`);`apps/notifications/tests/test_tasks.py` 的日期經盤點與今天無關,不需修改
 - 間接修正:活動詳情/列表 `displayStatus`、以其為前置檢查的 API(不需改動呼叫端)
