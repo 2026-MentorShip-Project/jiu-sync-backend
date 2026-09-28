@@ -27,6 +27,8 @@ from apps.events.models import (
     Slot,
 )
 
+from .helpers import taipei_today_plus
+
 pytestmark = pytest.mark.django_db
 
 EVENTS_URL = "/api/events/"
@@ -412,7 +414,8 @@ def _create_event(owner, **overrides):
     }
     defaults.update(overrides)
     event = Event.objects.create(**defaults)
-    Slot.objects.create(event=event, date="2026-10-01")
+    # 相對台灣時間今天(design.md D4):定案後 displayStatus 依此判斷是否已過。
+    Slot.objects.create(event=event, date=taipei_today_plus(2))
     return event
 
 
@@ -4570,7 +4573,8 @@ def test_poll_event_updated_at_detects_reopen_then_refinalize_with_unchanged_cou
     owner = _create_user()
     event = _create_event(owner)
     slot_1 = event.slots.first()
-    slot_2 = _add_slot(event, date="2026-10-03")
+    # 兩個時段都須在今天之後,前後兩次 displayStatus 才會相同(design.md D4)。
+    slot_2 = _add_slot(event, date=taipei_today_plus(4))
     client = _auth_client(owner)
 
     client.post(
