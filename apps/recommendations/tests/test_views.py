@@ -449,6 +449,35 @@ def test_whitespace_only_strings_are_treated_as_unset(fake_engine):
     assert resolved["dietary"]["restrictions"] == []
 
 
+@pytest.mark.parametrize("field", ["cuisines", "restrictions"])
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_list_items_are_dropped_before_max_items_check(fake_engine, field, blank):
+    user = _create_user()
+    event = _create_finalized_event(user)
+    items = ["a", "b", blank, "c", "d", "e"]
+
+    response = _auth_client(user).post(
+        _url(event.id), {"dietary": {field: items}}, format="json"
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["resolvedPreferences"]["dietary"][field] == ["a", "b", "c", "d", "e"]
+    assert fake_engine.calls[0].preferences["dietary"][field] == ["a", "b", "c", "d", "e"]
+
+
+def test_situational_blank_items_are_dropped_before_duplicate_check(fake_engine):
+    user = _create_user()
+    event = _create_finalized_event(user)
+    body = {"situational": ["可久坐", " ", "有插座", "停車位", "親子友善", "無障礙", ""]}
+
+    response = _auth_client(user).post(_url(event.id), body, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["resolvedPreferences"]["situational"] == [
+        "可久坐", "有插座", "停車位", "親子友善", "無障礙"
+    ]
+
+
 def test_custom_cuisines_are_accepted(fake_engine):
     user = _create_user()
     event = _create_finalized_event(user)
@@ -519,7 +548,53 @@ def test_party_size_defaults_to_available_non_deleted_responses(fake_engine):
     response = _auth_client(user).post(_url(event.id), {}, format="json")
 
     assert response.status_code == status.HTTP_201_CREATED
-    assert response.json()["resolvedPreferences"]["partySize"] == 2
+    resolved = response.json()["resolvedPreferences"]
+    # 2.3 商業邏輯變更:partySize 一律為人數規格字串,實際人數改由 attendeeCount 提供。
+    assert resolved["attendeeCount"] == 2
+    assert resolved["partySize"] == "2 人"
+    assert fake_engine.calls[0].preferences["partySize"] == "2 人"
+
+
+@pytest.mark.parametrize(
+    ("attendees", "expected"),
+    [(1, "2 人"), (3, "3-4 人"), (5, "5-8 人"), (9, "9 人以上（多人）"), (20, "20 人以上（團體）")],
+)
+def test_party_size_is_derived_from_attendee_count_when_not_chosen(
+    fake_engine, attendees, expected
+):
+    user = _create_user()
+    event = _create_finalized_event(user)
+    for i in range(attendees):
+        _add_response(event, f"p{i}", "available")
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    resolved = response.json()["resolvedPreferences"]
+    assert resolved["attendeeCount"] == attendees
+    assert resolved["partySize"] == expected
+
+
+def test_no_available_responses_gives_null_party_size_and_engine_gets_no_party_size(
+    fake_engine,
+):
+    user = _create_user()
+    event = _create_finalized_event(user)
+    _add_response(event, "a", "if_needed")
+    _add_response(event, "b", "available", deleted=True)
+
+    response = _auth_client(user).post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    resolved = response.json()["resolvedPreferences"]
+    assert resolved["attendeeCount"] == 0
+    assert resolved["partySize"] is None
+    sent = fake_engine.calls[0].preferences
+    assert sent["partySize"] is None
+    assert sent["attendeeCount"] == 0
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.preferences["partySize"] is None
+    assert record.preferences["attendeeCount"] == 0
 
 
 def test_party_size_from_request_takes_priority(fake_engine):
@@ -529,7 +604,23 @@ def test_party_size_from_request_takes_priority(fake_engine):
 
     response = _auth_client(user).post(_url(event.id), {"partySize": "5-8 人"}, format="json")
 
-    assert response.json()["resolvedPreferences"]["partySize"] == "5-8 人"
+    assert response.status_code == status.HTTP_201_CREATED
+    resolved = response.json()["resolvedPreferences"]
+    assert resolved["partySize"] == "5-8 人"
+    assert resolved["attendeeCount"] == 1
+    assert fake_engine.calls[0].preferences["partySize"] == "5-8 人"
+
+
+def test_chosen_party_size_is_kept_even_with_zero_attendees(fake_engine):
+    user = _create_user()
+    event = _create_finalized_event(user)
+
+    response = _auth_client(user).post(_url(event.id), {"partySize": "2 人"}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    resolved = response.json()["resolvedPreferences"]
+    assert resolved["partySize"] == "2 人"
+    assert resolved["attendeeCount"] == 0
 
 
 def test_meal_time_uses_final_slot_date_and_time_or_label(fake_engine):

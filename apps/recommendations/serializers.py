@@ -62,8 +62,16 @@ def _optional_choice(choices):
     )
 
 
+class _BlankDroppingListField(serializers.ListField):
+    """子項目去空白後為空的直接略過;``max_length`` 等 validator 在略過後才檢查
+    (spec:清單欄位先去除空白項目,再檢查項目數上限與重複)。"""
+
+    def to_internal_value(self, data):
+        return [item for item in super().to_internal_value(data) if item]
+
+
 def _free_text_list(item_max_length):
-    return serializers.ListField(
+    return _BlankDroppingListField(
         child=serializers.CharField(allow_blank=True, max_length=item_max_length),
         required=False,
         allow_null=True,
@@ -77,20 +85,13 @@ class DietarySerializer(serializers.Serializer):
     cuisines = _free_text_list(CUISINE_MAX_LENGTH)
     restrictions = _free_text_list(RESTRICTION_MAX_LENGTH)
 
-    def to_internal_value(self, data):
-        value = super().to_internal_value(data)
-        # 去空白後為空的項目視同未填,直接略過。
-        for key in ("cuisines", "restrictions"):
-            value[key] = [item for item in (value.get(key) or []) if item]
-        return value
-
 
 class RecommendationRequestSerializer(serializers.Serializer):
     location = _optional_text(LOCATION_MAX_LENGTH)
     relationship = _optional_choice(RELATIONSHIP_CHOICES)
     budget = _optional_choice(BUDGET_CHOICES)
     partySize = _optional_choice(PARTY_SIZE_CHOICES)
-    situational = serializers.ListField(
+    situational = _BlankDroppingListField(
         child=_TrimmedChoiceField(choices=SITUATIONAL_CHOICES, allow_blank=True),
         required=False,
         allow_null=True,
@@ -99,8 +100,8 @@ class RecommendationRequestSerializer(serializers.Serializer):
     customPrompt = _optional_text(CUSTOM_PROMPT_MAX_LENGTH)
 
     def validate_situational(self, value):
-        # 去空白後為空的項目視同未填,略過後再檢查重複。
-        value = [item for item in (value or []) if item]
+        # 空白項目已在 `_BlankDroppingListField` 略過,這裡只檢查重複。
+        value = value or []
         if len(set(value)) != len(value):
             raise serializers.ValidationError("情境條件不可重複")
         return value
