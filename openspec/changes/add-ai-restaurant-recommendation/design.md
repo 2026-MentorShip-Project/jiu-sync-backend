@@ -42,7 +42,7 @@
 | `status` | `pending` / `succeeded` / `failed` | |
 | `preferences` | JSONField | 解析後實際送出的條件(即 `resolvedPreferences`) |
 | `result` | JSONField null | 成功時回傳給前端的 `restaurants` + `notes` |
-| `error_code` | CharField null | `UPSTREAM_TIMEOUT` / `UPSTREAM_HTTP_ERROR` / `UPSTREAM_CONNECTION_ERROR` / `UPSTREAM_INVALID_RESPONSE` / `NO_USABLE_RESULTS` / `UNEXPECTED_ERROR` |
+| `error_code` | CharField null | `UPSTREAM_TIMEOUT` / `UPSTREAM_HTTP_ERROR` / `UPSTREAM_CONNECTION_ERROR` / `UPSTREAM_INVALID_RESPONSE` / `NO_USABLE_RESULTS` / `UNEXPECTED_ERROR` / `QUOTA_EXCEEDED_AT_CONFIRM` |
 | `error_detail` | TextField null | 失敗時上游原始回應(或例外訊息)前 2,000 字 |
 | `model` | CharField | 實際使用的模型/preset |
 | `usage` | JSONField null | 上游 `usage` 原樣保存(token、cost) |
@@ -71,24 +71,33 @@ except EngineError as e:
 except Exception:
     req 標記 failed(UNEXPECTED_ERROR);log.exception;re-raise → 500
 else:
-    req 標記 succeeded(result, usage, latency)
+    with transaction.atomic():                   # 確認時兜底(見下)
+        User.objects.select_for_update().get(pk=user.pk)
+        now = timezone.now()
+        if req.created_at <= now - PENDING_EXPIRY and used(req.quota_period, 排除 req) >= limit:
+            req 標記 failed(QUOTA_EXCEEDED_AT_CONFIRM,result/usage 仍保存);回 403 QUOTA_EXCEEDED
+        else:
+            req 標記 succeeded(result, usage, latency)
 ```
 
 - 鎖只包住「計數 + 建 pending」這一小段,呼叫上游時不持有 DB 鎖與 transaction。
 - `pending` 本身就是預留:同一使用者後續請求在鎖內計數時一定看得到它,所以不會超用。
 - 失敗的補償就是把 `pending` 改成 `failed`(不再計數),不存在「加回去」的算術。
 - 標記 succeeded/failed 用 `filter(pk=..., status=pending).update(...)`,確保只會轉換一次。更新 0 列(紀錄在請求期間因活動或使用者刪除被 cascade 刪除)時:成功路徑仍回 201 與結果,失敗路徑照常回錯誤,log 的 `event`、等級與 `error_code` 皆維持原本路徑的值(成功 INFO、上游失敗 WARNING、非預期例外 ERROR,失敗保留原 `error_code`),只額外帶布林欄位 `record_missing: true`(已列入白名單);其他情況不輸出此欄位。此時該次不計次,屬可接受的極端情況;費用仍計入 log 統計(上游確實收費)。
+- **確認時兜底(grill 2026-09-29 Q1–Q3)**:額度正確性不依賴「請求存活時間 < `PENDING_EXPIRY`」這個時間假設(見 D5 已知限制)。每次轉 `succeeded` 都在 `User` 列鎖內進行;只有自己的 `pending` 已過期(`created_at <= now - PENDING_EXPIRY`,與 `compute_quota` 的條件相反,`now` 在鎖內取)時才重算額度,重算用紀錄自己的 `quota_period`(D6,跨月以建立月份為準),不計入自己。已達上限 → 紀錄轉 `failed`、`error_code` `QUOTA_EXCEEDED_AT_CONFIRM`,`result`/`usage` 仍寫入 DB 方便追查,回 403 `AI_RECOMMENDATION_QUOTA_EXCEEDED`(body 與一般額度用完相同),log `ai_rec.failed`(WARNING)額外帶 `cost_usd`;未達上限照常成功。未過期時不重算:自己的預留一直被計入,其他請求不可能搶走這一次。失敗路徑不拿鎖(`failed` 不計次)。轉換仍用 `filter(status=pending).update`,判斷依記憶體中的 `created_at`/`quota_period`;更新 0 列時沿用上一條的 `record_missing` 規則。代價:極罕見情況下浪費一次已付費的上游呼叫。
+  - 替代:引擎內 watchdog(`threading.Timer` 到期 `shutdown` socket,或 executor + `future.result(timeout)`)——需依賴 urllib3 內部屬性或留下未結束的 thread,脆弱,不採用。替代:接受風險、只收緊啟動檢查——上游慢速回傳時仍可能超用,不符合併發安全邊界,不採用。
 - 為什麼鎖 `User` 列而不是鎖紀錄表:要鎖的是「這個使用者的額度」,紀錄表在額度為 0 筆時沒有列可鎖(phantom),`User` 列一定存在。
 - 替代:Redis `SET NX` 鎖——會形成第二份狀態、需要處理解鎖失敗與 TTL,且 Redis 失敗時仍需 DB 兜底,見 grill Q11 討論,不採用。
 - 替代:先扣後不退——上游失敗成本轉嫁給使用者,不採用。
 
-### D5. `pending` 過期時間 5 分鐘,必須大於任何請求的存活上限(由引擎整體期限保證)
+### D5. `pending` 過期時間 5 分鐘;額度正確性由確認時兜底(D4)保證,引擎整體期限只讓過期罕見
 
-不變式:活著的請求不可能比自己的 `pending` 活得更久,否則 `pending` 過期後額度被多放出一次,原請求之後又成功計次,造成超用。
+風險:`pending` 過期後額度被多放出一次,原請求之後又成功,就會超用。正確性由 D4 的「確認時兜底」保證(grill 2026-09-29 Q1),不依賴請求存活時間;以下時間上的限制只用來讓「請求活得比 `pending` 久」變得罕見,減少 `QUOTA_EXCEEDED_AT_CONFIRM`(浪費一次上游費用)的發生,並給使用者合理的等待上限。
 
 - **不依賴 gunicorn**:task 5.1 實測確認,gthread worker 的 `--timeout` 只檢查 worker 心跳,不限制單一請求時長(gunicorn 26.2.0 `config.py`:「not tied to the length of time required to handle a single request」)。`requests` 的 `timeout=(5, 45)` 也只限制「每次讀取」,上游緩慢分段回傳時整體仍可無限延長。
-- **引擎整體期限**:Perplexity 呼叫改用 `stream=True` 逐塊讀取,以 `time.monotonic()` 計算自送出請求起的總耗時,超過 `PERPLEXITY_TIMEOUT_SECONDS`(預設 45)即中斷連線並丟 `UpstreamTimeout`(504、不計次)。connect timeout 5 秒、每次讀取 timeout 也不超過剩餘期限。因此單次請求在引擎內的存活上限 ≈ 整體期限 + 少量解析時間。
-- **啟動時檢查**:`AppConfig.ready()` 檢查 `PENDING_EXPIRY` > `PERPLEXITY_TIMEOUT_SECONDS` + 60 秒緩衝(涵蓋前置檢查、DB、解析),不成立即 `ImproperlyConfigured`。60/45/5 分鐘這組數字的關係由這個檢查綁住,文件與註解只描述、不當作保證。
+- **引擎整體期限**:Perplexity 呼叫改用 `stream=True` 逐塊讀取,以 `time.monotonic()` 計算自送出請求起的總耗時,超過 `PERPLEXITY_TIMEOUT_SECONDS`(預設 45)即中斷連線並丟 `UpstreamTimeout`(504、不計次)。connect timeout 5 秒,read timeout 在送出時設為當下剩餘期限。
+- **已知限制**(task 5.3 code-review):`requests` 的 read timeout 只在送出時設定一次、作用於每次 socket recv,期限只在 chunk 之間檢查——單次卡住的讀取可再延長約一個期限(預設最壞約 95 秒),單一 chunk 內逐位元組慢速回傳則沒有上限。不再修引擎(見 D4 替代方案),由確認時兜底處理。
+- **啟動時檢查**:`AppConfig.ready()` 檢查 `PENDING_EXPIRY` > `PERPLEXITY_TIMEOUT_SECONDS` + 60 秒緩衝(涵蓋前置檢查、DB、解析),不成立即 `ImproperlyConfigured`。屬合理性檢查(避免設定讓過期變成常態),不是額度正確性的保證。
 - process 被殺掉留下的 `pending` 5 分鐘後自動不計數,不需要清理排程(紀錄維持 `pending` 狀態,可從資料看出異常終止)。
 - gunicorn `--timeout 60` 仍保留,用途改為偵測卡死的 worker,與額度正確性無關。
 
@@ -109,7 +118,7 @@ else:
 
 ### D8. Perplexity 呼叫細節
 
-- HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`stream=True`,connect timeout 5 秒,每次讀取 timeout 取「剩餘整體期限」;整體期限見 D5。
+- HTTP client:`requests`(已在 `pyproject.toml` 明確宣告);`stream=True`,connect timeout 5 秒,read timeout 取送出時的剩餘整體期限;整體期限與已知限制見 D5。
 - 模型設定:`PERPLEXITY_MODEL` 預設 `preset:low`(task 0.2 實測:延遲中位數 24 秒,`medium` 為 57–94 秒會超過 45 秒逾時)。值以 `preset:` 開頭 → 送 `preset` 欄位;否則視為 `provider/model` → 送 `model` 欄位。其他格式在啟動時 `ImproperlyConfigured`。
 - Request:`instructions` = 執行計畫書 §6 System Prompt,但**規則 1 放寬**(見下);移除「輸出純 JSON 不要 markdown」這類由 schema 取代的文字。`input` = §7 User Prompt 樣板;`tools: [{"type": "web_search"}]`;`response_format` = json_schema(`restaurants[]` + `notes`,欄位同 spec,`name`/`address` required,**不含任何 url 欄位**)。
 - System Prompt 規則 1 改為:「只推薦在本次搜尋結果中實際出現的真實餐廳,不可編造店名或地址。無法確認目前是否營業、是否能容納指定人數或是否符合某項條件時,仍可列出,但必須在 `recommend_reason` 或 `notes` 具體註明哪一項無法確認;查不到的欄位填 null。」原規則「只能推薦能確認仍在營業的餐廳」在 `preset:low` 下導致過度保守(PRD 標準情境回傳 0 間)。放寬後以 task 0.2b 重測驗證:C1–C4 有 ≥3 間由 2/4 升為 3/4,延遲中位數 16 秒,人工核對無編造店家。
@@ -143,7 +152,7 @@ enum 欄位對應固定的中文描述片段(例如 `同事` → 「同事聚餐
 
 - 在 `config/settings/base.py` 新增 `LOGGING`:只設定 `apps.recommendations` logger(level INFO、`propagate: False`),handler 為 `StdoutStreamHandler`(`StreamHandler` 子類別,每次寫入時取當下的 `sys.stdout`),formatter 為自寫的 `apps.recommendations.logging.JsonFormatter`(繼承內建 `logging.Formatter`,不新增套件)。其他 logger 維持 Django 預設,不改變既有輸出。
 - 呼叫方式固定為 `logger.info("ai_rec.succeeded", extra={"event": "ai_rec.succeeded", ...})`;formatter 輸出 `timestamp`(UTC ISO 8601,含時區)、`level`、`logger`、`event` 與 `extra` 中的白名單欄位;有例外時加上 `exc_type`、`exc_message`、`traceback`(內容安全性由 D7 的例外訊息規則保證)。數值欄位保持 JSON 數字;NaN/Infinity 輸出 null;序列化失敗時改輸出只含固定欄位與 `format_error` 的一行,不丟失事件。
-- 事件名稱與欄位見 spec「推薦事件輸出結構化 log」。`cost_usd` 取自上游 `usage.cost.total_cost`,`total_tokens` 取自 `usage.total_tokens`,缺少時為 `null`。
+- 事件名稱與欄位見 spec「推薦事件輸出結構化 log」。`cost_usd` 取自上游 `usage.cost.total_cost`,`total_tokens` 取自 `usage.total_tokens`,缺少時為 `null`。`error_code` 為 `QUOTA_EXCEEDED_AT_CONFIRM` 的 `ai_rec.failed` 也帶 `cost_usd`(上游已收費,D4)。
 - 不記 prompt、使用者自由文字、上游原始回應、API key(這些在 DB,用 `request_id` 查)。formatter 採白名單欄位輸出,避免之後有人在 `extra` 塞入敏感資料就直接被印出。
 - 替代:全站改 JSON log——會改變 accounts/events/exceptions 既有輸出格式,屬於跨 app 的觀測性決策,另開 change(已記為待辦)。替代:Prometheus metrics(`/metrics` endpoint)——需新增套件、保護 endpoint、另架收集端,以本功能流量(每人每月 ≤ 20 次)不划算。
 
@@ -157,8 +166,12 @@ sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.failed" | reco
   / sum(count_over_time({container=~".*app.*"} | json | event=~"ai_rec.(succeeded|failed)" | record_missing!="true" [1h]))
 # 延遲 P95
 quantile_over_time(0.95, {container=~".*app.*"} | json | event="ai_rec.succeeded" | unwrap latency_ms [1h])
-# 每日費用(不排除 record_missing:紀錄消失時上游仍確實收費)
-sum(sum_over_time({container=~".*app.*"} | json | event="ai_rec.succeeded" | unwrap cost_usd [1d]))
+# 每日費用(不排除 record_missing:紀錄消失時上游仍確實收費;含確認時才發現超額的 failed)
+sum(sum_over_time({container=~".*app.*"} | json | event=~"ai_rec.(succeeded|failed)" | cost_usd!="" | unwrap cost_usd [1d]))
+# 主揪選第幾名(分析排序是否有效)
+sum by (restaurant_ref) (count_over_time({container=~".*app.*"} | json | event="ai_rec.restaurant_selected" [30d]))
+# 確認時才發現超額的次數(應接近 0;持續出現代表上游常態慢到超過 PENDING_EXPIRY)
+sum(count_over_time({container=~".*app.*"} | json | event="ai_rec.failed" | error_code="QUOTA_EXCEEDED_AT_CONFIRM" [1d]))
 ```
 
 ```sql
@@ -173,6 +186,47 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 
 `AI_RECOMMENDATION_QUOTA_PER_USER`(int,預設 20)、`PERPLEXITY_MODEL`(預設 `preset:low`,格式見 D8)、`PERPLEXITY_TIMEOUT_SECONDS`(預設 45)。`RECOMMENDATION_ENGINE` 預設改 `perplexity`,更新註解。`PERPLEXITY_API_KEY` 空字串或只有空白 → `is_available()` 為 false → 503 / `serviceAvailable: false`,不影響啟動(`prod.py` 不檢查)。
 
+### D13. 選定推薦餐廳綁定到活動(grill 2026-09-29 Q6–Q14)
+
+**資料模型**:`apps.recommendations` 新增 `EventRestaurantSelection`:
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `event` | OneToOneField Event, CASCADE, `related_name="restaurant_selection"` | DB 層保證每個活動最多一筆 |
+| `recommendation` | FK `RestaurantRecommendationRequest`, CASCADE | 來源推薦紀錄(追溯) |
+| `restaurant_ref` | CharField | 該次推薦內的餐廳 `id`(`r1`…`r5`),可分析主揪選第幾名 |
+| `restaurant` | JSONField | 選定當下複製的完整餐廳物件(與推薦回應同 camelCase 形狀) |
+| `selected_at` / `updated_at` | DateTime | 首次選定 / 最後一次換選 |
+
+- 推薦紀錄的 `result` 成功後不可變,因此快照與來源不會不一致;活動詳情直接讀快照,不解析推薦 JSON。
+- 只能從推薦結果選;手動填寫不在推薦中的餐廳留到之後(屆時 `recommendation` 可改 nullable,純新增)。
+- 不保留選擇歷史:換一間就覆蓋同一列;分析改用 `ai_rec.restaurant_selected` log(D11)。流量大到需要長期分析時再加歷史表。
+- 不動 `Event.location`:`location` 維持「搜尋/集合地區」語意,也是推薦預設地點;覆寫會讓重新推薦的搜尋中心漂移。
+- 替代:`Event` 直接加欄位——events model 會依賴 recommendations model,形成循環依賴,不採用。替代:只存參照不存快照——讀取要 join 再挖 JSON,不採用。
+
+**API**:`PUT /api/events/{id}/selected-restaurant/`,body `{"recommendationId": "<uuid>", "restaurantId": "r2"}`,成功 200 回 `{recommendationId, restaurantId, restaurant, selectedAt, updatedAt}`。view 放 `apps.recommendations`,路由掛在 `apps/events/urls.py`(同 D1)。
+
+檢查順序:1. 認證(401)→ 2. 活動存在(404 `EVENT_NOT_FOUND`)→ 3. 擁有者(403)→ 4. body 驗證(400,缺欄位或型別錯)→ 5. 鎖內:活動狀態(同 D2 第 4 步:409 `EVENT_NOT_FINALIZED` / 409 `EVENT_ALREADY_PAST` / 410 `LINK_EXPIRED`)→ 6. 推薦紀錄不存在、不屬於此活動、或 `status != succeeded`(含有 `result` 的 `QUOTA_EXCEEDED_AT_CONFIRM`)→ 400 `INVALID_RECOMMENDATION`(統一代碼,不透露其他活動的紀錄是否存在)→ 7. `restaurantId` 不在該次 `result.restaurants` → 400 `INVALID_RESTAURANT` → 8. 寫入。
+
+**併發與冪等**:
+```
+with transaction.atomic():
+    event = Event.objects.select_for_update().get(pk=...)
+    狀態檢查、推薦紀錄與餐廳驗證
+    current = EventRestaurantSelection 目前這筆(可能不存在)
+    if current 指向同一 (recommendation, restaurant_ref): 不寫入,is_change=false
+    else: update_or_create(event=event, defaults=...),is_change = current 存在
+```
+- 鎖 `Event` 列:兩個分頁同時選不同間時不會撞 OneToOne unique 變 500,結果為最後寫入者勝(兩者都 200、各自回傳自己寫入的內容);狀態檢查在鎖內,避免與 reopen/cancel(同樣更新該列)競態。
+- 重送同一間:不寫入,`updatedAt` 不變,回 200 同內容。
+- 替代:不鎖、捕捉 `IntegrityError` 重試——狀態檢查與寫入之間仍有競態;樂觀鎖(版本號 409)——對主揪改自己的選擇過重。皆不採用。
+
+**活動詳情**:`EventDetailSerializer` 新增 `selectedRestaurant`(`SerializerMethodField`,以 `getattr(event, "restaurant_selection", None)` 讀取,輸出 `{restaurant, selectedAt}` 或 `null`),不 import `apps.recommendations`,耦合只剩 related_name 字串,由測試守住;活動詳情 view 加 `select_related("restaurant_selection")`,查詢數不增加。參與者與擁有者都看得到。`EventSummarySerializer`(列表)不加。
+
+**生命週期**:reopen / cancel 不動已選餐廳(不改 events 的 lifecycle view,避免反向依賴);reopen 後因狀態非 `finalized` 無法換選,重新定案後可再換。
+
+**log**:成功寫入或冪等重送都輸出 `ai_rec.restaurant_selected`(INFO):`user_id`、`event_id`、`request_id`(推薦紀錄 id)、`restaurant_ref`、`is_change`;`restaurant_ref`、`is_change` 加入白名單。不記店名、地址(上游內容,同 D11)。400/403/409 不記 log。
+
 ## Risks / Trade-offs
 
 - [上游實際延遲常態 > 45 秒] → task 0.2 實測 `preset:low` 中位數 24 秒、最大 29 秒,通過;`medium` 以上會超標,若之後需要換更強模型,須先回頭重新 grill D10(改非同步)。
@@ -180,6 +234,8 @@ Loki 用於即時監控與告警;DB 用於準確的月統計(log 可能因保存
 - [名稱比對 `sourceUrl` 命中率低] → 前端本來就要處理 `null`;task 1 記錄命中率,只調整正規化,不讓模型產生網址。
 - [同步呼叫佔住 gunicorn thread] → gthread 3×4=12 個 thread,加上每人每月 20 次上限,目前流量下可接受;監看 `latency_ms`。
 - [t2.micro 記憶體] → gthread 共用 process,不增加 worker process 數,記憶體增量小。
+- [確認時才發現超額,浪費一次上游費用] → 只在請求活得比 `pending`(5 分鐘)久且額度同時被用滿時發生;以 `error_code = QUOTA_EXCEEDED_AT_CONFIRM` 的 log 監控頻率(D11)。
+- [reopen 後已選餐廳可能不再適合新時段] → 推薦依舊時段與人數產生;保留選擇,由主揪重新定案後自行更換,前端可依活動狀態淡化顯示(D13)。
 - [`pending` 殘留] → 5 分鐘後不計數;若 log 看到大量殘留代表 worker 被殺,需調查逾時設定。
 - [Perplexity 費用] → `usage.cost` 入庫,可隨時 `SUM` 估算;上限可由 env 調整。
 - [模型回傳虛構餐廳] → prompt 要求只推薦可搜尋確認的真實店家、查不到填 null;`sourceUrl` 只用真實來源。無法完全消除,前端應標示「AI 推薦,請自行確認」。

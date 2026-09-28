@@ -116,7 +116,7 @@
 
 ### Requirement: 每人每月使用次數上限
 
-系統 SHALL 限制每位使用者每個台灣時間自然月最多成功取得推薦 N 次(N 預設 20,可由設定調整)。只有成功回傳推薦(201)的請求 SHALL 計入次數;驗證失敗、狀態不符、外部服務失敗或逾時 SHALL NOT 計入。進行中的請求 SHALL 暫時佔用一次額度,直到完成或超過 5 分鐘。次數歸屬於請求建立當下的月份。
+系統 SHALL 限制每位使用者每個台灣時間自然月最多成功取得推薦 N 次(N 預設 20,可由設定調整)。只有成功回傳推薦(201)的請求 SHALL 計入次數;驗證失敗、狀態不符、外部服務失敗或逾時 SHALL NOT 計入。進行中的請求 SHALL 暫時佔用一次額度,直到完成或超過 5 分鐘。請求完成時若其佔用已超過 5 分鐘而失效,系統 SHALL 於確認成功前重新檢查該月額度;已達上限則該次不計次並回傳 403。次數歸屬於請求建立當下的月份。
 
 #### Scenario: 額度用完
 - **WHEN** 使用者當月已成功使用 20 次後再呼叫
@@ -141,6 +141,10 @@
 #### Scenario: 卡住的進行中請求不永久佔用額度
 - **WHEN** 某筆進行中的請求建立超過 5 分鐘仍未完成
 - **THEN** 它不再佔用額度
+
+#### Scenario: 佔用失效後額度被用滿
+- **WHEN** 某筆請求執行超過 5 分鐘才取得外部服務結果,期間同一使用者的其他請求已把當月額度用滿
+- **THEN** 該筆回傳 403,`code` 為 `AI_RECOMMENDATION_QUOTA_EXCEEDED`,不計次,當月成功次數不超過上限
 
 ### Requirement: 同一活動不可同時進行多個推薦請求
 
@@ -184,10 +188,11 @@
 
 事件與欄位:
 - `ai_rec.succeeded`(INFO):`request_id`、`user_id`、`event_id`、`latency_ms`、`restaurant_count`、`total_tokens`、`cost_usd`、`model`
-- `ai_rec.failed`(WARNING;非預期例外為 ERROR):`request_id`、`user_id`、`event_id`、`error_code`、`latency_ms`、`upstream_status`(無則 null)
+- `ai_rec.failed`(WARNING;非預期例外為 ERROR):`request_id`、`user_id`、`event_id`、`error_code`、`latency_ms`、`upstream_status`(無則 null);`error_code` 為 `QUOTA_EXCEEDED_AT_CONFIRM` 時另帶 `cost_usd`
 - `ai_rec.quota_denied`(INFO):`user_id`、`used`、`limit`、`period`
 - `ai_rec.in_progress_denied`(INFO):`user_id`、`event_id`
 - `ai_rec.unavailable`(ERROR):`user_id`、`event_id`
+- `ai_rec.restaurant_selected`(INFO):`user_id`、`event_id`、`request_id`、`restaurant_ref`、`is_change`(布林)
 - `ai_rec.succeeded`/`ai_rec.failed` 在推薦紀錄於請求期間被刪除時,額外帶布林欄位 `record_missing: true`
 - `ai_rec.succeeded` 在外部服務未回報模型、改用伺服器設定值時,額外帶布林欄位 `model_fallback: true`
 
@@ -206,6 +211,50 @@
 #### Scenario: log 不含使用者輸入
 - **WHEN** 請求帶有 `customPrompt`
 - **THEN** 該次產生的所有 log 行都不包含 `customPrompt` 的內容
+
+### Requirement: 主揪可從推薦結果選定一間餐廳綁定到活動
+
+系統 SHALL 提供 `PUT /api/events/{id}/selected-restaurant/`,讓已登入的活動擁有者以 `{"recommendationId", "restaurantId"}` 從該活動某次成功推薦的結果中選定一間餐廳,成功回傳 200 與 `{recommendationId, restaurantId, restaurant, selectedAt, updatedAt}`。每個活動 SHALL 最多綁定一間;再次選定不同餐廳 SHALL 覆蓋原本的選擇。可選定的活動狀態 SHALL 與推薦 API 相同(已定案、定案時段日期未過、連結未失效)。選定的餐廳資訊 SHALL 以選定當下的內容保存,並出現在活動詳情 `GET /api/events/{id}/` 的 `selectedRestaurant` 欄位(未選定時為 `null`),參與者也可看到。選定餐廳 SHALL NOT 修改活動的 `location`。
+
+#### Scenario: 選定成功
+- **WHEN** 擁有者對已定案活動送出該活動某次成功推薦的 `recommendationId` 與其中一間的 `restaurantId`
+- **THEN** 回傳 200,`restaurant` 與該次推薦中該間的內容相同;活動詳情的 `selectedRestaurant` 為該間
+
+#### Scenario: 重送同一間
+- **WHEN** 擁有者對同一活動重複送出相同的 `recommendationId` 與 `restaurantId`
+- **THEN** 回傳 200 與相同內容,`updatedAt` 不變
+
+#### Scenario: 換一間餐廳
+- **WHEN** 活動已有選定餐廳,擁有者選定另一間(可來自同一次或另一次推薦)
+- **THEN** 回傳 200,活動詳情只顯示新選定的那間,舊的選擇不再保留
+
+#### Scenario: 非擁有者或未登入
+- **WHEN** 未登入,或已登入但不是活動擁有者的使用者呼叫
+- **THEN** 分別回傳 401、403,選擇不變
+
+#### Scenario: 活動狀態不可選定
+- **WHEN** 活動未定案或已取消、定案日期已過、或連結已失效
+- **THEN** 分別回傳 409 `EVENT_NOT_FINALIZED`、409 `EVENT_ALREADY_PAST`、410 `LINK_EXPIRED`,選擇不變
+
+#### Scenario: 無效的推薦紀錄
+- **WHEN** `recommendationId` 不存在、屬於其他活動,或該次推薦未成功
+- **THEN** 回傳 400,`code` 為 `INVALID_RECOMMENDATION`,選擇不變
+
+#### Scenario: 無效的餐廳
+- **WHEN** `restaurantId` 不在該次推薦的結果中
+- **THEN** 回傳 400,`code` 為 `INVALID_RESTAURANT`,選擇不變
+
+#### Scenario: 同時選定不同餐廳
+- **WHEN** 擁有者幾乎同時送出兩個選定不同餐廳的請求
+- **THEN** 兩者皆回傳 200,活動最終只綁定其中一間,不出現伺服器錯誤
+
+#### Scenario: 重新開放後保留
+- **WHEN** 已選定餐廳的活動被重新開放或取消
+- **THEN** 活動詳情仍顯示原本選定的餐廳;活動非已定案期間無法換選
+
+#### Scenario: 不影響活動地點
+- **WHEN** 擁有者選定餐廳
+- **THEN** 活動的 `location` 維持原值
 
 ### Requirement: 查詢當月額度
 
