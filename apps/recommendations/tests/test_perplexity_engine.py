@@ -727,6 +727,28 @@ def test_connection_errors_raise_http_error_with_connection_code(post, error):
     assert len(exc.raw_detail) <= 2000
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        # requests 實際行為:上游回傳不合法的 status line 時,訊息原樣帶出該行
+        # (task 7.2 以本機 socket 實測 `BadStatusLine('...')`),不只 URL 與錯誤類型。
+        requests.ConnectionError(
+            "Connection aborted.", f"BadStatusLine('{MARKER} garbage status')"
+        ),
+        requests.RequestException(f"generic {MARKER}"),
+    ],
+    ids=["bad_status_line", "request_exception"],
+)
+def test_send_phase_connection_error_does_not_chain_upstream_text(post, error):
+    """D7:送出階段非逾時的 requests 例外也不以 __cause__/__context__ 帶進 traceback
+    (與串流階段一致;JsonFormatter 會原樣輸出 traceback)。"""
+    post.error = error
+    with pytest.raises(UpstreamHTTPError) as info:
+        _recommend(post)
+    exc = info.value
+    assert exc.__cause__ is None and exc.__suppress_context__ is True
+
+
 def test_timeout_is_not_reported_as_connection_error(post):
     post.error = requests.ConnectTimeout("connect timed out")
     with pytest.raises(UpstreamTimeout) as info:

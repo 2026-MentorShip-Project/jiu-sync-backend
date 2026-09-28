@@ -759,6 +759,87 @@ def test_unexpected_error_returns_500_and_marks_failed(fake_engine):
     assert _used(client) == 0
 
 
+# ---------------------------------------------------------------------------
+# 7.2 自審:上游文字含 NUL(\u0000)時,Postgres text/jsonb 拒收——不可殘留 pending、
+# 不可變成 500(DataError 訊息會夾帶上游文字進 log,違反 D7/D11)
+# ---------------------------------------------------------------------------
+
+
+def _contains_nul(value):
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_contains_nul(k) or _contains_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_nul(v) for v in value)
+    return False
+
+
+def test_nul_in_upstream_result_is_stripped_and_succeeds(fake_engine):
+    result = _default_result()
+    restaurants = [dict(r) for r in result.restaurants]
+    restaurants[0]["name"] = "好吃\x00小館"
+    restaurants[0]["recommendReason"] = "適合\x00聚餐"
+    fake_engine.result = dataclasses.replace(
+        result,
+        restaurants=restaurants,
+        notes="部分\x00營業時間無法確認",
+        usage={**result.usage, "note\x00": "a\x00b"},
+        model="openai/gpt\x00-6-luna",
+    )
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    body = response.json()
+    assert not _contains_nul(body)
+    assert body["restaurants"][0]["name"] == "好吃小館"
+    assert body["notes"] == "部分營業時間無法確認"
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.SUCCEEDED
+    assert record.result["restaurants"][0]["name"] == "好吃小館"
+    assert not _contains_nul(record.result)
+    assert not _contains_nul(record.usage)
+    assert record.model == "openai/gpt-6-luna"
+    assert _used(client) == 1
+
+
+def test_nul_in_raw_detail_still_marks_failed_not_pending(fake_engine):
+    fake_engine.error = UpstreamInvalidResponse("structure mismatch", raw_detail="a\x00b")
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_502_BAD_GATEWAY
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.FAILED
+    assert record.error_code == "UPSTREAM_INVALID_RESPONSE"
+    assert record.error_detail == "ab"
+    assert _used(client) == 0
+
+
+def test_nul_in_unexpected_error_message_still_marks_failed(fake_engine):
+    fake_engine.error = RuntimeError("bo\x00om")
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+    client.raise_request_exception = False
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.FAILED
+    assert record.error_code == "UNEXPECTED_ERROR"
+    assert record.error_detail == "RuntimeError: boom"
+    assert _used(client) == 0
+
+
 def test_retry_after_failure_succeeds(fake_engine):
     fake_engine.error = UpstreamTimeout("read timeout")
     user = _create_user()

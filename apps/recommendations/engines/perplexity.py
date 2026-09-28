@@ -424,7 +424,9 @@ class PerplexityEngine(RecommendationEngine):
             raise UpstreamTimeout() from exc
         except requests.RequestException as exc:
             # 連線層失敗:例外訊息只用自寫摘要;DB error_detail 只記例外類型(D7/D8)。
-            raise UpstreamConnectionError(raw_detail=type(exc).__name__) from exc
+            # `from None`:requests 的訊息可能原樣帶上游 bytes(例如不合法 status line
+            # 的 `BadStatusLine('...')`,task 7.2 實測),不可經 traceback 進 log。
+            raise UpstreamConnectionError(raw_detail=type(exc).__name__) from None
 
         # 不論成功、逾時或任何例外都關閉回應,中斷與上游的連線(D5)。
         with response:

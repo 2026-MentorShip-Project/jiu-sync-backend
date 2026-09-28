@@ -153,6 +153,19 @@ def _lock_for_confirm(record):
     list(User.objects.select_for_update().filter(pk=record.user_id).only("pk"))
 
 
+def _strip_nul(value):
+    """移除所有字串(含 dict key)中的 NUL(\\u0000):Postgres text/jsonb 不接受 NUL,
+    寫入會丟 DataError,其訊息夾帶資料內容(違反 D7/D11),且失敗路徑寫不進去會殘留
+    ``pending``。上游/例外文字寫入 DB 前一律經過這裡(task 7.2 code-review)。"""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
 def _usage_number(usage, *path):
     value = usage
     for key in path:
@@ -244,7 +257,9 @@ class RestaurantRecommendationView(APIView):
 
         try:
             latency_ms = _elapsed_ms(started)
-            result_body = {"restaurants": result.restaurants, "notes": result.notes}
+            result_body = _strip_nul({"restaurants": result.restaurants, "notes": result.notes})
+            usage = _strip_nul(result.usage)
+            model = _strip_nul(result.model)
             # 寫入失敗時整段回滾(外層若有 transaction 則為 savepoint),之後由
             # except 把紀錄標成 failed。
             with transaction.atomic():
@@ -262,8 +277,8 @@ class RestaurantRecommendationView(APIView):
                 ).update(
                     **outcome,
                     result=result_body,
-                    usage=result.usage,
-                    model=result.model,
+                    usage=usage,
+                    model=model,
                     latency_ms=latency_ms,
                     completed_at=confirmed_at,
                 )
@@ -277,7 +292,7 @@ class RestaurantRecommendationView(APIView):
                 level=logging.ERROR,
             )
             raise
-        cost_usd = _usage_number(result.usage, "cost", "total_cost")
+        cost_usd = _usage_number(usage, "cost", "total_cost")
         if exceeded:
             # pending 已過期、期間額度被用滿:不計次,回與一般額度用完相同的 403。
             logger.warning(
@@ -296,9 +311,9 @@ class RestaurantRecommendationView(APIView):
         success_fields = {
             "latency_ms": latency_ms,
             "restaurant_count": len(result.restaurants),
-            "total_tokens": _usage_number(result.usage, "total_tokens"),
+            "total_tokens": _usage_number(usage, "total_tokens"),
             "cost_usd": cost_usd,
-            "model": result.model,
+            "model": model,
         }
         # 紀錄已被 cascade 刪除時仍回 201 與結果,本次不計次(D4 可接受的極端情況)。
         logger.info(
@@ -405,7 +420,7 @@ class RestaurantRecommendationView(APIView):
         ).update(
             status=Status.FAILED,
             error_code=error_code,
-            error_detail=str(detail)[:ERROR_DETAIL_MAX_LENGTH],
+            error_detail=_strip_nul(str(detail))[:ERROR_DETAIL_MAX_LENGTH],
             latency_ms=latency_ms,
             completed_at=timezone.now(),
         )
