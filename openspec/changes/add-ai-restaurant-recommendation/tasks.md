@@ -47,7 +47,7 @@
 
 ## 5. 正式環境設定
 
-- [ ] 5.1 `Dockerfile` gunicorn 改為 `--worker-class gthread --workers 3 --threads 4 --timeout 60`(D10);`docker build` 成功且容器內 `gunicorn --check-config` 通過 — (auto)
+- [x] 5.1 `Dockerfile` gunicorn 改為 `--worker-class gthread --workers 3 --threads 4 --timeout 60`(D10);`docker build` 成功且容器內 `gunicorn --check-config` 通過 — (auto)
 - [ ] 5.2 EC2 部署前確認:host nginx `proxy_read_timeout` ≥ 60 秒;EC2 `.env` 加上 `PERPLEXITY_API_KEY`(以及 0.2 選定且與預設不同時的 `PERPLEXITY_MODEL`)— (manual,跨 repo / 正式環境)
 
 ## 6. 收尾
