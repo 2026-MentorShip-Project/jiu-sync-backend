@@ -10,6 +10,7 @@
 import datetime
 import json
 import re
+import time
 import unicodedata
 from typing import NamedTuple
 
@@ -30,6 +31,10 @@ from .base import (
 
 API_URL = "https://api.perplexity.ai/v1/agent"
 CONNECT_TIMEOUT_SECONDS = 5
+READ_CHUNK_SIZE = 8192
+
+# 整體期限用的時鐘(D5);模組層級變數讓測試以 monkeypatch 注入假時鐘,不必 sleep。
+_monotonic = time.monotonic
 RAW_DETAIL_MAX_LENGTH = 2000
 MAX_RESTAURANTS = 5
 MODEL_MAX_LENGTH = 100  # RestaurantRecommendationRequest.model 的 max_length
@@ -400,6 +405,9 @@ class PerplexityEngine(RecommendationEngine):
 
     def recommend(self, context: RecommendationContext) -> RecommendationResult:
         body = self.build_request(context)
+        # 整體期限自送出請求起算(D5):requests 的 read timeout 只限制「每次讀取」,
+        # 上游緩慢分段回傳時整體可無限延長,因此以 stream=True 逐塊讀取並自行計時。
+        deadline = _monotonic() + settings.PERPLEXITY_TIMEOUT_SECONDS
         try:
             response = requests.post(
                 API_URL,
@@ -408,7 +416,8 @@ class PerplexityEngine(RecommendationEngine):
                     "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY.strip()}",
                     "Content-Type": "application/json",
                 },
-                timeout=(CONNECT_TIMEOUT_SECONDS, settings.PERPLEXITY_TIMEOUT_SECONDS),
+                stream=True,
+                timeout=(CONNECT_TIMEOUT_SECONDS, _remaining(deadline)),
             )
         except requests.Timeout as exc:
             # requests 的例外訊息只含 URL 與錯誤類型,維持原樣串接(D7)。
@@ -417,7 +426,9 @@ class PerplexityEngine(RecommendationEngine):
             # 連線層失敗:例外訊息只用自寫摘要;DB error_detail 只記例外類型(D7/D8)。
             raise UpstreamConnectionError(raw_detail=type(exc).__name__) from exc
 
-        raw_body = response.text
+        # 不論成功、逾時或任何例外都關閉回應,中斷與上游的連線(D5)。
+        with response:
+            raw_body = _read_body(response, deadline)
         if not 200 <= response.status_code < 300:
             raise UpstreamHTTPError(response.status_code, raw_detail=_truncate(raw_body))
         return self._parse(raw_body)
@@ -495,6 +506,44 @@ class PerplexityEngine(RecommendationEngine):
             model=model[:MODEL_MAX_LENGTH],
             model_fallback=model_fallback,
         )
+
+
+def _remaining(deadline):
+    return deadline - _monotonic()
+
+
+def _read_body(response, deadline):
+    """逐塊讀完 body 再整份以 UTF-8 解碼;累計耗時超過整體期限即丟 ``UpstreamTimeout``
+    (D5)。呼叫端負責關閉 ``response``。
+
+    每塊讀取仍受 ``requests`` 的 read timeout 限制(送出時設為當下剩餘期限);串流中
+    的 ``requests`` 例外若發生在期限之後(例如被包成 ``ConnectionError`` 的 read
+    timeout)視為逾時,期限內則為連線層失敗。例外訊息一律自寫,不含上游文字(D7)。
+
+    不設 body 大小上限,與改用串流前的 ``response.text`` 行為一致;讀取量受整體期限約束。
+    """
+    chunks = []
+    try:
+        if _remaining(deadline) < 0:
+            raise UpstreamTimeout("upstream exceeded total deadline before body")
+        for chunk in response.iter_content(chunk_size=READ_CHUNK_SIZE):
+            chunks.append(chunk)
+            if _remaining(deadline) < 0:
+                raise UpstreamTimeout("upstream exceeded total deadline while streaming")
+    except requests.RequestException as exc:
+        # 串流中的例外訊息可能夾帶上游 bytes(例如 urllib3 InvalidChunkLength 會帶原始
+        # chunk 長度行),`from None` 讓它不進 traceback/log;DB 只記例外類型(D7)。
+        if isinstance(exc, requests.Timeout) or _remaining(deadline) < 0:
+            raise UpstreamTimeout(
+                "upstream exceeded total deadline while streaming", raw_detail=type(exc).__name__
+            ) from None
+        raise UpstreamConnectionError(raw_detail=type(exc).__name__) from None
+    except UpstreamTimeout:
+        raise
+    except Exception as exc:
+        # requests 未包裝的例外(例如 OSError)也不可離開引擎(D7:對外只丟 EngineError)。
+        raise UpstreamConnectionError(raw_detail=type(exc).__name__) from None
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _parse_message(text):

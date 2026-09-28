@@ -14,9 +14,12 @@ from django.utils import timezone
 from .models import RestaurantRecommendationRequest
 
 # pending 視為「進行中、佔用一次額度」的時限(D5)。必須大於任何活著的請求可能
-# 存活的上限:gunicorn --timeout 60 秒會直接殺掉超時 worker、上游 HTTP timeout
-# 45 秒,所以 5 分鐘 > 60 秒 > 45 秒——活著的請求不可能比自己的 pending 更久,
-# 不會因過期而多放出額度;process 被殺留下的 pending 5 分鐘後自動不計數。
+# 存活的上限,否則 pending 過期後額度被多放出一次、原請求之後又成功計次而超用。
+# 請求存活上限由引擎整體期限(PERPLEXITY_TIMEOUT_SECONDS,自送出請求起算)保證,
+# 不依賴 gunicorn(gthread 的 --timeout 不限制單一請求);這組數字的關係由
+# engines.check_settings() 在啟動時檢查 PENDING_EXPIRY > 整體期限 + 60 秒,
+# 不成立即 ImproperlyConfigured——本註解只描述,不當作保證。
+# process 被殺留下的 pending 5 分鐘後自動不計數。
 PENDING_EXPIRY = timedelta(minutes=5)
 
 

@@ -49,6 +49,8 @@
 
 - [x] 5.1 `Dockerfile` gunicorn 改為 `--worker-class gthread --workers 3 --threads 4 --timeout 60`(D10);`docker build` 成功且容器內 `gunicorn --check-config` 通過 — (auto)
 - [ ] 5.3 [RED→GREEN] 引擎整體期限(design.md D5 修訂):① 上游以慢速分段回傳(假 response 的 `iter_content` 每塊之間推進 monotonic 時鐘,每塊都在單次讀取 timeout 內,但總和超過 `PERPLEXITY_TIMEOUT_SECONDS`)→ `UpstreamTimeout`,且回應被關閉;② 總時間剛好在期限內 → 正常成功;③ `requests.post` 以 `stream=True` 呼叫、connect timeout 5、read timeout 不超過剩餘期限;④ 回應 body 讀完後再解析,既有 4.x 測試全部仍通過(若既有測試的 mock 只提供 `.json()`/`.text`,可調整 mock 以支援串流——屬實作方式變更、非商業邏輯變更,斷言不得放寬);⑤ `PENDING_EXPIRY` ≤ `PERPLEXITY_TIMEOUT_SECONDS` + 60 秒時 `AppConfig.ready()` 丟 `ImproperlyConfigured`,預設值通過;⑥ view 層:整體期限觸發時回 504、不計次、紀錄 failed。同步修正 `apps/recommendations/quota.py` 的 `PENDING_EXPIRY` 註解,改為引用 D5 的啟動檢查。先寫測試確認 FAIL — (auto) `pytest apps/recommendations` 全綠
+  - RED 結果(2026-09-28):既有 4.x 假回應改為只提供串流介面(`FakeResponse`、`test_views.py` 的 `_FakeHTTPResponse`,斷言未改;`(5, 45)`/`(5, 30)` 兩則加上凍結的假時鐘以維持精確相等)後 133 則 FAIL(無 `.text`)、新測試 13 則 ERROR(無 `_monotonic`)、啟動檢查 9 則 DID NOT RAISE;實作後全綠。code-review 補「串流中非 requests 例外仍轉 `EngineError`」2 則(RED→GREEN)。
+  - **未完成、待 `opsx:update` + grill-me**:code-review 兩個子審查皆指出 ③「每次讀取 timeout 不超過剩餘期限」實際未達成——`requests` 的 read timeout 只在送出時設定一次(≈整體期限 T)且作用於每次 socket recv,期限只在 chunk 之間檢查:單次卡住可再延長約 T(最壞 ≈ connect + 2T,預設 T=45 約 95 秒 < 5 分鐘,目前成立);單一 chunk 內逐位元組慢速回傳則理論上無上限。啟動檢查接受 T=239,但此時最壞情況 > 300 秒,D5 不變式可能被打破。修法(watchdog 到期關閉連線 / 每次讀取前調整 socket timeout / 改啟動檢查公式)屬額度正確性邊界決策,未在 implement 內拍板。
 - [ ] 5.2 EC2 部署前確認:host nginx `proxy_read_timeout` ≥ 60 秒;EC2 `.env` 加上 `PERPLEXITY_API_KEY`(以及 0.2 選定且與預設不同時的 `PERPLEXITY_MODEL`)— (manual,跨 repo / 正式環境)
 
 ## 6. 收尾

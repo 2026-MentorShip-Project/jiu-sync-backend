@@ -46,14 +46,44 @@ def perplexity_settings(settings):
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, body=None, text=None):
-        self.status_code = status_code
-        if text is None:
-            text = json.dumps(body, ensure_ascii=False)
-        self.text = text
+    """只提供串流介面(``iter_content``/``close``/context manager),沒有 ``.text``/
+    ``.json()``:引擎必須逐塊讀完 body 再解析(task 5.3 ④,design.md D5/D8)。
 
-    def json(self):
-        return json.loads(self.text)
+    ``chunks`` 可直接指定每一塊 bytes;``on_chunk(i)`` 在交出第 i 塊前呼叫(用來推進
+    假的 monotonic 時鐘或丟例外)。``chunks_served`` 記錄實際交出幾塊。
+    """
+
+    def __init__(self, status_code=200, body=None, text=None, *, chunks=None, on_chunk=None):
+        self.status_code = status_code
+        if chunks is None:
+            if text is None:
+                text = json.dumps(body, ensure_ascii=False)
+            raw = text.encode("utf-8")
+            # 刻意切在多位元組 UTF-8 字元中間,確保引擎是整份 bytes 讀完才解碼
+            chunks = [raw[i:i + 7] for i in range(0, len(raw), 7)] or [b""]
+        self.chunks = chunks
+        self.on_chunk = on_chunk
+        self.chunks_served = 0
+        self.closed = False
+        self.iter_calls = []
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        self.iter_calls.append({"chunk_size": chunk_size, "decode_unicode": decode_unicode})
+        for index, chunk in enumerate(self.chunks):
+            if self.on_chunk is not None:
+                self.on_chunk(index)
+            self.chunks_served += 1
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
 
 
 class FakePost:
@@ -198,7 +228,7 @@ def _recommend(post, body=None, *, status_code=200, text=None, ctx=None):
 # ---------------------------------------------------------------------------
 
 
-def test_request_url_auth_tools_timeout(post):
+def test_request_url_auth_tools_timeout(post, clock):
     _recommend(post)
 
     call = post.calls[-1]
@@ -208,7 +238,7 @@ def test_request_url_auth_tools_timeout(post):
     assert call["json"]["tools"] == [{"type": "web_search"}]
 
 
-def test_timeout_follows_setting(post, settings):
+def test_timeout_follows_setting(post, settings, clock):
     settings.PERPLEXITY_TIMEOUT_SECONDS = 30
     _recommend(post)
     assert post.calls[-1]["timeout"] == (5, 30)
@@ -1052,3 +1082,260 @@ def test_system_prompt_keeps_plan_guards(post, phrase):
 def test_user_prompt_keeps_plan_requirements(post, phrase):
     _recommend(post)
     assert phrase in post.body["input"]
+
+
+# ---------------------------------------------------------------------------
+# 5.3 引擎整體期限(design.md D5/D8):stream=True 逐塊讀取,以 monotonic 時鐘計算
+# 自送出請求起的總耗時,超過 PERPLEXITY_TIMEOUT_SECONDS 即關閉回應並丟 UpstreamTimeout。
+# 時鐘以 monkeypatch 注入,測試不 sleep。
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr("apps.recommendations.engines.perplexity._monotonic", fake)
+    return fake
+
+
+def _slow_response(clock, *, per_chunk, chunk_count, status_code=200, body=None):
+    """body 平均切成 ``chunk_count`` 塊,每塊交出前時鐘推進 ``per_chunk`` 秒。"""
+    raw = json.dumps(body if body is not None else _body(), ensure_ascii=False).encode("utf-8")
+    size = -(-len(raw) // chunk_count)
+    chunks = [raw[i:i + size] for i in range(0, len(raw), size)]
+    assert len(chunks) == chunk_count
+    return FakeResponse(
+        status_code, chunks=chunks, on_chunk=lambda index: clock.advance(per_chunk)
+    )
+
+
+def test_request_is_streamed_with_connect_5_and_read_within_budget(post, clock):
+    """③ stream=True、connect timeout 5、read timeout 不超過剩餘整體期限。"""
+    _recommend(post)
+    call = post.calls[-1]
+    assert call["stream"] is True
+    connect, read = call["timeout"]
+    assert connect == 5
+    assert 0 < read <= 45
+
+
+def test_read_timeout_never_exceeds_budget_setting(post, clock, settings):
+    settings.PERPLEXITY_TIMEOUT_SECONDS = 30
+    _recommend(post)
+    connect, read = post.calls[-1]["timeout"]
+    assert connect == 5
+    assert 0 < read <= 30
+
+
+@pytest.mark.parametrize("status_code", [200, 500])
+def test_slow_trickle_over_total_deadline_raises_timeout_and_closes(post, clock, status_code):
+    """① 每塊間隔 10 秒(遠小於單次讀取 timeout),總和超過 45 秒 → UpstreamTimeout。"""
+    body = _body(notes=MARKER) if status_code == 200 else {"error": {"message": MARKER}}
+    response = _slow_response(
+        clock, per_chunk=10, chunk_count=6, status_code=status_code, body=body
+    )
+    post.response = response
+
+    with pytest.raises(UpstreamTimeout) as info:
+        PerplexityEngine().recommend(_ctx())
+
+    assert response.closed is True
+    # 第 5 塊交出後累計 50 秒 > 45 秒即中斷,不再讀第 6 塊
+    assert response.chunks_served == 5
+    exc = info.value
+    assert exc.error_code == "UPSTREAM_TIMEOUT"
+    for rendered in (str(exc), repr(exc)):
+        assert MARKER not in rendered
+        assert "test-key-123" not in rendered
+
+
+def test_total_time_exactly_at_deadline_succeeds(post, clock):
+    """② 總耗時剛好等於期限(5 塊 × 9 秒 = 45 秒)→ 正常成功,回應仍被關閉。"""
+    response = _slow_response(clock, per_chunk=9, chunk_count=5)
+    post.response = response
+
+    result = PerplexityEngine().recommend(_ctx())
+
+    assert [r["name"] for r in result.restaurants] == ["偈亭泡菜鍋(西屯店)", "鮮友火鍋(中科旗艦店)"]
+    assert response.chunks_served == 5
+    assert response.closed is True
+
+
+def test_deadline_follows_timeout_setting(post, clock, settings):
+    settings.PERPLEXITY_TIMEOUT_SECONDS = 20
+    response = _slow_response(clock, per_chunk=5, chunk_count=5)  # 25 秒 > 20 秒
+    post.response = response
+    with pytest.raises(UpstreamTimeout):
+        PerplexityEngine().recommend(_ctx())
+    assert response.chunks_served == 5
+    assert response.closed is True
+
+
+def test_deadline_counts_time_spent_before_response_headers(monkeypatch, clock):
+    """期限自送出請求起算:等 header 就花掉 46 秒 → 不讀 body、直接 UpstreamTimeout。"""
+    response = FakeResponse(200, _body())
+
+    def slow_post(url, **kwargs):
+        clock.advance(46)
+        return response
+
+    monkeypatch.setattr("requests.post", slow_post)
+
+    with pytest.raises(UpstreamTimeout):
+        PerplexityEngine().recommend(_ctx())
+    assert response.chunks_served == 0
+    assert response.closed is True
+
+
+def test_read_error_after_deadline_is_timeout_not_connection_error(post, clock):
+    """requests 會把串流中的 read timeout 包成 ConnectionError;期限已過時一律視為逾時。"""
+
+    def on_chunk(index):
+        if index == 2:
+            clock.advance(50)
+            raise requests.ConnectionError(f"Read timed out {MARKER}")
+
+    response = FakeResponse(200, _body(), on_chunk=on_chunk)
+    post.response = response
+
+    with pytest.raises(UpstreamTimeout) as info:
+        PerplexityEngine().recommend(_ctx())
+    assert response.closed is True
+    assert MARKER not in str(info.value) and MARKER not in repr(info.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.ChunkedEncodingError(f"Connection broken {MARKER}"),
+        requests.ConnectionError(f"Connection reset {MARKER}"),
+    ],
+    ids=["chunked", "connection"],
+)
+def test_stream_error_before_deadline_is_connection_error(post, clock, error):
+    """期限內串流中斷 → UpstreamConnectionError(D7:引擎對外只丟 EngineError)。"""
+
+    def on_chunk(index):
+        if index == 2:
+            raise error
+
+    response = FakeResponse(200, _body(), on_chunk=on_chunk)
+    post.response = response
+
+    with pytest.raises(UpstreamHTTPError) as info:
+        PerplexityEngine().recommend(_ctx())
+    exc = info.value
+    assert not isinstance(exc, UpstreamTimeout)
+    assert exc.error_code == "UPSTREAM_CONNECTION_ERROR"
+    assert exc.status is None
+    assert response.closed is True
+    for rendered in (str(exc), repr(exc)):
+        assert MARKER not in rendered
+
+
+@pytest.mark.parametrize(
+    "status_code, body, expected",
+    [
+        (200, None, None),
+        (429, {"error": {"message": "slow down"}}, UpstreamHTTPError),
+        (200, "not json", UpstreamInvalidResponse),
+    ],
+    ids=["success", "http_error", "invalid"],
+)
+def test_response_is_closed_on_every_outcome(post, clock, status_code, body, expected):
+    if body is None:
+        response = FakeResponse(status_code, _body())
+    elif isinstance(body, str):
+        response = FakeResponse(status_code, text=body)
+    else:
+        response = FakeResponse(status_code, body)
+    post.response = response
+
+    if expected is None:
+        PerplexityEngine().recommend(_ctx())
+    else:
+        with pytest.raises(expected):
+            PerplexityEngine().recommend(_ctx())
+    assert response.closed is True
+
+
+# ---------------------------------------------------------------------------
+# 5.3 ⑤ 啟動檢查:PENDING_EXPIRY 必須 > PERPLEXITY_TIMEOUT_SECONDS + 60 秒(D5)
+# ---------------------------------------------------------------------------
+
+
+def _ready():
+    apps.get_app_config("recommendations").ready()
+
+
+def test_default_pending_expiry_and_timeout_pass_startup_check(settings):
+    settings.PERPLEXITY_TIMEOUT_SECONDS = 45
+    _ready()  # 預設值:5 分鐘 > 45 + 60 秒
+
+
+@pytest.mark.parametrize("timeout, ok", [(239, True), (240, False), (1000, False)])
+def test_timeout_plus_buffer_must_be_below_pending_expiry(settings, timeout, ok):
+    settings.PERPLEXITY_TIMEOUT_SECONDS = timeout
+    if ok:
+        _ready()
+    else:
+        with pytest.raises(ImproperlyConfigured):
+            _ready()
+
+
+@pytest.mark.parametrize("seconds, ok", [(105, False), (106, True)])
+def test_startup_check_reads_pending_expiry(settings, monkeypatch, seconds, ok):
+    import datetime
+
+    monkeypatch.setattr(
+        "apps.recommendations.quota.PENDING_EXPIRY", datetime.timedelta(seconds=seconds)
+    )
+    settings.PERPLEXITY_TIMEOUT_SECONDS = 45
+    if ok:
+        _ready()
+    else:
+        with pytest.raises(ImproperlyConfigured):
+            _ready()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, None, "45", True, 45.5])
+def test_non_positive_or_non_int_timeout_is_improperly_configured(settings, timeout):
+    settings.PERPLEXITY_TIMEOUT_SECONDS = timeout
+    with pytest.raises(ImproperlyConfigured):
+        _ready()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(f"socket reset {MARKER}"), ValueError(f"bad chunk {MARKER}")],
+    ids=["oserror", "valueerror"],
+)
+def test_non_requests_stream_error_is_still_engine_error(post, clock, error):
+    """D7:串流中 requests 未包裝的例外也不可離開引擎,且訊息不含上游文字。"""
+
+    def on_chunk(index):
+        if index == 1:
+            raise error
+
+    response = FakeResponse(200, _body(), on_chunk=on_chunk)
+    post.response = response
+
+    with pytest.raises(EngineError) as info:
+        PerplexityEngine().recommend(_ctx())
+    exc = info.value
+    assert exc.error_code == "UPSTREAM_CONNECTION_ERROR"
+    assert exc.__cause__ is None and exc.__suppress_context__ is True
+    assert response.closed is True
+    for rendered in (str(exc), repr(exc)):
+        assert MARKER not in rendered

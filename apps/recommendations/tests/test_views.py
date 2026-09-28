@@ -1089,9 +1089,31 @@ def test_failure_while_saving_success_marks_failed_not_pending(fake_engine, capl
 
 
 class _FakeHTTPResponse:
-    def __init__(self, body):
+    """只提供串流介面(task 5.3:引擎以 stream=True 逐塊讀取);``on_chunk`` 可推進假時鐘。"""
+
+    def __init__(self, body, *, chunk_count=3, on_chunk=None):
         self.status_code = 200
-        self.text = json.dumps(body, ensure_ascii=False)
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        size = max(1, -(-len(raw) // chunk_count))
+        self.chunks = [raw[i:i + size] for i in range(0, len(raw), size)]
+        self.on_chunk = on_chunk
+        self.closed = False
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        for index, chunk in enumerate(self.chunks):
+            if self.on_chunk is not None:
+                self.on_chunk(index)
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
 
 
 @pytest.fixture
@@ -1101,13 +1123,15 @@ def perplexity_http(settings, monkeypatch):
     settings.PERPLEXITY_API_KEY = "test-key-123"
     settings.PERPLEXITY_MODEL = "preset:low"
     settings.PERPLEXITY_TIMEOUT_SECONDS = 45
-    fake = {"error": None, "body": None, "calls": 0}
+    fake = {"error": None, "body": None, "calls": 0, "on_chunk": None, "responses": []}
 
     def post(url, **kwargs):
         fake["calls"] += 1
         if fake["error"] is not None:
             raise fake["error"]
-        return _FakeHTTPResponse(fake["body"])
+        response = _FakeHTTPResponse(fake["body"], on_chunk=fake["on_chunk"])
+        fake["responses"].append(response)
+        return response
 
     monkeypatch.setattr("requests.post", post)
     return fake
@@ -1215,3 +1239,40 @@ def test_response_with_model_has_no_model_fallback_end_to_end(perplexity_http, c
     line = json.loads(JsonFormatter().format(record))
     assert "model_fallback" not in line
     assert line["model"] == "openai/gpt-6-luna"
+
+
+# ---------------------------------------------------------------------------
+# 5.3 ⑥ 引擎整體期限觸發 → 504、不計次、紀錄 failed(design.md D5)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_total_deadline_returns_504_not_counted(perplexity_http, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    now = {"t": 5000.0}
+    monkeypatch.setattr(
+        "apps.recommendations.engines.perplexity._monotonic", lambda: now["t"]
+    )
+
+    def on_chunk(index):
+        now["t"] += 20  # 每塊 20 秒(單次讀取不逾時),3 塊累計 60 秒 > 45 秒
+
+    perplexity_http["body"] = _perplexity_body_without_model()
+    perplexity_http["on_chunk"] = on_chunk
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_504_GATEWAY_TIMEOUT
+    assert response.json()["code"] == "AI_RECOMMENDATION_UPSTREAM_TIMEOUT"
+    assert perplexity_http["calls"] == 1
+    assert perplexity_http["responses"][0].closed is True
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.FAILED
+    assert record.error_code == RestaurantRecommendationRequest.ErrorCode.UPSTREAM_TIMEOUT
+    assert record.completed_at is not None
+    assert _used(client) == 0
+    [failed] = _events(caplog, "ai_rec.failed")
+    assert json.loads(JsonFormatter().format(failed))["error_code"] == "UPSTREAM_TIMEOUT"
+    assert _events(caplog, "ai_rec.succeeded") == []
