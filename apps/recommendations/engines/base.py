@@ -47,9 +47,22 @@ class UpstreamTimeout(EngineError):
 class UpstreamHTTPError(EngineError):
     error_code = "UPSTREAM_HTTP_ERROR"
 
-    def __init__(self, status, *, raw_detail=None):
-        super().__init__(f"upstream HTTP {status}", raw_detail=raw_detail)
+    def __init__(self, status, *, raw_detail=None, message=None):
+        super().__init__(message or f"upstream HTTP {status}", raw_detail=raw_detail)
         self.status = status
+
+
+class UpstreamConnectionError(UpstreamHTTPError):
+    """連線層失敗(DNS、連線被拒、TLS、proxy 等非逾時的 ``requests`` 例外)。
+
+    沒有 HTTP 狀態(``status`` 為 None);view 對應 502,``error_code`` 與上游 5xx 分開
+    以便監控(D8)。
+    """
+
+    error_code = "UPSTREAM_CONNECTION_ERROR"
+
+    def __init__(self, *, raw_detail=None):
+        super().__init__(None, raw_detail=raw_detail, message="upstream connection error")
 
 
 class UpstreamInvalidResponse(EngineError):

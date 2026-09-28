@@ -14,6 +14,7 @@ from datetime import time, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
+import requests
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -1009,3 +1010,101 @@ def test_failure_while_saving_success_marks_failed_not_pending(fake_engine, capl
     assert len(_events(caplog, "ai_rec.failed")) == 1
     assert _events(caplog, "ai_rec.succeeded") == []
     assert _used(client) == 0
+
+
+# ---------------------------------------------------------------------------
+# 4.4 真實 PerplexityEngine + 假 HTTP(不打網路):連線失敗、回應缺 model
+# ---------------------------------------------------------------------------
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body):
+        self.status_code = 200
+        self.text = json.dumps(body, ensure_ascii=False)
+
+
+@pytest.fixture
+def perplexity_http(settings, monkeypatch):
+    """view 用真的 ``get_engine()``(PerplexityEngine),只替換 ``requests.post``。"""
+    settings.RECOMMENDATION_ENGINE = "perplexity"
+    settings.PERPLEXITY_API_KEY = "test-key-123"
+    settings.PERPLEXITY_MODEL = "preset:low"
+    settings.PERPLEXITY_TIMEOUT_SECONDS = 45
+    fake = {"error": None, "body": None, "calls": 0}
+
+    def post(url, **kwargs):
+        fake["calls"] += 1
+        if fake["error"] is not None:
+            raise fake["error"]
+        return _FakeHTTPResponse(fake["body"])
+
+    monkeypatch.setattr("requests.post", post)
+    return fake
+
+
+def test_connection_error_returns_502_not_counted_with_connection_error_code(
+    perplexity_http, caplog
+):
+    caplog.set_level(logging.INFO)
+    perplexity_http["error"] = requests.ConnectionError(f"Failed to resolve host {MARKER}")
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_502_BAD_GATEWAY
+    assert response.json()["code"] == "AI_RECOMMENDATION_UPSTREAM_FAILED"
+    assert "notes" not in response.json()
+    assert perplexity_http["calls"] == 1
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.FAILED
+    assert record.error_code == RestaurantRecommendationRequest.ErrorCode.UPSTREAM_CONNECTION_ERROR
+    assert record.completed_at is not None
+    assert _used(client) == 0
+
+    records = _events(caplog, "ai_rec.failed")
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    line = json.loads(JsonFormatter().format(records[0]))
+    assert line["error_code"] == "UPSTREAM_CONNECTION_ERROR"
+    assert line["upstream_status"] is None
+    assert line["request_id"] == str(record.id)
+    assert MARKER not in line["exc_message"]
+
+
+def _perplexity_body_without_model():
+    restaurant = {
+        "name": "好吃小館", "address": "台北市中正區忠孝西路一段 1 號", "rating": 4.5,
+        "review_count": 120, "opening_hours": None, "price_range": "$$",
+        "avg_price_per_person": None, "phone": None, "cuisine_type": "台菜",
+        "distance_info": None, "recommend_reason": "適合聚餐",
+    }
+    text = json.dumps({"restaurants": [restaurant], "notes": None}, ensure_ascii=False)
+    return {
+        "id": "resp_x",
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+        "usage": {"total_tokens": 100, "cost": {"total_cost": 0.01}},
+    }
+
+
+def test_response_without_model_succeeds_with_configured_model(perplexity_http, settings, caplog):
+    caplog.set_level(logging.INFO)
+    settings.PERPLEXITY_MODEL = "openai/gpt-6-luna-configured"
+    perplexity_http["body"] = _perplexity_body_without_model()
+    user = _create_user()
+    event = _create_finalized_event(user)
+    client = _auth_client(user)
+
+    response = client.post(_url(event.id), {}, format="json")
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert [r["name"] for r in response.json()["restaurants"]] == ["好吃小館"]
+    record = RestaurantRecommendationRequest.objects.get()
+    assert record.status == Status.SUCCEEDED
+    assert record.model == "openai/gpt-6-luna-configured"
+    assert _used(client) == 1
+    line = json.loads(JsonFormatter().format(_events(caplog, "ai_rec.succeeded")[0]))
+    assert line["model"] == "openai/gpt-6-luna-configured"
+    assert _events(caplog, "ai_rec.failed") == []

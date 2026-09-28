@@ -503,6 +503,117 @@ def test_model_comes_from_response_not_setting(post):
     assert PerplexityEngine().model_name == "preset:low"
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b.pop("model"),
+        lambda b: b.update(model=None),
+        lambda b: b.update(model=""),
+        lambda b: b.update(model="   "),
+        lambda b: b.update(model=5),
+        lambda b: b.update(model=["openai/gpt-6-luna"]),
+    ],
+    ids=["missing", "null", "empty", "blank", "number", "list"],
+)
+def test_missing_or_invalid_model_falls_back_to_setting(post, settings, mutate):
+    """4.4 ②:model 只是紀錄用欄位,不因缺少而讓已付費且正常的推薦失敗(D8)。"""
+    settings.PERPLEXITY_MODEL = "openai/gpt-6-luna-fallback"
+    body = _body()
+    mutate(body)
+    result = _recommend(post, body)
+    assert result.model == "openai/gpt-6-luna-fallback"
+    assert [r["id"] for r in result.restaurants] == ["r1", "r2"]
+
+
+def test_fallback_model_is_preset_setting_as_is(post):
+    body = _body()
+    body.pop("model")
+    assert _recommend(post, body).model == "preset:low"
+
+
+def _obj_text(names, notes=None):
+    restaurants = [_restaurant(n, f"{n} 的地址") for n in names]
+    return json.dumps({"restaurants": restaurants, "notes": notes}, ensure_ascii=False)
+
+
+def _body_with_messages(*messages):
+    body = _body()
+    body["output"] = [copy.deepcopy(DEFAULT_SOURCES), *messages]
+    return body
+
+
+def _names(result):
+    return [r["name"] for r in result.restaurants]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        _message("```json\n{broken"),
+        _message(json.dumps({"restaurants": "不是陣列", "notes": None})),
+        _message(json.dumps({"notes": None})),
+        {"type": "message", "content": []},
+    ],
+    ids=["not_json", "restaurants_not_list", "missing_restaurants", "no_text"],
+)
+def test_first_message_invalid_second_valid_uses_second(post, first):
+    """4.4 ③:多個 message 依序逐一嘗試,取第一個能解析且通過結構驗證的(D8)。"""
+    body = _body_with_messages(first, _message(_obj_text(["第二則店"], notes="第二則")))
+    result = _recommend(post, body)
+    assert _names(result) == ["第二則店"]
+    assert result.notes == "第二則"
+
+
+def test_two_valid_messages_uses_first(post):
+    body = _body_with_messages(
+        _message(_obj_text(["第一則店"], notes="第一則")),
+        _message(_obj_text(["第二則店"], notes="第二則")),
+    )
+    result = _recommend(post, body)
+    assert _names(result) == ["第一則店"]
+    assert result.notes == "第一則"
+
+
+def test_all_messages_invalid_raises_invalid_response_without_upstream_text(post):
+    body = _body_with_messages(
+        _message(f"not json {MARKER}"),
+        _message(json.dumps({"restaurants": MARKER, "notes": None}, ensure_ascii=False)),
+    )
+    with pytest.raises(UpstreamInvalidResponse) as info:
+        _recommend(post, body)
+    exc = info.value
+    for rendered in (str(exc), repr(exc)):
+        assert MARKER not in rendered
+    assert MARKER in exc.raw_detail
+    assert len(exc.raw_detail) <= 2000
+
+
+def test_messages_are_not_concatenated_across_items(post):
+    """一個合法 JSON 被拆在兩個 message → 各自都不合法 → UpstreamInvalidResponse。"""
+    text = _obj_text(["店"])
+    half = len(text) // 2
+    body = _body_with_messages(_message(text[:half]), _message(text[half:]))
+    with pytest.raises(UpstreamInvalidResponse):
+        _recommend(post, body)
+
+
+def test_content_texts_within_one_message_are_joined(post):
+    text = _obj_text(["同一則店"])
+    half = len(text) // 2
+    message = _message(text[:half])
+    message["content"].append({"type": "output_text", "annotations": [], "text": text[half:]})
+    assert _names(_recommend(post, _body_with_messages(message))) == ["同一則店"]
+
+
+def test_sources_from_all_messages_are_used_for_source_url(post):
+    first = _message("```json\n{broken")
+    first["content"][0]["annotations"] = [
+        {"type": "url_citation", "title": "第二則店 官網", "url": "https://example.com/2"}
+    ]
+    body = _body_with_messages(first, _message(_obj_text(["第二則店"])))
+    assert _recommend(post, body).restaurants[0]["sourceUrl"] == "https://example.com/2"
+
+
 # ---------------------------------------------------------------------------
 # ⑦–⑨ 錯誤
 # ---------------------------------------------------------------------------
@@ -518,6 +629,41 @@ def test_connect_timeout_also_upstream_timeout(post):
     post.error = requests.ConnectTimeout("connect timed out")
     with pytest.raises(UpstreamTimeout):
         _recommend(post)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.ConnectionError(f"Failed to resolve api.perplexity.ai {MARKER}"),
+        requests.exceptions.SSLError(f"certificate verify failed {MARKER}"),
+        requests.exceptions.ProxyError(f"proxy refused {MARKER}"),
+        requests.exceptions.TooManyRedirects(f"Exceeded 30 redirects {MARKER}"),
+        requests.RequestException(f"generic {MARKER}"),
+    ],
+    ids=["connection", "ssl", "proxy", "redirects", "request_exception"],
+)
+def test_connection_errors_raise_http_error_with_connection_code(post, error):
+    """4.4 ①:非逾時的連線層失敗 → UpstreamHTTPError(status None)、UPSTREAM_CONNECTION_ERROR。"""
+    post.error = error
+    with pytest.raises(UpstreamHTTPError) as info:
+        _recommend(post)
+    exc = info.value
+    assert not isinstance(exc, UpstreamTimeout)
+    assert exc.status is None
+    assert exc.error_code == "UPSTREAM_CONNECTION_ERROR"
+    for rendered in (str(exc), repr(exc)):
+        assert MARKER not in rendered
+        assert "test-key-123" not in rendered
+    # DB error_detail 用:只記例外類型,不進 log
+    assert type(error).__name__ in exc.raw_detail
+    assert len(exc.raw_detail) <= 2000
+
+
+def test_timeout_is_not_reported_as_connection_error(post):
+    post.error = requests.ConnectTimeout("connect timed out")
+    with pytest.raises(UpstreamTimeout) as info:
+        _recommend(post)
+    assert info.value.error_code == "UPSTREAM_TIMEOUT"
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 404, 429, 500, 503])
@@ -823,7 +969,7 @@ def test_weird_shapes_only_raise_upstream_invalid_response(post, case):
 @pytest.mark.parametrize(
     "case",
     ["top_level_list", "output_not_list", "content_string", "restaurant_item_number",
-     "usage_string", "model_missing", "output_item_number"],
+     "usage_string", "output_item_number"],
 )
 def test_listed_weird_shapes_raise_upstream_invalid_response(post, case):
     with pytest.raises(UpstreamInvalidResponse):

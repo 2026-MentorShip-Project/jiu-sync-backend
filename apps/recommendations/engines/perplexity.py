@@ -22,6 +22,7 @@ from .base import (
     RecommendationContext,
     RecommendationEngine,
     RecommendationResult,
+    UpstreamConnectionError,
     UpstreamHTTPError,
     UpstreamInvalidResponse,
     UpstreamTimeout,
@@ -297,8 +298,8 @@ class _Source(NamedTuple):
 
 
 def _collect_output(output):
-    """回傳 (message text, ``_Source`` 清單)。未知 type 忽略(D8)。"""
-    texts, sources = [], []
+    """回傳 (每個 message 各自串接後的 text 清單, ``_Source`` 清單)。未知 type 忽略(D8)。"""
+    messages, sources = [], []
     for item in output:
         kind = item.get("type")
         if kind == "search_results":
@@ -307,6 +308,7 @@ def _collect_output(output):
                     _Source(result.get("title"), result.get("snippet"), result.get("url"))
                 )
         elif kind == "message":
+            texts = []
             for content in item["content"]:
                 text = content.get("text")
                 if isinstance(text, str):
@@ -319,7 +321,8 @@ def _collect_output(output):
                         sources.append(
                             _Source(annotation.get("title"), None, annotation.get("url"))
                         )
-    return "".join(texts), sources
+            messages.append("".join(texts))
+    return messages, sources
 
 
 def _match_source_url(name, sources):
@@ -410,6 +413,9 @@ class PerplexityEngine(RecommendationEngine):
         except requests.Timeout as exc:
             # requests 的例外訊息只含 URL 與錯誤類型,維持原樣串接(D7)。
             raise UpstreamTimeout() from exc
+        except requests.RequestException as exc:
+            # 連線層失敗:例外訊息只用自寫摘要;DB error_detail 只記例外類型(D7/D8)。
+            raise UpstreamConnectionError(raw_detail=type(exc).__name__) from exc
 
         raw_body = response.text
         if not 200 <= response.status_code < 300:
@@ -439,7 +445,8 @@ class PerplexityEngine(RecommendationEngine):
             raise _ParseFailure("response status is not completed", raw_body)
         model = data.get("model")
         if not _has_text(model):
-            raise _ParseFailure("missing field model", raw_body)
+            # model 只是紀錄用欄位:缺少/非字串時改用設定值,不讓已付費的推薦失敗(D8)。
+            model = settings.PERPLEXITY_MODEL
         usage = data.get("usage")
         if usage is not None and not isinstance(usage, dict):
             raise _ParseFailure("usage is not an object", raw_body)
@@ -449,21 +456,26 @@ class PerplexityEngine(RecommendationEngine):
         if not all(isinstance(item, dict) for item in output):
             raise _ParseFailure("output item is not an object", raw_body)
 
-        text, sources = _collect_output(output)
-        if not text:
+        messages, sources = _collect_output(output)
+        texts = [text for text in messages if text]
+        if not texts:
             raise _ParseFailure("missing message text", raw_body)
 
-        parsed = _load_json(text)
-        if not isinstance(parsed, dict):
-            raise _ParseFailure("message JSON is not an object", text)
-        restaurants = parsed.get("restaurants")
-        notes = parsed.get("notes")
-        if not isinstance(restaurants, list):
-            raise _ParseFailure("missing field restaurants", text)
-        if notes is not None and not isinstance(notes, str):
-            raise _ParseFailure("notes is not a string", text)
-        if not all(isinstance(item, dict) for item in restaurants):
-            raise _ParseFailure("restaurant item is not an object", text)
+        # 多個 message 依序逐一嘗試,取第一個能解析且通過結構驗證的;不跨 message
+        # 串接。全部失敗時回報第一個的摘要與原文(D8)。
+        failures = []
+        for text in texts:
+            try:
+                restaurants, notes = _parse_message(text)
+                break
+            except _ParseFailure as failure:
+                failures.append(failure)
+        else:
+            first = failures[0]
+            summary = first.summary
+            if len(failures) > 1:
+                summary = f"{summary} (all {len(failures)} messages invalid)"
+            raise _ParseFailure(summary, first.raw_detail)
 
         usable = [
             item for item in restaurants
@@ -481,6 +493,22 @@ class PerplexityEngine(RecommendationEngine):
             usage=usage,
             model=model[:MODEL_MAX_LENGTH],
         )
+
+
+def _parse_message(text):
+    """單一 message text → (restaurants, notes);結構不符丟 ``_ParseFailure``。"""
+    parsed = _load_json(text)
+    if not isinstance(parsed, dict):
+        raise _ParseFailure("message JSON is not an object", text)
+    restaurants = parsed.get("restaurants")
+    notes = parsed.get("notes")
+    if not isinstance(restaurants, list):
+        raise _ParseFailure("missing field restaurants", text)
+    if notes is not None and not isinstance(notes, str):
+        raise _ParseFailure("notes is not a string", text)
+    if not all(isinstance(item, dict) for item in restaurants):
+        raise _ParseFailure("restaurant item is not an object", text)
+    return restaurants, notes
 
 
 def _load_json(text):
