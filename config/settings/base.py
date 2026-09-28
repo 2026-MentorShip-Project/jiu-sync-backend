@@ -233,14 +233,20 @@ GOOGLE_OAUTH_CLIENT_ID = env("GOOGLE_OAUTH_CLIENT_ID", default="")
 # Event link lifetime per PRD §2.5 — soft-delete after N days, not hard delete.
 EVENT_LINK_LIFETIME_DAYS = env.int("EVENT_LINK_LIFETIME_DAYS", default=7)
 
-# Active AI recommendation backend. Pluggable strategy — see
-# apps.recommendations.engines. "google_places_gemini" is the MVP default per
-# PRD §4 (Plan A); "perplexity" is a documented, swappable alternative (Plan B)
-# still under evaluation, not yet implemented.
-RECOMMENDATION_ENGINE = env("RECOMMENDATION_ENGINE", default="google_places_gemini")
+# AI 餐廳推薦引擎(apps.recommendations.engines.get_engine)。目前只實作
+# "perplexity"(Perplexity Agent API,見 openspec/changes/add-ai-restaurant-recommendation
+# design.md D7/D8);其他值(含舊的 "google_places_gemini")在啟動時
+# ImproperlyConfigured,不靜默 fallback。
+RECOMMENDATION_ENGINE = env("RECOMMENDATION_ENGINE", default="perplexity")
 GOOGLE_PLACES_API_KEY = env("GOOGLE_PLACES_API_KEY", default="")
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
+# "preset:<name>" → 送 preset 欄位;"<provider>/<model>" → 送 model 欄位;其他格式啟動即
+# ImproperlyConfigured。預設 preset:low(task 0.2 實測延遲中位數約 24 秒,medium 會超過
+# 逾時)。見 design.md D8/D12。
+PERPLEXITY_MODEL = env("PERPLEXITY_MODEL", default="preset:low")
+# 上游 read timeout(秒);connect timeout 固定 5 秒。
+PERPLEXITY_TIMEOUT_SECONDS = env.int("PERPLEXITY_TIMEOUT_SECONDS", default=45)
 # 每位使用者每個台灣時間自然月可成功取得 AI 推薦的次數上限;失敗/逾時不計次。
 # 見 openspec/changes/add-ai-restaurant-recommendation/design.md D3/D12。
 AI_RECOMMENDATION_QUOTA_PER_USER = env.int("AI_RECOMMENDATION_QUOTA_PER_USER", default=20)
