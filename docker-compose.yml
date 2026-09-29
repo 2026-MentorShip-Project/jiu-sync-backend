@@ -10,6 +10,31 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # 連線池(add-pgbouncer-and-celery-worker design.md D1/D2)。本機預設
+  # DATABASE_URL 仍直連 db(5455);要經 PgBouncer 跑時改用
+  #   DATABASE_URL=postgres://jiu_sync:jiu_sync@localhost:6433/jiu_sync
+  #   PGBOUNCER_ADMIN_URL=postgres://jiu_sync:jiu_sync@localhost:6433/pgbouncer
+  # 萬用字元資料庫(不設 DB_NAME),pytest 的 test_* 資料庫也能經 PgBouncer 連線。
+  # 連線池狀態:
+  #   PGPASSWORD=jiu_sync psql "host=localhost port=6433 user=jiu_sync dbname=pgbouncer" -c 'SHOW POOLS;'
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0
+    environment:
+      DB_HOST: db
+      DB_USER: jiu_sync
+      DB_PASSWORD: jiu_sync
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: 10
+      MAX_CLIENT_CONN: 100
+      LISTEN_PORT: 6432
+      ADMIN_USERS: jiu_sync
+      STATS_USERS: jiu_sync
+    ports:
+      - "6433:6432"
+    depends_on:
+      - db
+
   redis:
     image: redis:7
     ports:
