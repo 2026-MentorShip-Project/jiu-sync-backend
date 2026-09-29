@@ -41,7 +41,10 @@ Django 配合:`DISABLE_SERVER_SIDE_CURSORS=True`(transaction pooling 下 server-
 
 ### D4. 驗證:本機 compose + CI 經 PgBouncer 的 test job(grill Q4)
 
-`ci.yml` 新增 job `test-pgbouncer`:service container `postgres:16` + `edoburu/pgbouncer`(同版本、同 pool 設定),`DATABASE_URL` 指向 PgBouncer,跑全套 `pytest`。原 `test` job(直連)保留。PR #25(AI 推薦,含 `select_for_update`/`SET LOCAL` 併發測試)與本 change 後 merge 的一方,須在此 job 下全綠。
+`ci.yml` 新增 job `test-pgbouncer`:service container `postgres:16` + `edoburu/pgbouncer`(同版本、同 pool 設定),`DATABASE_URL` 指向 PgBouncer,跑全套 `pytest`。原 `test` job(直連)保留。
+
+**經 PgBouncer 跑 pytest 的測試資料庫清理(grill Q6,task 1.1 實測發現)**:PgBouncer 會保留對 `test_jiu_sync` 的閒置 server 連線,pytest-django 收尾 `DROP DATABASE` 會失敗,下次執行因殘留資料庫全部 error。處理:`conftest.py` 包一層 session 範圍的 `django_db_setup` fixture,在其收尾(先於 pytest-django 原 fixture 的 DROP 執行)對 PgBouncer 管理資料庫下 `KILL <測試資料庫名>`,切斷 server 連線。僅在環境變數 `PGBOUNCER_ADMIN_URL`(例如 `postgres://jiu_sync:jiu_sync@localhost:6433/pgbouncer`)存在時啟用;未設定時完全不作用,直連開發不受影響。KILL 失敗時明確報錯(不吞掉)。本機與 CI 用同一機制,可連續執行。
+  - 替代:一律 `--reuse-db`——migration 變動需記得 `--create-db`,CI 本為全新容器效益低;接受收尾 warning 並手動重啟 PgBouncer——warning 可能掩蓋其他問題、依賴人工。皆不採用。PR #25(AI 推薦,含 `select_for_update`/`SET LOCAL` 併發測試)與本 change 後 merge 的一方,須在此 job 下全綠。
 
 ### D5. celery worker 最小可用(grill Q0/Q5)
 
