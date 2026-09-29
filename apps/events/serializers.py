@@ -421,6 +421,7 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
     finalSlotId = serializers.SerializerMethodField()
     finalNote = serializers.CharField(source="final_note", read_only=True)
     finalAttendees = serializers.SerializerMethodField()
+    selectedRestaurant = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
@@ -442,7 +443,21 @@ class EventDetailSerializer(_OwnerAndDisplayStatusMixin, serializers.ModelSerial
             "finalSlotId",
             "finalNote",
             "finalAttendees",
+            "selectedRestaurant",
         ]
+
+    def get_selectedRestaurant(self, event):
+        # 主揪從 AI 推薦選定的餐廳(add-ai-restaurant-recommendation design.md D13)。
+        # 刻意只透過 related_name 字串讀取,不 import apps.recommendations(避免
+        # events 反向依賴);詳情 view 已 select_related("restaurant_selection"),
+        # 未選定時 getattr 取得 None,不另外查詢。參與者也看得到。
+        selection = getattr(event, "restaurant_selection", None)
+        if selection is None:
+            return None
+        return {
+            "restaurant": selection.restaurant,
+            "selectedAt": serializers.DateTimeField().to_representation(selection.selected_at),
+        }
 
     def get_hostEmail(self, event):
         if not self._is_owner(event):

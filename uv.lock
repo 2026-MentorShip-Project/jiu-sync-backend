@@ -616,6 +616,7 @@ dependencies = [
     { name = "gunicorn" },
     { name = "psycopg", extra = ["binary"] },
     { name = "redis" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -640,6 +641,7 @@ requires-dist = [
     { name = "gunicorn", specifier = ">=23.0.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "redis", specifier = ">=8.1.0" },
+    { name = "requests", specifier = ">=2.34.2" },
 ]
 
 [package.metadata.requires-dev]

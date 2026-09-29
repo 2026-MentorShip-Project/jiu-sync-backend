@@ -1,5 +1,7 @@
 from django.urls import path, register_converter
 
+from apps.recommendations.views import RestaurantRecommendationView, SelectedRestaurantView
+
 from .views import (
     CommentDetailView,
     CommentListCreateView,
@@ -77,6 +79,16 @@ urlpatterns = [
         "<shortid:id>/reopen/",
         EventReopenView.as_view(),
         name="event-reopen",
+    ),
+    path(
+        "<shortid:id>/restaurant-recommendations/",
+        RestaurantRecommendationView.as_view(),
+        name="restaurant-recommendations",
+    ),
+    path(
+        "<shortid:id>/selected-restaurant/",
+        SelectedRestaurantView.as_view(),
+        name="selected-restaurant",
     ),
     path(
         "<shortid:id>/poll/",
