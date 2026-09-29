@@ -55,7 +55,7 @@ Django 配合:`DISABLE_SERVER_SIDE_CURSORS=True`(transaction pooling 下 server-
 ### D6. app 與 worker 的 settings 一致、build context 排除 secret(task 3.1 code-review 後決策)
 
 - 正式 compose 的 `app` 與 `worker` 同樣以 `environment` 明確指定 `DJANGO_SETTINGS_MODULE=config.settings.prod`(`environment` 優先於 `env_file`)。原本 app 只靠 `config/wsgi.py` 的 `setdefault`,正式 `.env` 若設了其他值(例如 dev,eager 為 true)會讓 app 在行程內同步執行 task、不進佇列,與 worker 設定分歧。
-- 新增 `.dockerignore`,至少排除 `.env`、`.env.*`、`.venv`、`.git`:本機 `docker build .` 原本會把含 secret 的 `.env` 打包進 image。正式 image 由 CI 乾淨 checkout 建置不受影響,但避免本機 image 外流時洩漏 secret。
+- 新增 `.dockerignore`,排除 secret 與 host 本地狀態:`.env`、`.env.*`(含巢狀)、`.venv`、`.git`,以及 terraform state/`.terraform`/`*.tfvars`(repo 內有已被 gitignore 的 `infra/terraform/terraform.tfstate*`,可能含 AWS 資源敏感資訊,task 3.2 發現)、`db.sqlite3`、`.coverage`、`staticfiles` 與快取/編輯器檔;`.env.example` 一併排除(image 不需要)。以 `config/tests/test_dockerignore.py` 實際匯出 build context 守住;完整 image 的 `docker build .` 驗證為手動實測(需拉 base image,不寫成自動測試):本機 `docker build .` 原本會把含 secret 的 `.env` 打包進 image。正式 image 由 CI 乾淨 checkout 建置不受影響,但避免本機 image 外流時洩漏 secret。
 - 替代:僅於 task 4.1 人工確認 `.env` 未設 `DJANGO_SETTINGS_MODULE`——依賴人工、無測試守住,不採用。
 
 ## Risks / Trade-offs
