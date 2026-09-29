@@ -43,6 +43,7 @@
     - 驗完 `down -v`(只移除本次臨時 project `task31verify` 自己建立的 volume/network),既有 `jiu-sync-backend_postgres_data` 未動;本機 image `jiu-sync-backend:task31-local` 保留。
     - 全套 `pytest -q` 322 passed;`ruff check .`、`manage.py check` 乾淨。`spectra analyze` 0.02s(僅已知誤報:巢狀 spec 路徑 CRITICAL、D1–D5 WARNING);`spectra drift` 0.30s,MEDIUM(僅已知誤報 `--concurrency`/`--create-db`/`--reuse-db` anchor)。
     - code-review 已處理:檔頭註解「swallowed」改為「caught and logged」、防洗版 URL 註明「預設」由 broker 推導。**未處理、待決**:`app` 未在 compose 明確設 `DJANGO_SETTINGS_MODULE`(靠 `config/wsgi.py` 的 `setdefault`),若正式 `.env` 設了其他值,app 與 worker 會載入不同 settings(例如 dev 的 `CELERY_TASK_ALWAYS_EAGER=True` 使 task 在 app 內同步執行、不進佇列);超出 task 3.1 範圍,待使用者決定是否對 app 也加覆寫(或於 task 4.1 確認正式 `.env` 未設此變數)。
+- [ ] 3.2 [RED→GREEN](design.md D6)① 在 `config/tests/test_prod_compose.py` 新增測試:正式 compose 的 `app` 在 fake `.env` 設 `DJANGO_SETTINGS_MODULE=config.settings.dev` 時,解析結果仍為 `config.settings.prod`,且與 `worker` 相同;先確認 FAIL 再改 compose。② 新增測試:以 `.dockerignore` 的規則過濾 repo 檔案(或以 `docker build` 的 context 實測,例如建一個只 `COPY . /ctx` 並列出檔案的臨時 Dockerfile)確認 `.env`、`.env.*`、`.venv`、`.git` 不在 build context 內,且 `Dockerfile` 需要的檔案(`pyproject.toml`、`uv.lock`、`manage.py`、`config/`、`apps/`)仍在;先確認 FAIL 再新增 `.dockerignore`。以 `git archive` 以外的一般 `docker build .` 建置成功且 image 內無 `.env` — (auto) `pytest -q` 全綠
 
 ## 4. 正式環境切換
 

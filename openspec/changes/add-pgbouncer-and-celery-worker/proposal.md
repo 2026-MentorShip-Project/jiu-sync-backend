@@ -11,6 +11,7 @@
 - `deploy.sh`:migrate 改以 `.env` 的 `DATABASE_URL_DIRECT` 直連 `db`;未設定即中止部署
 - CI:新增經 PgBouncer 跑全套測試的 job
 - 正式 compose 新增 celery `worker` service(同一 image、`--concurrency=1`、連 PgBouncer);正式環境 `CELERY_BROKER_URL` 修正為 `redis://redis:6379/0`
+- 正式 compose 的 app 明確指定 prod settings(與 worker 一致);新增 `.dockerignore` 避免本機 build 打包 `.env`
 - 不改任何 API 行為、資料模型或通知 task 本身的重試行為
 
 未涵蓋(明確排除):搬遷到 RDS / RDS Proxy;通知 task 的重試與冪等(會引入重複寄信問題,另開 change);Redis 持久化;SMTP 設定本身(本機與正式環境 `EMAIL_BACKEND` 皆已為 SMTP,worker 上線後即會實際寄信)。
