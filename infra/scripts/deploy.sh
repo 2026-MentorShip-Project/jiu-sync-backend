@@ -40,7 +40,13 @@
 #      rather than `source`-ing the whole .env, so values elsewhere in the
 #      file containing shell-special characters ($, quotes, backticks — e.g.
 #      DATABASE_URL) are never evaluated as shell syntax.
-#   4. docker compose pull / up -d / migrate / collectstatic. Re-running
+#   4. Read DATABASE_URL_DIRECT from the same .env (same grep/cut helper).
+#      `migrate` must bypass PgBouncer (transaction pooling can break
+#      non-atomic migrations — openspec/changes/add-pgbouncer-and-celery-worker
+#      design.md D3), so it runs with `-e DATABASE_URL=<direct URL>`. If the
+#      variable is missing or empty, abort BEFORE pull/up — never fall back
+#      to migrating through PgBouncer.
+#   5. docker compose pull / up -d / migrate / collectstatic. Re-running
 #      this is safe: `docker pull` is a no-op when the digest is unchanged,
 #      and `up -d` doesn't restart services with no image/config change
 #      (design.md decision 8 — idempotency for free).
@@ -101,7 +107,7 @@ REPO_DIR="${REPO_DIR}"
 COMPOSE_FILE="\${REPO_DIR}/docker-compose.prod.yml"
 COMPOSE_B64="${COMPOSE_B64}"
 
-echo "=== [1/7] Checking for required .env at \${ENV_FILE} ==="
+echo "=== [1/8] Checking for required .env at \${ENV_FILE} ==="
 if [ ! -f "\${ENV_FILE}" ]; then
   echo "ERROR: \${ENV_FILE} does not exist on this instance." >&2
   echo "The production .env must be created manually via a one-off SSM session" >&2
@@ -111,11 +117,11 @@ if [ ! -f "\${ENV_FILE}" ]; then
 fi
 echo "OK: .env found."
 
-echo "=== [2/7] Writing docker-compose.prod.yml to \${COMPOSE_FILE} ==="
+echo "=== [2/8] Writing docker-compose.prod.yml to \${COMPOSE_FILE} ==="
 echo "\${COMPOSE_B64}" | base64 -d > "\${COMPOSE_FILE}"
 echo "OK: compose file written."
 
-echo "=== [3/7] Extracting GHCR_USERNAME/GHCR_TOKEN from \${ENV_FILE} ==="
+echo "=== [3/8] Extracting GHCR_USERNAME/GHCR_TOKEN from \${ENV_FILE} ==="
 # Extracted with grep/cut rather than \`source\`-ing the whole .env: other
 # values in that file (e.g. DATABASE_URL) may contain characters (\$, quotes,
 # backticks) that bash would try to evaluate if the file were sourced
@@ -154,17 +160,31 @@ if [ -z "\${GHCR_USERNAME}" ] || [ -z "\${GHCR_TOKEN}" ]; then
 fi
 echo "OK: GHCR_USERNAME/GHCR_TOKEN present."
 
-echo "=== [4/7] docker login ghcr.io ==="
+echo "=== [4/8] Extracting DATABASE_URL_DIRECT from \${ENV_FILE} ==="
+# migrate connects directly to db, bypassing PgBouncer (design.md D3 of
+# openspec/changes/add-pgbouncer-and-celery-worker). Checked before any
+# pull/up so a missing value leaves the running stack untouched.
+DATABASE_URL_DIRECT="\$(extract_env_var DATABASE_URL_DIRECT "\${ENV_FILE}")"
+if [ -z "\${DATABASE_URL_DIRECT}" ]; then
+  echo "ERROR: DATABASE_URL_DIRECT not set in \${ENV_FILE}." >&2
+  echo "migrate must connect directly to db (e.g. postgres://<user>:<pw>@db:5432/<db>)," >&2
+  echo "not through PgBouncer. Add it via an SSM session before deploying." >&2
+  echo "Aborting — not attempting docker login/pull/up/migrate." >&2
+  exit 1
+fi
+echo "OK: DATABASE_URL_DIRECT present."
+
+echo "=== [5/8] docker login ghcr.io ==="
 docker login ghcr.io -u "\${GHCR_USERNAME}" -p "\${GHCR_TOKEN}"
 
-echo "=== [5/7] docker compose pull ==="
+echo "=== [6/8] docker compose pull ==="
 docker compose -f "\${COMPOSE_FILE}" pull
 
-echo "=== [6/7] docker compose up -d ==="
+echo "=== [7/8] docker compose up -d ==="
 docker compose -f "\${COMPOSE_FILE}" up -d
 
-echo "=== [7/7] Running migrations and collecting static files ==="
-docker compose -f "\${COMPOSE_FILE}" exec -T app python manage.py migrate
+echo "=== [8/8] Running migrations (direct to db) and collecting static files ==="
+docker compose -f "\${COMPOSE_FILE}" exec -T -e DATABASE_URL="\${DATABASE_URL_DIRECT}" app python manage.py migrate
 docker compose -f "\${COMPOSE_FILE}" exec -T app python manage.py collectstatic --noinput
 
 echo "=== Deploy finished successfully ==="
