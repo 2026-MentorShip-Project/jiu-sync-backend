@@ -12,6 +12,15 @@
 #   DATABASE_URL=postgres://<user>:<password>@pgbouncer:6432/<dbname>
 #   DATABASE_URL_DIRECT=postgres://<user>:<password>@db:5432/<dbname>
 #   CELERY_BROKER_URL=redis://redis:6379/0
+# CELERY_BROKER_URL is REQUIRED to be exactly redis://redis:6379/0 (the
+# `redis` service). Both app (enqueues via .delay()) and worker (consumes)
+# read it from the same .env, and the comment rate-limit lock URL is derived
+# from it by default (/0 -> /1, unless COMMENT_RATE_LIMIT_REDIS_URL is set;
+# config/settings/base.py). The settings default redis://localhost:6381/0 is
+# for local dev only and is unreachable inside a container: .delay() then
+# fails (caught and logged by the view, the API still succeeds, so no
+# notification is ever queued) and the rate-limit lock fails open
+# (design.md D5).
 # app connects through PgBouncer (transaction pooling, see
 # openspec/changes/add-pgbouncer-and-celery-worker design.md D1/D2).
 # DATABASE_URL_DIRECT is used only by infra/scripts/deploy.sh to run
@@ -39,6 +48,26 @@ services:
       - ../../.env
     ports:
       - "127.0.0.1:8000:8000"
+    depends_on:
+      - pgbouncer
+      - redis
+    restart: unless-stopped
+
+  # Celery worker (design.md D5): same image as app, consumes the queue that
+  # app's .delay() fills (notification emails). --concurrency=1 for the
+  # t2.micro memory budget. DJANGO_SETTINGS_MODULE is set explicitly because
+  # config/celery.py refuses to start without it; it overrides any value in
+  # .env. Connects to the DB through PgBouncer (same DATABASE_URL as app).
+  # No ports: nothing needs to reach the worker.
+  # Rollback: `docker compose -f docker-compose.prod.yml stop worker`
+  # (notifications stop being sent; API unaffected).
+  worker:
+    image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
+    command: celery -A config worker -l info --concurrency=1
+    env_file:
+      - ../../.env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
     depends_on:
       - pgbouncer
       - redis
