@@ -85,11 +85,26 @@ ASGI_APPLICATION = "config.asgi.application"
 # postgres://user:password@localhost:5455/jiu_sync
 # (host port 5455, not Postgres's default 5432 — see docker-compose.yml)
 
-DATABASES = {
-    "default": env.db_url(
+
+def _database_config():
+    """DATABASES["default"]: connection target from DATABASE_URL, plus options
+    required behind PgBouncer transaction pooling (add-pgbouncer-and-celery-worker
+    design.md D1). Server-side cursors don't survive across statements in
+    transaction pooling; CONN_MAX_AGE reuses the client connection to PgBouncer
+    (override with DB_CONN_MAX_AGE; 0 = close after each request), and health
+    checks avoid reusing a connection PgBouncer already dropped."""
+    config = env.db_url(
         "DATABASE_URL",
         default="postgres://jiu_sync:jiu_sync@localhost:5455/jiu_sync",
-    ),
+    )
+    config["DISABLE_SERVER_SIDE_CURSORS"] = True
+    config["CONN_MAX_AGE"] = env.int("DB_CONN_MAX_AGE", default=60)
+    config["CONN_HEALTH_CHECKS"] = True
+    return config
+
+
+DATABASES = {
+    "default": _database_config(),
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

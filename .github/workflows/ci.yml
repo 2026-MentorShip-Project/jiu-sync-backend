@@ -55,7 +55,7 @@ jobs:
           --health-retries 5
       # 留言防洗版測試(test_comment_rate_limit_*)需要真的 Redis 連線,
       # 對應 docker-compose.yml 的 redis:7 與預設 CELERY_BROKER_URL(localhost:6381)
-      redis:
+      redis: &redis-service
         image: redis:7
         ports:
           - 6381:6379
@@ -97,6 +97,66 @@ jobs:
             exit 0
           fi
           exit "$status"
+
+  # 經 PgBouncer 跑全套測試(add-pgbouncer-and-celery-worker design.md D4):
+  # 守住 transaction pooling 相容性前提(select_for_update / SET LOCAL 都在
+  # transaction.atomic() 內、不用 session 層級功能)。image 與 pool 設定同
+  # docker-compose.yml / infra/docker/docker-compose.prod.yml 的 pgbouncer。
+  # PGBOUNCER_ADMIN_URL 讓根目錄 conftest.py 在 DROP 測試資料庫前 KILL/RESUME
+  # PgBouncer 對它的 server 連線(design.md D4 Q6)。
+  test-pgbouncer:
+    name: test-pgbouncer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres: *postgres-service
+      pgbouncer:
+        image: edoburu/pgbouncer:v1.25.2-p0
+        env:
+          DB_HOST: postgres
+          DB_USER: jiu_sync
+          DB_PASSWORD: jiu_sync
+          AUTH_TYPE: scram-sha-256
+          POOL_MODE: transaction
+          DEFAULT_POOL_SIZE: "10"
+          MAX_CLIENT_CONN: "100"
+          LISTEN_PORT: "6432"
+          ADMIN_USERS: jiu_sync
+          STATS_USERS: jiu_sync
+        ports:
+          - 6432:6432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -p 6432"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis: *redis-service
+    env:
+      DATABASE_URL: postgres://jiu_sync:jiu_sync@localhost:6432/jiu_sync
+      PGBOUNCER_ADMIN_URL: postgres://jiu_sync:jiu_sync@localhost:6432/pgbouncer
+      CELERY_BROKER_URL: redis://localhost:6381/0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # pytest-django 自行建立並 migrate 測試資料庫(經 PgBouncer),不需另跑 migrate
+      - name: Run tests through PgBouncer
+        run: uv run pytest -q
+
+      - name: Show PgBouncer pools
+        if: always()
+        env:
+          PGPASSWORD: jiu_sync
+        run: psql "host=localhost port=6432 user=jiu_sync dbname=pgbouncer" -c 'SHOW POOLS;'
 
   spec-sync:
     name: spec-sync

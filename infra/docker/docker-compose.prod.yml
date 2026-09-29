@@ -9,13 +9,34 @@
 # Django resolves DB/broker connections from full URLs, not separate
 # host/port vars, so the production .env MUST point at the compose service
 # names (Docker's internal DNS), not localhost:
-#   DATABASE_URL=postgres://<user>:<password>@db:5432/<dbname>
+#   DATABASE_URL=postgres://<user>:<password>@pgbouncer:6432/<dbname>
+#   DATABASE_URL_DIRECT=postgres://<user>:<password>@db:5432/<dbname>
 #   CELERY_BROKER_URL=redis://redis:6379/0
-# The POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB values below must match the
-# credentials embedded in that DATABASE_URL.
+# CELERY_BROKER_URL is REQUIRED to be exactly redis://redis:6379/0 (the
+# `redis` service). Both app (enqueues via .delay()) and worker (consumes)
+# read it from the same .env, and the comment rate-limit lock URL is derived
+# from it by default (/0 -> /1, unless COMMENT_RATE_LIMIT_REDIS_URL is set;
+# config/settings/base.py). The settings default redis://localhost:6381/0 is
+# for local dev only and is unreachable inside a container: .delay() then
+# fails (caught and logged by the view, the API still succeeds, so no
+# notification is ever queued) and the rate-limit lock fails open
+# (design.md D5).
+# app connects through PgBouncer (transaction pooling, see
+# openspec/changes/add-pgbouncer-and-celery-worker design.md D1/D2).
+# DATABASE_URL_DIRECT is used only by infra/scripts/deploy.sh to run
+# `migrate` directly against db (design.md D3); deploy aborts if it is
+# missing. The POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB values below must
+# match the credentials embedded in both URLs.
+#
+# Connection pool status (from the EC2 host, inside the compose network):
+#   docker compose -f docker-compose.prod.yml exec pgbouncer \
+#     psql -h 127.0.0.1 -p 6432 -U <user> pgbouncer -c 'SHOW POOLS;'
+#
+# Rollback (PgBouncer holds no state): point DATABASE_URL back at
+# db:5432 in .env and redeploy.
 #
 # Unlike local dev's docker-compose.yml, nothing here binds to 0.0.0.0 or a
-# host port for db/redis — only `app` is reachable from the host, and only
+# host port for db/redis/pgbouncer — only `app` is reachable from the host, and only
 # via loopback (127.0.0.1:8000), per the "應用程式 port 不直接對外暴露"
 # requirement. nginx (host-native, see design.md Decision 3) is the only
 # thing that should ever reach app, over 127.0.0.1:8000.
@@ -25,11 +46,56 @@ services:
     image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
     env_file:
       - ../../.env
+    # Explicit, same as worker (design.md D6): `environment` overrides any
+    # DJANGO_SETTINGS_MODULE in .env, so app and worker can never load
+    # different settings (e.g. dev's CELERY_TASK_ALWAYS_EAGER=True would run
+    # tasks in-process and never enqueue them). Don't rely on wsgi.py's
+    # setdefault.
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
-      - db
+      - pgbouncer
       - redis
+    restart: unless-stopped
+
+  # Celery worker (design.md D5): same image as app, consumes the queue that
+  # app's .delay() fills (notification emails). --concurrency=1 for the
+  # t2.micro memory budget. DJANGO_SETTINGS_MODULE is set explicitly because
+  # config/celery.py refuses to start without it; it overrides any value in
+  # .env and must match app's (design.md D6). Connects to the DB through
+  # PgBouncer (same DATABASE_URL as app).
+  # No ports: nothing needs to reach the worker.
+  # Rollback: `docker compose -f docker-compose.prod.yml stop worker`
+  # (notifications stop being sent; API unaffected).
+  worker:
+    image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
+    command: celery -A config worker -l info --concurrency=1
+    env_file:
+      - ../../.env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+    depends_on:
+      - pgbouncer
+      - redis
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0
+    environment:
+      DB_HOST: db
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: 10
+      MAX_CLIENT_CONN: 100
+      LISTEN_PORT: 6432
+      ADMIN_USERS: ${POSTGRES_USER}
+      STATS_USERS: ${POSTGRES_USER}
+    depends_on:
+      - db
     restart: unless-stopped
 
   db:
