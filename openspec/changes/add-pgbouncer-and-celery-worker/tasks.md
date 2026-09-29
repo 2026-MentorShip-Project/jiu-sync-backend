@@ -2,7 +2,18 @@
 
 ## 1. 環境健檢
 
-- [ ] 1.1 確認 `docker` 可用、`docker pull edoburu/pgbouncer:<版本>` 成功並記錄選定的明確版本 tag(查 image 的 tag 列表,選最新穩定版,記下 PgBouncer 版本號);確認該版本支援 `AUTH_TYPE=scram-sha-256` 與萬用字元資料庫設定;`git status`/`git log` 正常且位於 `feature/pgbouncer`;本機 `docker-compose.yml` 的 `db`/`redis` 可啟動 — (auto)
+- [x] 1.1 確認 `docker` 可用、`docker pull edoburu/pgbouncer:<版本>` 成功並記錄選定的明確版本 tag(查 image 的 tag 列表,選最新穩定版,記下 PgBouncer 版本號);確認該版本支援 `AUTH_TYPE=scram-sha-256` 與萬用字元資料庫設定;`git status`/`git log` 正常且位於 `feature/pgbouncer`;本機 `docker-compose.yml` 的 `db`/`redis` 可啟動 — (auto)
+  - 結果(2026-09-29):
+    - 環境:Docker 29.2.1、Docker Compose v5.1.0;`git` 位於 `feature/pgbouncer`、toplevel 為本 repo、working tree clean;`docker compose up -d db redis` 正常(postgres:16,`password_encryption=scram-sha-256`,pg_hba 對外 `scram-sha-256`)。
+    - 選定 image:`edoburu/pgbouncer:v1.25.2-p0`(Docker Hub 最新明確 tag,2026-06-10),index digest `sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340`,內含 **PgBouncer 1.25.2**;multi-arch(linux/amd64、linux/arm64)。image 預設 `EXPOSE 5432`、以 `postgres` 使用者執行。
+    - entrypoint(`/entrypoint.sh`)行為:未設 `DB_NAME`/`DATABASE_URL` 時產生 `* = host=${DB_HOST} port=${DB_PORT:-5432} auth_user=${DB_USER}`(萬用字元);`AUTH_TYPE=scram-sha-256` 時 userlist 直接寫**明文密碼**(`"jiu_sync" "jiu_sync"`),PgBouncer 以明文密碼對 server 做 SCRAM,不需自行產生 verifier;`LISTEN_PORT` 預設 **5432**(必須明確設 6432);`ADMIN_USERS` 預設 `postgres`(必須明確設);`STATS_USERS`、`POOL_MODE`、`DEFAULT_POOL_SIZE`、`MAX_CLIENT_CONN` 皆支援;`/etc/pgbouncer/pgbouncer.ini` 已存在時不重新產生。
+    - 實測可用的環境變數組合(本機 compose 網路 `jiu-sync-backend_default`,`-p 6433:6432`):
+      `DB_HOST=db` `DB_USER=jiu_sync` `DB_PASSWORD=jiu_sync` `AUTH_TYPE=scram-sha-256` `POOL_MODE=transaction` `DEFAULT_POOL_SIZE=10` `MAX_CLIENT_CONN=100` `LISTEN_PORT=6432` `ADMIN_USERS=jiu_sync` `STATS_USERS=jiu_sync`(不設 `DB_NAME`)。
+    - 驗證:經 `localhost:6433` 連 `jiu_sync` 執行 `select 1` 成功;連未列於設定的資料庫(臨時建立的 `pgb_check_tmp`)經萬用字元成功;經 `postgres` 資料庫 `CREATE DATABASE` 成功;錯誤密碼回 `SASL authentication failed`;不存在的資料庫回 `database "..." does not exist`。
+    - `SHOW POOLS` 指令(可執行,已看到 `cl_active`/`cl_waiting`/`sv_active`/`sv_idle`/`pool_mode=transaction`):
+      本機 `PGPASSWORD=jiu_sync psql "host=localhost port=6433 user=jiu_sync dbname=pgbouncer" -c 'SHOW POOLS;'`;容器網路內 `psql -h pgbouncer -p 6432 -U <user> pgbouncer -c 'SHOW POOLS;'`。
+    - **與 design 未涵蓋的落差(待 `opsx:update` 決策,不在本 task 處理)**:PgBouncer 會保留對 `test_jiu_sync` 的 idle server 連線,pytest-django 在 teardown 經 PgBouncer `DROP DATABASE` 失敗(`database "test_jiu_sync" is being accessed by other users`)。實測 `DATABASE_URL=...@localhost:6433/jiu_sync pytest -q apps/notifications`:第一次 13 passed + teardown PytestWarning;不重啟 PgBouncer 再跑第二次,因殘留的 `test_jiu_sync` 無法刪除,13 errors。影響 task 2.1 的「本機經 PgBouncer 跑全套 pytest」與 D4 的 CI job(CI 每次為全新 container,預期僅 teardown warning,但未實測)。
+    - 臨時容器 `pgb-check` 已停止(`--rm`),臨時資料庫已刪除,既有 compose volume 未動。
 
 ## 2. PgBouncer 連線池(D1–D4)
 
