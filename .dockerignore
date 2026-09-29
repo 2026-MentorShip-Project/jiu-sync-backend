@@ -1,0 +1,30 @@
+# Build context exclusions (openspec add-pgbouncer-and-celery-worker design.md D6).
+# Keep secrets and host-local state out of images built with `docker build .`
+# (Dockerfile does `COPY . .`). Guarded by config/tests/test_dockerignore.py.
+
+# Secrets
+.env
+.env.*
+**/.env
+**/.env.*
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+db.sqlite3
+.coverage
+staticfiles
+
+# Host-local environment / VCS (the image builds its own /app/.venv)
+.venv
+.git
+
+# Caches and editor/tool state
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.idea
+.DS_Store
+.claude
+.spectra

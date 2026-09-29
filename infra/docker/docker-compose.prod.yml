@@ -46,6 +46,13 @@ services:
     image: ghcr.io/2026-mentorship-project/jiu-sync-backend:latest
     env_file:
       - ../../.env
+    # Explicit, same as worker (design.md D6): `environment` overrides any
+    # DJANGO_SETTINGS_MODULE in .env, so app and worker can never load
+    # different settings (e.g. dev's CELERY_TASK_ALWAYS_EAGER=True would run
+    # tasks in-process and never enqueue them). Don't rely on wsgi.py's
+    # setdefault.
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -57,7 +64,8 @@ services:
   # app's .delay() fills (notification emails). --concurrency=1 for the
   # t2.micro memory budget. DJANGO_SETTINGS_MODULE is set explicitly because
   # config/celery.py refuses to start without it; it overrides any value in
-  # .env. Connects to the DB through PgBouncer (same DATABASE_URL as app).
+  # .env and must match app's (design.md D6). Connects to the DB through
+  # PgBouncer (same DATABASE_URL as app).
   # No ports: nothing needs to reach the worker.
   # Rollback: `docker compose -f docker-compose.prod.yml stop worker`
   # (notifications stop being sent; API unaffected).

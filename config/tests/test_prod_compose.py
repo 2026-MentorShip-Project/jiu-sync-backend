@@ -118,3 +118,10 @@ def test_header_requires_broker_url_pointing_at_redis_service():
     # 需明講 worker 也吃這個值、且不可用 localhost(container 內不可達)
     assert "worker" in header
     assert "localhost:6381" in header
+
+
+def test_app_explicitly_uses_prod_settings_same_as_worker(prod_services, worker):
+    # design.md D6:假 .env 設 dev,app 仍須解析為 prod,且與 worker 相同(不靠 wsgi.py setdefault)
+    app_env = prod_services["app"]["environment"]
+    assert app_env["DJANGO_SETTINGS_MODULE"] == "config.settings.prod"
+    assert app_env["DJANGO_SETTINGS_MODULE"] == worker["environment"]["DJANGO_SETTINGS_MODULE"]
