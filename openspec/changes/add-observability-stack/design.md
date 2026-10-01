@@ -90,10 +90,11 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 ### D10. Dashboard 與告警(grill Q14/Q15)
 
-- 在 Grafana Cloud UI 建立 App、Containers、Host、Logs 四張 dashboard(可匯入社群 dashboard 後調整),JSON 匯出到 `infra/grafana/dashboards/`。
+- App、Containers、Host、Logs 四張 dashboard 先以 JSON 產生於 `infra/grafana/dashboards/`(有測試守住),再由使用者在 Grafana Cloud 以 Import 匯入;UI 上調整後匯出覆蓋回 repo(Task 4 開始前 opsx:update,使用者確認;原訂在 UI 逐一建 panel 再匯出,約 20 個 panel 耗時且易錯)。data source 以 dashboard 變數(prometheus / loki 類型)指定,不寫死 stack 的 uid,JSON 不含任何 token。App 的 panel 排除 `view="metrics"`(Alloy scrape 本身的流量)。替代:在 UI 手動逐一建——較能熟悉操作但耗時;Terraform grafana provider——見下方,不採用。
+- 4 條告警在 Grafana Cloud UI 手動建立(需設定 email 通知),再匯出。
 - 4 條告警,通知寄到開發者 email,規則匯出到 `infra/grafana/alerts/`:
   1. 10 分鐘內收不到任何 metrics(`absent`/no data)
-  2. `node_memory_MemAvailable_bytes` < 100MB 或 swap 用量 > 200MB,持續 5 分鐘
+  2. `node_memory_MemAvailable_bytes` < 100MB,持續 5 分鐘(原訂的「swap 用量 > 200MB」已移除——Task 3.2 後 swap 長期約 415MB 但為閒置分頁,設了會一直響;swap 讀寫頻率需另開 `vmstat` collector,目前不收。真正傷害 app 的 OOM kill 會由第 4 條 container 重啟告警抓到;swap 是否頻繁讀寫改以 `vmstat 5 6` 手動判斷,見 D8)
   3. 5 分鐘內 5xx 比例 > 5%
   4. 15 分鐘內任一 container 重啟
 - 門檻值先用以上保守值,上線一兩週後依實際數據調整。

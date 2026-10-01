@@ -86,7 +86,7 @@ metrics 端點 SHALL 只在請求帶有與設定相符的 bearer token 時回傳
 
 ### Requirement: Dashboard 與告警
 
-外部平台 SHALL 提供應用程式、container、主機、log 四個 dashboard,並在以下情況寄送告警:收集資料中斷超過 10 分鐘、主機可用記憶體或 swap 達門檻、5xx 比例超過 5%、任一 container 重啟。dashboard 與告警規則 SHALL 匯出保存於 repo。
+外部平台 SHALL 提供應用程式、container、主機、log 四個 dashboard,並在以下情況寄送告警:收集資料中斷超過 10 分鐘、主機可用記憶體低於門檻、5xx 比例超過 5%、任一 container 重啟。dashboard 與告警規則 SHALL 匯出保存於 repo。
 
 #### Scenario: 收集中斷觸發告警
 - **WHEN** 收集元件停止超過 10 分鐘
