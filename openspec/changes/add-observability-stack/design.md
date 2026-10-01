@@ -48,7 +48,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 ### D5. 機密:最小權限 token + 只傳必要變數(grill Q5)
 
 - Grafana Cloud Access Policy token 只給 `metrics:write`、`logs:write`。
-- `.env` 新增 `GRAFANA_CLOUD_PROM_URL`、`GRAFANA_CLOUD_PROM_USER`、`GRAFANA_CLOUD_LOKI_URL`、`GRAFANA_CLOUD_LOKI_USER`、`GRAFANA_CLOUD_API_TOKEN`、`METRICS_TOKEN`。
+- `.env` 新增 `GRAFANA_CLOUD_PROM_URL`、`GRAFANA_CLOUD_PROM_USER`、`GRAFANA_CLOUD_LOKI_URL`、`GRAFANA_CLOUD_LOKI_USER`、`GRAFANA_CLOUD_API_TOKEN`、`METRICS_TOKEN`。兩個 URL 存完整 push endpoint(Prometheus:`https://prometheus-...grafana.net/api/prom/push`;Loki:`https://logs-...grafana.net/loki/api/v1/push`),`config.alloy` 直接使用、不再拼接路徑;`*_USER` 為各自的數字 instance ID;`METRICS_TOKEN` 以 `openssl rand -hex 32` 產生。
 - alloy service 用 `environment: X: ${X}` 只取這 6 個變數(compose 會自動讀同目錄的 `.env` 做變數展開,pgbouncer 已經這樣用),不使用 `env_file`。`config.alloy` 以 `sys.env()` 讀取。
 - 替代:`env_file: .env`——Alloy 會拿到 DB 密碼、`SECRET_KEY` 等用不到的機密。不採用。
 
