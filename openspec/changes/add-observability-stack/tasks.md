@@ -30,4 +30,5 @@
 
 ## 4. Dashboard 與告警
 
-- [ ] 4.1 在 Grafana Cloud 建立 App、Containers、Host、Logs 四張 dashboard 與 4 條告警(D10),JSON 匯出到 `infra/grafana/dashboards/` 與 `infra/grafana/alerts/`(確認 JSON 不含 token)。驗證:(manual) 四張 dashboard 的每個 panel 都有資料;`docker compose stop alloy` 超過 10 分鐘後收到「收不到 metrics」告警 email,之後再 `start`
+- [ ] 4.1 先寫測試(紅燈):`infra/grafana/dashboards/` 的 App、Containers、Host、Logs 四個 JSON 格式正確、可被 Grafana 匯入(含 `title`、`uid`、`panels`、`schemaVersion`);每個 panel 都有查詢且 data source 指向 dashboard 變數(不寫死 uid);App 的查詢排除 `view="metrics"`;所用的 metric 與 label 名稱存在於 django-prometheus / `config.alloy` 實際輸出的名稱中;JSON 不含 token 或 stack 專屬 uid。產生四個 JSON 使測試轉綠(design.md D10)。驗證:(auto) `pytest` 全綠;(manual) 使用者在 Grafana Cloud Import 四張 dashboard,每個 panel 都有資料;若在 UI 有調整,匯出覆蓋回 repo 並重跑測試
+- [ ] 4.2 在 Grafana Cloud UI 建立 4 條告警(D10)並設定 email 通知,規則匯出到 `infra/grafana/alerts/`(確認不含 token、email 以外的個資)。驗證:(manual) `docker compose stop alloy` 超過 10 分鐘後收到「收不到 metrics」告警 email,之後再 `start`
