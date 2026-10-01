@@ -26,6 +26,7 @@
 
 - [x] 3.4 先改測試(紅燈):nginx 的 log stream 帶 `service_name="nginx"`(並保留 `source="nginx"`、`log_type`),docker log 的 label 不變(design.md D7)。改 `config.alloy` 使測試轉綠。驗證:(auto) `pytest` 全綠、本機以真正的 Alloy 載入設定且元件皆 healthy;(manual) 部署後 Grafana Logs Drilldown 出現 `nginx`,不再有 `unknown_service`
   - 結果(2026-10-01):`loki.source.file "nginx"` 兩個 target 加 `service_name="nginx"`(保留 `source`、`log_type`);`test_nginx_file_targets` 先改(RED:只缺 `service_name`)後轉綠,新增 `test_docker_log_labels_unchanged_by_nginx_service_name`(docker relabel 只設 `container`、`loki.source.docker` 無 `source`/`service_name` label),皆以真正的 Alloy v1.20.1 component API 驗證、元件皆 healthy、`alloy fmt` 正規;`pytest -q` 961 passed。(manual) Grafana Logs Drilldown 出現 `nginx` 的檢查待部署後確認。
+  - 部署後(2026-10-01,PR #29):Logs Drilldown 出現 `nginx`,新的 nginx log 不再進 `unknown_service`(舊資料留到過期)。label 改變後 Alloy 視為新的 target,把 `access.log` 從頭重讀一次,所以 `nginx` 底下有一批時間戳都是 18:18:59 的舊行(與 `unknown_service` 內容重複,僅此一次);`loki.source.file` 以讀取時間為時間戳,正常 tail 時與實際時間只差幾秒。
 
 ## 4. Dashboard 與告警
 
