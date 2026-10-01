@@ -137,11 +137,12 @@ loki.source.docker "containers" {
 	forward_to    = [redact.secrets.logs.receiver]
 }
 
-// Host nginx (root:adm 640; alloy runs as root).
+// Host nginx (root:adm 640; alloy runs as root). service_name is what
+// Grafana Logs Drilldown groups by; without it the stream is "unknown_service".
 loki.source.file "nginx" {
 	targets = [
-		{"__path__" = "/var/log/nginx/access.log", "source" = "nginx", "log_type" = "access"},
-		{"__path__" = "/var/log/nginx/error.log", "source" = "nginx", "log_type" = "error"},
+		{"__path__" = "/var/log/nginx/access.log", "source" = "nginx", "service_name" = "nginx", "log_type" = "access"},
+		{"__path__" = "/var/log/nginx/error.log", "source" = "nginx", "service_name" = "nginx", "log_type" = "error"},
 	]
 	forward_to = [redact.secrets.logs.receiver]
 }

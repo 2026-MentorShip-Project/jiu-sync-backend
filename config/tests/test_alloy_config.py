@@ -385,10 +385,33 @@ def test_nginx_file_targets(comps):
     a = _args(comps, "loki.source.file.nginx")
     targets = sorted(a["targets"], key=lambda t: t["__path__"])
     assert targets == [
-        {"__path__": "/var/log/nginx/access.log", "source": "nginx", "log_type": "access"},
-        {"__path__": "/var/log/nginx/error.log", "source": "nginx", "log_type": "error"},
+        {
+            "__path__": "/var/log/nginx/access.log",
+            "source": "nginx",
+            "service_name": "nginx",
+            "log_type": "access",
+        },
+        {
+            "__path__": "/var/log/nginx/error.log",
+            "source": "nginx",
+            "service_name": "nginx",
+            "log_type": "error",
+        },
     ]
     assert _refs(comps, "loki.source.file.nginx") == {"redact.secrets.logs"}
+
+
+def test_docker_log_labels_unchanged_by_nginx_service_name(comps):
+    """Task 3.4:只有 nginx 補 `service_name`;docker log 仍只由我們加 `container`,
+    不強加 `source`/`service_name`(Drilldown 對 docker log 的分組維持原狀)。"""
+    rules = _rules(comps, "discovery.relabel.docker_logs")
+    assert {r.get("target_label") for r in rules} == {"container"}
+    for r in rules:
+        assert r.get("action", "replace") == "replace"
+    src = _args(comps, "loki.source.docker.containers")
+    labels = src.get("labels") or {}
+    assert "source" not in labels
+    assert "service_name" not in labels
 
 
 def test_every_log_source_goes_through_redaction_only(comps):
