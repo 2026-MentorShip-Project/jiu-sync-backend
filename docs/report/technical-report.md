@@ -82,6 +82,56 @@ flowchart LR
     ALLOY -.推送.-> GC
 ```
 
+### 1.1 使用者請求序列圖
+
+下圖以「使用者開啟活動、送出操作，後端完成資料寫入並非同步通知」為例。前端實際會透過 `src/api/eventsApi.ts` 呼叫活動、投票、留言與 poll API；需要登入的主揪操作則由共用 HTTP client 自動帶上 access token。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as 使用者
+    participant FE as React 前端
+    participant Nginx as nginx / HTTPS
+    participant API as Django REST API
+    participant Redis as Redis
+    participant Worker as Celery Worker
+    participant DB as PostgreSQL（目前）／RDS（未來）
+    participant Mail as Email 服務
+
+    User->>FE: 開啟活動頁或送出操作
+    FE->>Nginx: HTTPS API request
+    Nginx->>API: 轉送請求
+    API->>DB: 查詢活動、權限與目前狀態
+    DB-->>API: 回傳資料
+
+    alt 建立活動、投票、留言或生命週期操作
+        API->>DB: BEGIN，驗證並寫入資料
+        DB-->>API: COMMIT 成功
+        opt 需要寄送通知
+            API->>Redis: commit 後排入通知任務
+            Redis-->>Worker: 取出 Celery task
+            Worker->>DB: 重新確認最新活動狀態
+            Worker->>Mail: 個別寄送通知信
+        end
+        API-->>Nginx: 2xx + 最新結果
+        Nginx-->>FE: JSON response
+        FE-->>User: 更新畫面
+    else 輕量輪詢
+        API-->>FE: 狀態、版本、投票／留言摘要
+        alt 摘要與上次不同
+            FE->>API: 重新取得完整活動或留言
+            API->>DB: 查詢最新資料
+            DB-->>API: 回傳結果
+            API-->>FE: 完整資料
+            FE-->>User: 靜默更新畫面
+        else 沒有變化
+            FE-->>User: 維持目前畫面
+        end
+    end
+```
+
+Redis 不負責保存核心活動資料；它主要用於 Celery 任務佇列與短期留言限流。活動、投票、留言及使用者資料仍以 PostgreSQL 為唯一事實來源。未來若改用 AWS RDS，只是把 PostgreSQL 從 EC2 container 搬到代管服務，API 的主要資料流程不需要重新設計。
+
 ### 架構說明
 
 - **nginx 是唯一對外入口**，負責 TLS 終止與反向代理；PostgreSQL、Redis 和 metrics 端點不直接暴露到網際網路。
@@ -211,4 +261,3 @@ CI 已有健康檢查與 k6 smoke test，但沒有正式負載測試。因此 P9
 ## 結論
 
 目前架構適合 MVP：它降低參與者使用門檻，也針對併發更新、外部服務失敗及敏感資料建立了明確保護。最大的限制不在功能正確性，而在單機部署、備份、防濫用與容量驗證。下一階段應先補資料備份與公開端點防護，再以真實監控和負載測試決定何時拆分基礎設施，而不是過早投入高成本的分散式架構。
-
