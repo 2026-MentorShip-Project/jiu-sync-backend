@@ -27,6 +27,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - `PROMETHEUS_MULTIPROC_DIR=/dev/shm/prometheus`(compose 的 app `environment` 設定)。`/dev/shm` 是 container 自己的 tmpfs,container 重啟即清空,滿足「重啟不殘留舊數值」。
 - 新增 `gunicorn.conf.py`:沿用現有參數(bind、gthread、3 workers、4 threads、timeout 60、`worker_tmp_dir=/dev/shm`);`on_starting` 清空並建立 multiprocess 目錄;`child_exit` 呼叫 `prometheus_client.multiprocess.mark_process_dead(worker.pid)`。Dockerfile `CMD` 改為 `gunicorn -c gunicorn.conf.py config.wsgi:application`。
 - 只有 app 設 `PROMETHEUS_MULTIPROC_DIR`,celery worker 不設。
+- 不換 `django_prometheus.db.backends.postgresql`(不輸出 DB 查詢次數;Task 2.1 後 opsx:update,使用者確認):換 engine 會讓觀測進入每一條 SQL 的路徑,牽動 PgBouncer transaction pooling、`select_for_update`、`SET LOCAL`,違反 D9「觀測不影響 app」。慢 API 由 view latency 判斷;DB 層數據之後以 Postgres exporter 另開 change。
 - 版本相容性(Task 1.1 查 PyPI,2026-10-01):最新 stable `django-prometheus==2.5.0` 宣告 `Django>=4.2,<6.1,!=5.0.*`(classifiers 到 6.0),**不支援本專案的 Django 6.1.1**,直接 `uv add` 會解析失敗;`2.6.0.dev*` 預發布版(最新 `2.6.0.dev22`,2026-09-19)已放寬為 `<6.2` 並列出 Django 6.1。**決定(2026-10-01,使用者確認)**:釘死 `django-prometheus==2.6.0.dev22`(精確版本,不用範圍),使用面僅 middleware + 匯出,由 Task 2.1 測試守住;2.6.0 正式版釋出後另行升級。若 dev22 在 Task 2.1 實測不可用,退回直接用 `prometheus_client` 自寫 view 層級 middleware。替代:等正式版——時程未知;Django 降回 6.0——為監控降框架版本不划算。不採用。
 - multiprocess mode 下不提供 `process_*` metrics,container 的 CPU / 記憶體改由 cadvisor 提供(D6)。
 - 替代:放在掛 volume 的一般目錄——需要自己寫清理 entrypoint;gunicorn statsd——看不到 Django view。不採用。
@@ -35,6 +36,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 - 自訂 view 包住 django-prometheus 的匯出:`METRICS_TOKEN` 未設定或空字串,或 `Authorization` 不是 `Bearer <METRICS_TOKEN>` → `raise Http404`(走既有 `handler404`,回應與不存在的路徑相同);比對用 `hmac.compare_digest`。
 - 不使用 `django_prometheus.urls` 的公開路由。
+- 內部 scrape 放行(Task 2.1 實測後 opsx:update,使用者確認):Alloy 以 `http://app:8000/metrics` scrape,不帶 `X-Forwarded-Proto` 且 `Host: app`,原本會被 `SECURE_SSL_REDIRECT`(301)與 `ALLOWED_HOSTS`(400)擋下。`prod.py` 設 `SECURE_REDIRECT_EXEMPT = [r"^metrics$"]`,並在程式碼把 `"app"` 附加到 `ALLOWED_HOSTS`(不靠 `.env`,由測試守住)。對外的 `/metrics` 仍由 nginx 404 + token 保護;外部請求必經 nginx 並帶真實網域,`Host: app` 只會出現在 compose 內網。替代:Alloy 送 `X-Forwarded-Proto`/`Host` header 模擬 nginx——Go HTTP client 改 Host 受限,且需在 Alloy 寫死網域;改 `.env` 的 `DJANGO_ALLOWED_HOSTS`——無測試守住。不採用。
 - 第二道防線:nginx `location = /metrics { return 404; }`(人工步驟);先把 EC2 上現有 nginx 設定備份到 `infra/nginx/`,作為參考文件。
 - 替代:只靠 nginx——設定不在 repo、沒有測試;用來源 IP 判斷——經 docker-proxy 進來的請求和 Alloy 的來源 IP 分不出來。不採用。
 

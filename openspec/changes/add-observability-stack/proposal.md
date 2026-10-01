@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- App 加入 `django-prometheus`,以 gunicorn multiprocess mode 輸出 `/metrics`(request rate、各 view latency、HTTP status、DB 查詢)
+- App 加入 `django-prometheus`,以 gunicorn multiprocess mode 輸出 `/metrics`(request rate、各 view latency、HTTP status)
 - 新增 `gunicorn.conf.py`(multiprocess 目錄、worker 結束清理),Dockerfile `CMD` 改用此設定檔,參數不變(3 workers × 4 threads)
 - `/metrics` 以 `METRICS_TOKEN` bearer token 保護,未通過一律 404(fail closed);nginx 加第二道 404
 - 正式 compose 新增 Grafana Alloy:scrape app `/metrics`、內建 cadvisor(container)與 unix exporter(EC2 host),收集所有 container log 與 host 上的 nginx log,遮蔽敏感字串後推送至 Grafana Cloud Prometheus / Loki

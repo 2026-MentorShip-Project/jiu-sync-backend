@@ -6,7 +6,7 @@
 
 ### Requirement: 應用程式提供 HTTP 層 metrics
 
-應用程式 SHALL 提供 metrics 端點,輸出每個 view 的請求數、回應時間分布、HTTP status 分布與資料庫查詢次數。應用程式以多個 worker process 運行時,端點輸出的數值 SHALL 為所有 worker 的加總,SHALL NOT 隨請求落到哪個 worker 而變動。worker 重啟後,先前 worker 已累計的 counter SHALL 保留在加總中;應用程式整體重啟後 SHALL 從零開始,不殘留上次啟動的數值。
+應用程式 SHALL 提供 metrics 端點,輸出每個 view 的請求數、回應時間分布、HTTP status 分布。應用程式以多個 worker process 運行時,端點輸出的數值 SHALL 為所有 worker 的加總,SHALL NOT 隨請求落到哪個 worker 而變動。worker 重啟後,先前 worker 已累計的 counter SHALL 保留在加總中;應用程式整體重啟後 SHALL 從零開始,不殘留上次啟動的數值。
 
 #### Scenario: 多個 worker 的數值被加總
 - **WHEN** 多個 worker 各自處理過請求後讀取 metrics 端點多次
@@ -31,6 +31,10 @@ metrics 端點 SHALL 只在請求帶有與設定相符的 bearer token 時回傳
 #### Scenario: 系統未設定 token(fail closed)
 - **WHEN** 系統未設定 metrics token,請求帶任意 token 或不帶
 - **THEN** 回應 404
+
+#### Scenario: 內部收集端以 http 存取
+- **WHEN** 內部收集端以 http 經 compose 內部網址(主機名稱 `app`)存取 metrics 端點並帶正確 token
+- **THEN** 回應 200,不被 https 導向或主機名稱檢查擋下
 
 #### Scenario: 從公開網址存取
 - **WHEN** 從 EC2 外部經公開網址存取 metrics 路徑
