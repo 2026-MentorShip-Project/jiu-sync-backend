@@ -88,7 +88,7 @@ prometheus.exporter.unix "host" {
 	procfs_path    = "/host/proc"
 	sysfs_path     = "/sys"
 	rootfs_path    = "/rootfs"
-	set_collectors = ["cpu", "meminfo", "filesystem", "netdev", "loadavg", "diskstats"]
+	set_collectors = ["cpu", "meminfo", "filesystem", "netdev", "loadavg"]
 }
 
 prometheus.scrape "host" {

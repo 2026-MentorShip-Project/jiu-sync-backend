@@ -220,6 +220,16 @@ def test_full_config_loads_and_stays_running(full_config):
     assert full_config["running"] == "true", full_config["logs"][-4000:]
 
 
+def test_startup_logs_have_no_diskstats_udev_error(full_config):
+    # D6:diskstats 不收,啟動 log 不應出現 diskstats / /run/udev 的錯誤
+    bad = [
+        line
+        for line in full_config["logs"].splitlines()
+        if "level=error" in line and ("diskstats" in line or "/run/udev" in line)
+    ]
+    assert not bad, "\n".join(bad)
+
+
 def test_no_component_unhealthy(comps):
     bad = {k: c["health"] for k, c in comps.items() if c["health"]["state"] not in ("healthy",)}
     assert not bad
@@ -325,8 +335,9 @@ def test_unix_exporter_paths_and_collectors(comps):
     assert a.get("sysfs_path", "/sys") == "/sys"
     assert re.search(r'^\s*sysfs_path\s*=\s*"/sys"\s*$', CONFIG.read_text(), re.M)
     assert a["rootfs_path"] == "/rootfs"
+    # D6:不收 diskstats(未掛 /run/udev 時每次啟動都會記一行錯誤 log)
     assert sorted(a["set_collectors"]) == sorted(
-        ["cpu", "meminfo", "filesystem", "netdev", "loadavg", "diskstats"]
+        ["cpu", "meminfo", "filesystem", "netdev", "loadavg"]
     )
     s = _args(comps, "prometheus.scrape.host")
     assert s["scrape_interval"] == "30s"
