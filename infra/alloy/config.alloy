@@ -1,0 +1,147 @@
+// Grafana Alloy pipeline for the single EC2 host (add-observability-stack).
+//
+// Shipped by infra/scripts/deploy.sh (base64, like the compose file) to
+// /opt/jiu-sync-backend/config.alloy and mounted read-only at
+// /etc/alloy/config.alloy (design.md D4). Secrets come only from the six
+// environment variables the compose alloy service passes in (D5).
+//
+// Metrics (D6): app (django-prometheus) + cadvisor (containers) + unix
+// exporter (host), all every 30s, into one prometheus.remote_write.
+// Logs (D7): docker container logs + host nginx logs, all through the shared
+// redaction module (redact.alloy) into one loki.write.
+
+import.file "redact" {
+	filename = "/etc/alloy/redact.alloy"
+}
+
+// --- Metrics ---------------------------------------------------------------
+
+prometheus.remote_write "grafana_cloud" {
+	endpoint {
+		// Full push endpoint stored in .env; used as-is (D5).
+		url = sys.env("GRAFANA_CLOUD_PROM_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_PROM_USER")
+			password = sys.env("GRAFANA_CLOUD_API_TOKEN")
+		}
+	}
+}
+
+// App: /metrics is protected by a bearer token and exempted from the https
+// redirect / ALLOWED_HOSTS for Host "app" (D3).
+prometheus.scrape "app" {
+	targets         = [{"__address__" = "app:8000"}]
+	metrics_path    = "/metrics"
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+
+	authorization {
+		type        = "Bearer"
+		credentials = sys.env("METRICS_TOKEN")
+	}
+}
+
+// Containers. Needs /var/run/docker.sock, /run/containerd/containerd.sock,
+// /sys, /rootfs, /var/lib/docker, /dev/disk mounted read-only; no privileged
+// (D8). Only the metric categories we use are collected (cheaper than
+// dropping afterwards). NOTE: design.md D6 also lists
+// housekeeping_interval = "30s", but Alloy v1.20.1 has no such argument
+// (the whole config fails to load with it); left out pending opsx:update.
+prometheus.exporter.cadvisor "containers" {
+	docker_only     = true
+	enabled_metrics = ["cpu", "memory", "network"]
+}
+
+prometheus.scrape "cadvisor" {
+	targets         = prometheus.exporter.cadvisor.containers.targets
+	scrape_interval = "30s"
+	forward_to      = [prometheus.relabel.cadvisor.receiver]
+}
+
+prometheus.relabel "cadvisor" {
+	forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+	// Allowlist; everything else is dropped.
+	rule {
+		action        = "keep"
+		source_labels = ["__name__"]
+		regex         = "container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_memory_rss|container_network_receive_bytes_total|container_network_transmit_bytes_total|container_start_time_seconds|container_last_seen"
+	}
+
+	// Host-wide root cgroup (no container name).
+	rule {
+		action        = "drop"
+		source_labels = ["name"]
+		regex         = ""
+	}
+
+	// High-cardinality labels; the container name ("name") is kept.
+	rule {
+		action = "labeldrop"
+		regex  = "id|image|container_label_.+"
+	}
+}
+
+// Host.
+prometheus.exporter.unix "host" {
+	procfs_path    = "/host/proc"
+	sysfs_path     = "/sys"
+	rootfs_path    = "/rootfs"
+	set_collectors = ["cpu", "meminfo", "filesystem", "netdev", "loadavg"]
+}
+
+prometheus.scrape "host" {
+	targets         = prometheus.exporter.unix.host.targets
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+// --- Logs ------------------------------------------------------------------
+
+loki.write "grafana_cloud" {
+	endpoint {
+		url = sys.env("GRAFANA_CLOUD_LOKI_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_LOKI_USER")
+			password = sys.env("GRAFANA_CLOUD_API_TOKEN")
+		}
+	}
+}
+
+// Every log source forwards ONLY to this (D7).
+redact.secrets "logs" {
+	forward_to = [loki.write.grafana_cloud.receiver]
+}
+
+discovery.docker "containers" {
+	host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "docker_logs" {
+	targets = []
+
+	// "/jiu-sync-backend-app-1" -> container="jiu-sync-backend-app-1"
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+}
+
+loki.source.docker "containers" {
+	host          = "unix:///var/run/docker.sock"
+	targets       = discovery.docker.containers.targets
+	relabel_rules = discovery.relabel.docker_logs.rules
+	forward_to    = [redact.secrets.logs.receiver]
+}
+
+// Host nginx (root:adm 640; alloy runs as root).
+loki.source.file "nginx" {
+	targets = [
+		{"__path__" = "/var/log/nginx/access.log", "source" = "nginx", "log_type" = "access"},
+		{"__path__" = "/var/log/nginx/error.log", "source" = "nginx", "log_type" = "error"},
+	]
+	forward_to = [redact.secrets.logs.receiver]
+}

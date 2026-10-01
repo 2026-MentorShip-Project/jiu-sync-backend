@@ -42,7 +42,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 ### D4. Alloy 設定檔傳送:deploy.sh base64(grill Q4)
 
-- 新增 `infra/alloy/config.alloy`;`deploy.sh` 用與 compose 檔相同的手法寫到 `/opt/jiu-sync-backend/config.alloy`;compose 掛 `./config.alloy:/etc/alloy/config.alloy:ro`。
+- 新增 `infra/alloy/config.alloy` 與 `infra/alloy/redact.alloy`(遮蔽模組,見 D7);`deploy.sh` 用與 compose 檔相同的 base64 手法,在所有中止檢查通過後寫到 `/opt/jiu-sync-backend/`;compose 以 `:ro` 掛到 `/etc/alloy/config.alloy`、`/etc/alloy/redact.alloy`。repo 內 compose 的掛載來源為 `../alloy/…`,`deploy.sh` 傳送時改寫成 `./…`(與 env_file 的改寫相同手法)。
 - `up -d` 之後執行 `docker compose restart alloy`:bind mount 內容變動不會觸發 `up -d` 重建 container。
 - 之後做 CD 時直接重用 `deploy.sh`。
 - 替代:compose `configs.content` 內嵌——`$` 需要跳脫、難讀、無法用 `alloy fmt`;自己 build Alloy image——多一條 pipeline。不採用。
@@ -58,8 +58,8 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 - scrape interval 30s。
 - `prometheus.scrape "app"`:`app:8000/metrics`,帶 `authorization { type = "Bearer", credentials = sys.env("METRICS_TOKEN") }`。
-- `prometheus.exporter.cadvisor`:用 `prometheus.relabel` 白名單保留 `container_cpu_usage_seconds_total`、`container_memory_working_set_bytes`、`container_memory_rss`、`container_network_receive_bytes_total`、`container_network_transmit_bytes_total`、`container_start_time_seconds`、`container_last_seen`,其他全部 drop;同時 drop `id`、`image` 等高基數 label,只保留 container 名稱。
-- `prometheus.exporter.unix`:`set_collectors = ["cpu","meminfo","filesystem","netdev","loadavg","diskstats"]`。
+- `prometheus.exporter.cadvisor`:`docker_only = true`、`enabled_metrics = ["cpu","memory","network"]`(不收用不到的類別,比事後 drop 省記憶體)(原訂的 `housekeeping_interval = "30s"` 在 Alloy v1.20.1 不是可用參數,加上會使整份設定載入失敗,Task 3.1 實測後移除;記憶體是否足夠於 3.2 實測);用 `prometheus.relabel` 白名單保留 `container_cpu_usage_seconds_total`、`container_memory_working_set_bytes`、`container_memory_rss`、`container_network_receive_bytes_total`、`container_network_transmit_bytes_total`、`container_start_time_seconds`、`container_last_seen`,其他全部 drop;同時 drop `id`、`image` 等高基數 label,只保留 container 名稱;drop `name=""`(主機合計的 root cgroup)。
+- `prometheus.exporter.unix`:`set_collectors = ["cpu","meminfo","filesystem","netdev","loadavg"]`。不收 `diskstats`(Task 3.1 後 opsx:update):dashboard 用不到磁碟 I/O,且未掛 `/run/udev` 時每次啟動都會產生一行錯誤 log 送進 Loki。
 - 不做 Postgres / Redis / PgBouncer / Celery exporter。
 - 目標 active series < 3k,部署後人工確認。
 
@@ -67,15 +67,18 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 - `discovery.docker` + `loki.source.docker`:label `container`(去掉開頭的 `/`)。
 - `loki.source.file`:`/var/log/nginx/access.log`、`error.log`,label `source="nginx"`、`log_type`。
-- `loki.process` 共用遮蔽:`Bearer\s+\S+`、JWT(`eyJ[\w-]+\.[\w-]+\.[\w-]+`)、email → `[REDACTED]`;IP 保留。
+- `loki.process` 共用遮蔽:`Bearer\s+[^\s"',;]+`(遇到引號、逗號、分號即停,避免吃掉 JSON 的結尾引號;Task 3.1 code-review 前發現 `Bearer\s+\S+` 會把 `"Bearer abc"` 變成 `"[REDACTED]`,opsx:update 使用者確認)、JWT(`eyJ[\w-]+\.[\w-]+\.[\w-]+`)、email → `[REDACTED]`;IP 保留。
+- 遮蔽規則只寫在 `redact.alloy`(`declare` 模組),`config.alloy` 以 `import.file` 引用,測試也 import 同一份檔案,確保測到的就是正式規則。
 - 遮蔽規則以樣本 log 驗證:用 docker 跑 Alloy,`loki.source.file` 讀 fixture,`loki.echo`(或寫檔)輸出後比對。在 Task 3 實作時確定驗證方式,但驗證本身不可省略。
 - 不改 log 格式(JSON 化另開 change)。
 
 ### D8. 資源、權限與持久化(grill Q3/Q11/Q13)
 
-- Alloy `mem_limit: 200m`、`restart: unless-stopped`,不出現在任何 service 的 `depends_on`;UI port 12345 不 publish。
+- Alloy `mem_limit: 200m`、環境變數 `GOMEMLIMIT=150MiB`(讓 Go GC 在接近上限前積極回收)、`restart: unless-stopped`,不出現在任何 service 的 `depends_on`;UI port 12345 不 publish。
 - image 釘版本 `grafana/alloy:v1.20.1`(Task 1.1 選定:2026-09-28 發布的最新 stable release;本機以 docker 驗證 `--version` 與 `fmt` 正常,multi-arch image 含 amd64)。
-- 掛載全部 `:ro`:`/var/run/docker.sock`、`/proc`→`/host/proc`、`/sys`→`/host/sys`、`/`→`/host/root`、`/var/lib/docker`、`/dev/disk`、`/var/log/nginx`。以 root 執行(讀取 `root:adm 640` 的 nginx log)。
+- 掛載全部 `:ro`:`/var/run/docker.sock`、`/run/containerd/containerd.sock`、`/sys`→`/sys`、`/`→`/rootfs`、`/proc`→`/host/proc`、`/var/lib/docker`、`/dev/disk`、`/var/log/nginx`。unix exporter 使用 `procfs_path=/host/proc`、`sysfs_path=/sys`、`rootfs_path=/rootfs`。以 root 執行(讀取 `root:adm 640` 的 nginx log)。**不開 `privileged`、不加 capabilities、不用 `pid: host`。**
+- containerd.sock 與 `/sys` 原路徑(Task 3.1 實測後 opsx:update,使用者確認):Alloy v1.20.1 的 cadvisor 讀 Docker container 需經 containerd socket,只有 docker.sock 時 container metrics 為空(本機與官方文件皆證實;官方文件建議 privileged)。2026-10-01 在 EC2 實測:`containerd.sock:ro` + `/sys:/sys:ro`、不開 privileged,可取得 app/db/worker/pgbouncer/redis 各 container 的 `container_memory_working_set_bytes`(唯一的 log 是 crio factory 註冊失敗,level=info、無害)。containerd.sock 與 docker.sock 同為 root 等級權限,風險等級不變。替代:`privileged: true`——container 被入侵即可直接接管主機,不採用;拿掉 cadvisor——看不到各 container 的資源與重啟,不採用;另跑官方 cadvisor container——同樣建議 privileged 且多吃記憶體,不採用。
+- 記憶體實測與調整:同次 EC2 實測只開 cadvisor(預設設定)即用 170.5MiB / 200MiB,因此加上 `GOMEMLIMIT` 與 D6 的 cadvisor 參數。不擴展 instance(使用者決定先試 t2.micro);Task 3.2 部署後若 Alloy 反覆被 OOM kill 重啟、或 swap 長期 > 200MB,另開 change 垂直擴展(注意 `ec2.tf` 依 AZ 選 subnet,改 instance type 可能導致 instance 被重建、資料遺失)。
 - named volume `alloy_data:/var/lib/alloy/data`,以 `--storage.path` 指向,保存 positions 與 remote_write WAL,讓重啟後不重送、不遺漏。
 - EC2 加 1GB swapfile、`vm.swappiness=10`、寫入 `/etc/fstab`(人工 SSM)。
 
@@ -98,8 +101,8 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 
 ## Risks / Trade-offs
 
-- [docker.sock 等同 host root] → 所有掛載 `:ro`、image 釘版本、不 publish port;單人專案接受此風險。之後有多人協作或主機上有更敏感的服務時,再評估 docker-socket-proxy。
-- [記憶體不足造成 OOM] → swap 當緩衝 + Alloy `mem_limit` + 記憶體與 swap 告警;若 swap 經常被使用,另開 change 升級 instance。
+- [docker.sock 與 containerd.sock 等同 host root] → 所有掛載 `:ro`、不開 privileged、image 釘版本、不 publish port;單人專案接受此風險。之後有多人協作或主機上有更敏感的服務時,再評估 docker-socket-proxy。
+- [記憶體不足造成 OOM] → swap 當緩衝 + Alloy `mem_limit` + 記憶體與 swap 告警;若 Alloy 反覆 OOM 重啟或 swap 長期 > 200MB,另開 change 升級 instance(見 D8)。
 - [django-prometheus middleware 在每個 request 的路徑上] → 只做計數、成本極低;出問題時回滾 image。
 - [multiprocess 目錄殘留] → 放 tmpfs + `on_starting` 清空 + `child_exit` mark dead。
 - [series 數超過額度] → 白名單 + 部署後人工確認。

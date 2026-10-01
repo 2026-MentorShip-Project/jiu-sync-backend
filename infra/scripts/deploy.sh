@@ -50,6 +50,17 @@
 #      this is safe: `docker pull` is a no-op when the digest is unchanged,
 #      and `up -d` doesn't restart services with no image/config change
 #      (design.md decision 8 — idempotency for free).
+#   6. Grafana Alloy (openspec/changes/add-observability-stack design.md
+#      D4/D9): infra/alloy/config.alloy and redact.alloy are shipped the same
+#      way as the compose file (base64) to /opt/jiu-sync-backend/, and the
+#      compose file's `../alloy/<file>` mount sources are rewritten to
+#      `./<file>` in transit. The six GRAFANA_CLOUD_* / METRICS_TOKEN keys
+#      are checked in .env by NAME only (values are never printed); a missing
+#      or empty one prints a WARNING and the deploy CONTINUES — observability
+#      must never block a deploy (deliberately unlike DATABASE_URL_DIRECT,
+#      which aborts). After `up -d`, `docker compose restart alloy` makes
+#      alloy re-read its config (a changed bind-mounted file does not
+#      recreate the container); a failed restart only warns.
 #
 # Usage: ./infra/scripts/deploy.sh
 
@@ -60,6 +71,8 @@ INSTANCE_ID="i-0f6d5dc974e91bbf6"
 REGION="ap-northeast-3"
 REPO_DIR="/opt/jiu-sync-backend"          # target dir on the EC2 instance
 COMPOSE_FILE_LOCAL="infra/docker/docker-compose.prod.yml"
+ALLOY_CONFIG_LOCAL="infra/alloy/config.alloy"
+ALLOY_REDACT_LOCAL="infra/alloy/redact.alloy"
 ENV_FILE="${REPO_DIR}/.env"
 SSM_TIMEOUT_SECONDS=900    # no more `docker compose build` on the instance
                            # (moved to GitHub Actions, design.md decision 5)
@@ -71,16 +84,22 @@ POLL_MAX_ATTEMPTS=200      # ~16.5 min at 5s/poll, comfortably above SSM_TIMEOUT
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not found in PATH." >&2; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not found in PATH." >&2; exit 1; }
 
-if [ ! -f "$COMPOSE_FILE_LOCAL" ]; then
-  echo "ERROR: ${COMPOSE_FILE_LOCAL} not found. Run this script from the repo root." >&2
-  exit 1
-fi
+for f in "$COMPOSE_FILE_LOCAL" "$ALLOY_CONFIG_LOCAL" "$ALLOY_REDACT_LOCAL"; do
+  if [ ! -f "$f" ]; then
+    echo "ERROR: ${f} not found. Run this script from the repo root." >&2
+    exit 1
+  fi
+done
 
 # Rewrite the compose file's env_file entries for the flat remote layout
 # (see NOTE in the header comment above). Only touches the two YAML list
 # items themselves (`      - ../../.env`), not the prose in the file's
-# header comments that also happens to mention that path.
-COMPOSE_B64=$(sed -E 's#^([[:space:]]*-[[:space:]]+)\.\./\.\./\.env[[:space:]]*$#\1.env#' "$COMPOSE_FILE_LOCAL" | base64 | tr -d '\n')
+# header comments that also happens to mention that path. Likewise the
+# alloy volume items `      - ../alloy/<file>:...` become `./<file>:...`
+# (config.alloy / redact.alloy are written next to the compose file, step 6).
+COMPOSE_B64=$(sed -E -e 's#^([[:space:]]*-[[:space:]]+)\.\./\.\./\.env[[:space:]]*$#\1.env#' -e 's#^([[:space:]]*-[[:space:]]+)\.\./alloy/#\1./#' "$COMPOSE_FILE_LOCAL" | base64 | tr -d '\n')
+ALLOY_CONFIG_B64=$(base64 < "$ALLOY_CONFIG_LOCAL" | tr -d '\n')
+ALLOY_REDACT_B64=$(base64 < "$ALLOY_REDACT_LOCAL" | tr -d '\n')
 
 # --- Build the remote shell script --------------------------------------
 # Everything inside this heredoc runs ON THE EC2 INSTANCE, not locally.
@@ -106,6 +125,8 @@ ENV_FILE="${ENV_FILE}"
 REPO_DIR="${REPO_DIR}"
 COMPOSE_FILE="\${REPO_DIR}/docker-compose.prod.yml"
 COMPOSE_B64="${COMPOSE_B64}"
+ALLOY_CONFIG_B64="${ALLOY_CONFIG_B64}"
+ALLOY_REDACT_B64="${ALLOY_REDACT_B64}"
 
 echo "=== [1/8] Checking for required .env at \${ENV_FILE} ==="
 if [ ! -f "\${ENV_FILE}" ]; then
@@ -174,6 +195,32 @@ if [ -z "\${DATABASE_URL_DIRECT}" ]; then
 fi
 echo "OK: DATABASE_URL_DIRECT present."
 
+echo "=== [4b/8] Checking Grafana Alloy variables in \${ENV_FILE} ==="
+# add-observability-stack design.md D9: observability must never block a
+# deploy — a missing/empty key only WARNs (unlike DATABASE_URL_DIRECT above).
+# Only key NAMES are printed, never values.
+MISSING_ALLOY_VARS=""
+for key in GRAFANA_CLOUD_PROM_URL GRAFANA_CLOUD_PROM_USER GRAFANA_CLOUD_LOKI_URL GRAFANA_CLOUD_LOKI_USER GRAFANA_CLOUD_API_TOKEN METRICS_TOKEN; do
+  if [ -z "\$(extract_env_var "\${key}" "\${ENV_FILE}")" ]; then
+    MISSING_ALLOY_VARS="\${MISSING_ALLOY_VARS} \${key}"
+  fi
+done
+if [ -n "\${MISSING_ALLOY_VARS}" ]; then
+  echo "WARNING: missing or empty in \${ENV_FILE}:\${MISSING_ALLOY_VARS}" >&2
+  echo "WARNING: alloy will start but cannot scrape /metrics and/or push to Grafana Cloud. Continuing deploy." >&2
+else
+  echo "OK: all Grafana Alloy variables present."
+fi
+
+echo "=== [4c/8] Writing config.alloy, redact.alloy to \${REPO_DIR} ==="
+# Only after every abort check above: an aborted deploy must not leave a new
+# alloy config on disk for a later restart/reboot to pick up undeployed.
+# Written in place (\`>\` truncates the same inode), so the single-file bind
+# mounts of a running alloy container keep pointing at the new content.
+echo "\${ALLOY_CONFIG_B64}" | base64 -d > "\${REPO_DIR}/config.alloy"
+echo "\${ALLOY_REDACT_B64}" | base64 -d > "\${REPO_DIR}/redact.alloy"
+echo "OK: alloy config written."
+
 echo "=== [5/8] docker login ghcr.io ==="
 docker login ghcr.io -u "\${GHCR_USERNAME}" -p "\${GHCR_TOKEN}"
 
@@ -182,6 +229,15 @@ docker compose -f "\${COMPOSE_FILE}" pull
 
 echo "=== [7/8] docker compose up -d ==="
 docker compose -f "\${COMPOSE_FILE}" up -d
+
+echo "=== [7b/8] docker compose restart alloy (re-read config.alloy) ==="
+# A changed bind-mounted config file doesn't make \`up -d\` recreate alloy,
+# so restart it explicitly. Failure only warns (design.md D9).
+if docker compose -f "\${COMPOSE_FILE}" restart alloy; then
+  echo "OK: alloy restarted."
+else
+  echo "WARNING: docker compose restart alloy failed; observability may be running an old config. Continuing deploy." >&2
+fi
 
 echo "=== [8/8] Running migrations (direct to db) and collecting static files ==="
 docker compose -f "\${COMPOSE_FILE}" exec -T -e DATABASE_URL="\${DATABASE_URL_DIRECT}" app python manage.py migrate
