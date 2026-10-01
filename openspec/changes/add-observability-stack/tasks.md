@@ -18,7 +18,7 @@
 ## 3. Alloy 管線上線
 
 - [ ] 3.1 先寫測試(紅燈):compose 的 alloy service 符合 D5/D8/D9(釘版本、`mem_limit`、所有掛載 `:ro`、`alloy_data` volume、只有 6 個 environment 變數且沒有 `env_file`、沒有 publish port、不出現在任何 `depends_on`),沿用 `config/tests/test_prod_compose.py` 的 `docker compose config` 做法;`config.alloy` 通過 `alloy fmt`;遮蔽規則用樣本 log 驗證 Bearer、JWT、email 會被遮蔽、IP 保留、其他內容不變(D7);`deploy.sh` 會寫入 `config.alloy`、缺少變數時只印 WARNING 不中止、`up -d` 之後會 restart alloy。實作 `infra/alloy/config.alloy`、compose、`deploy.sh` 使測試轉綠。驗證:(auto) `pytest` 全綠
-- [ ] 3.2 部署並確認資料:執行 `deploy.sh`。驗證:(manual) Grafana Cloud Explore 查得到 `django_http_*`、`container_*`(各 container)、`node_*`(含 swap),Loki 查得到各 container 與 nginx 的 log;active series < 3k;`docker stats` 顯示 alloy 記憶體在 200MB 以內;再執行一次 `deploy.sh`,確認 nginx log 沒有重複;`docker compose stop alloy` 期間 API 正常,之後再 `start`
+- [ ] 3.2 部署並確認資料:執行 `deploy.sh`。驗證:(manual) Grafana Cloud Explore 查得到 `django_http_*`、`container_*`(各 container)、`node_*`(含 swap),Loki 查得到各 container 與 nginx 的 log;active series < 3k;`docker stats` 顯示 alloy 記憶體在 200MB 以內、`docker inspect` 的 RestartCount 未持續增加(反覆 OOM 即依 D8 另開擴展 change),`free -m` 的 swap 未長期 > 200MB;再執行一次 `deploy.sh`,確認 nginx log 沒有重複;`docker compose stop alloy` 期間 API 正常,之後再 `start`
 
 ## 4. Dashboard 與告警
 
