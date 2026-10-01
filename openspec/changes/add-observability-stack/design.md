@@ -93,7 +93,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - 在 Grafana Cloud UI 建立 App、Containers、Host、Logs 四張 dashboard(可匯入社群 dashboard 後調整),JSON 匯出到 `infra/grafana/dashboards/`。
 - 4 條告警,通知寄到開發者 email,規則匯出到 `infra/grafana/alerts/`:
   1. 10 分鐘內收不到任何 metrics(`absent`/no data)
-  2. `node_memory_MemAvailable_bytes` < 100MB 或 swap 用量 > 200MB,持續 5 分鐘
+  2. `node_memory_MemAvailable_bytes` < 100MB,持續 5 分鐘(原訂的「swap 用量 > 200MB」已移除——Task 3.2 後 swap 長期約 415MB 但為閒置分頁,設了會一直響;swap 讀寫頻率需另開 `vmstat` collector,目前不收。真正傷害 app 的 OOM kill 會由第 4 條 container 重啟告警抓到;swap 是否頻繁讀寫改以 `vmstat 5 6` 手動判斷,見 D8)
   3. 5 分鐘內 5xx 比例 > 5%
   4. 15 分鐘內任一 container 重啟
 - 門檻值先用以上保守值,上線一兩週後依實際數據調整。
