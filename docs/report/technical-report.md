@@ -287,6 +287,9 @@ CI 已有健康檢查與 k6 smoke test，但沒有正式負載測試。因此 P9
 | P2 | 通知沒有 retry／timeout | 先確保寄信不影響核心 API | 暫時故障會漏信，SMTP 卡住會堵塞 worker | 設定 timeout、有限次數 exponential backoff |
 | P2 | nginx、機密與 Terraform state 仍有手動管理 | 單人單環境最快 | 重建困難、多人協作風險高 | 設定即程式碼、Secrets Manager、遠端 Terraform state |
 | P3 | 尚未做容量測試 | 優先驗證功能正確性 | 無法以數據判斷可承受流量 | 建立 k6 workload，留下 P50/P95/RPS/error rate 基準 |
+| P1 | 前端沒有錯誤處理頁面 | 先完成主要流程 | 渲染錯誤變白畫面；錯誤網址默默回首頁；後端的 404／410 沒有對應畫面 | Error Boundary、404 與連結失效頁，`http.ts` 依錯誤 `code` 統一處理 |
+| P1 | 前端沒有錯誤監控（Sentry） | 先建立後端可觀測性 | 使用者端錯誤開發者看不到，也無法與後端 log 對照 | 導入 Sentry 並上傳 source map，回報前遮蔽個資 |
+| P2 | 前端沒有 E2E 與 design system 單元測試 | 單元測試優先放在核心邏輯 | 共用元件改壞與前後端串接問題要到正式環境才發現；CI 不跑測試 | CI 加入型別檢查與 Vitest；元件測試；Playwright 測關鍵流程 |
 
 技術債不是單純的缺點清單，而是目前產品階段下的取捨紀錄。詳細背景、已修正事件與實作位置可參考 `06-tech-debt.md`。
 
