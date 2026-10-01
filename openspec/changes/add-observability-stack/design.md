@@ -27,7 +27,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - `PROMETHEUS_MULTIPROC_DIR=/dev/shm/prometheus`(compose 的 app `environment` 設定)。`/dev/shm` 是 container 自己的 tmpfs,container 重啟即清空,滿足「重啟不殘留舊數值」。
 - 新增 `gunicorn.conf.py`:沿用現有參數(bind、gthread、3 workers、4 threads、timeout 60、`worker_tmp_dir=/dev/shm`);`on_starting` 清空並建立 multiprocess 目錄;`child_exit` 呼叫 `prometheus_client.multiprocess.mark_process_dead(worker.pid)`。Dockerfile `CMD` 改為 `gunicorn -c gunicorn.conf.py config.wsgi:application`。
 - 只有 app 設 `PROMETHEUS_MULTIPROC_DIR`,celery worker 不設。
-- 版本相容性(Task 1.1 查 PyPI,2026-10-01):最新 stable `django-prometheus==2.5.0` 宣告 `Django>=4.2,<6.1,!=5.0.*`(classifiers 到 6.0),**不支援本專案的 Django 6.1.1**,直接 `uv add` 會解析失敗;`2.6.0.dev*` 預發布版(最新 `2.6.0.dev22`,2026-09-19)已放寬為 `<6.2` 並列出 Django 6.1。Task 2.1 前需決定:採用 dev 版並釘死版本、等 2.6.0 正式版,或其他方案。
+- 版本相容性(Task 1.1 查 PyPI,2026-10-01):最新 stable `django-prometheus==2.5.0` 宣告 `Django>=4.2,<6.1,!=5.0.*`(classifiers 到 6.0),**不支援本專案的 Django 6.1.1**,直接 `uv add` 會解析失敗;`2.6.0.dev*` 預發布版(最新 `2.6.0.dev22`,2026-09-19)已放寬為 `<6.2` 並列出 Django 6.1。**決定(2026-10-01,使用者確認)**:釘死 `django-prometheus==2.6.0.dev22`(精確版本,不用範圍),使用面僅 middleware + 匯出,由 Task 2.1 測試守住;2.6.0 正式版釋出後另行升級。若 dev22 在 Task 2.1 實測不可用,退回直接用 `prometheus_client` 自寫 view 層級 middleware。替代:等正式版——時程未知;Django 降回 6.0——為監控降框架版本不划算。不採用。
 - multiprocess mode 下不提供 `process_*` metrics,container 的 CPU / 記憶體改由 cadvisor 提供(D6)。
 - 替代:放在掛 volume 的一般目錄——需要自己寫清理 entrypoint;gunicorn statsd——看不到 Django view。不採用。
 
