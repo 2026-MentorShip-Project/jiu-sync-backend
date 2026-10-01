@@ -20,6 +20,7 @@ from django.urls import include, path
 from apps.accounts.views import MeView
 from apps.recommendations.views import AIRecommendationQuotaView
 from config.health import healthz
+from config.metrics import metrics
 
 admin.site.site_header = "揪甘心管理後台 deploy-verify-v1"
 
@@ -32,6 +33,9 @@ urlpatterns = [
         name='ai-recommendation-quota',
     ),
     path('healthz/', healthz, name='healthz'),
+    # Bearer token 保護,不對外(add-observability-stack design.md D3);不用
+    # django_prometheus.urls 的公開路由。Alloy scrape `app:8000/metrics`(無結尾斜線)。
+    path('metrics', metrics, name='metrics'),
     path('api/auth/', include('apps.accounts.urls')),
     path('api/events/', include('apps.events.urls')),
     path('api/recommendations/', include('apps.recommendations.urls')),
