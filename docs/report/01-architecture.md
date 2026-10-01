@@ -2,10 +2,11 @@
 
 揪甘心讓主揪建立活動、分享連結,參與者免登入投票選時段。後端負責活動資料、投票彙整、活動生命週期(定案、取消、重新開放)、通知信,以及定案後的 AI 餐廳推薦。
 
-本章分成三個視角:
+本章分成四個視角:
 
 - **執行期視角**:一個請求如何穿過正在運作的系統。
 - **建置與部署視角(CI/CD)**:程式碼如何從 PR 變成正式環境上跑的 container。
+- **基礎設施即程式碼(Terraform IaC)**:AWS 資源如何被宣告、建立與管理。
 - **可觀測性視角**:系統的 metrics 與 log 如何被收集,以及為什麼它放在請求路徑之外。
 
 ## 1.1 執行期視角
@@ -138,9 +139,96 @@ flowchart LR
 
 > **待補:CD 全自動部署。** 「image 推上 GHCR 後自動觸發部署」目前刻意不在範圍內(`openspec/changes/deploy-django-app/design.md` Non-Goals),會在之後的 change 補上。完成後請更新本節的流程圖。
 
-**基礎設施(Terraform,`infra/terraform/`)**:在 `ap-northeast-3`(大阪)建立 t2.micro(Ubuntu 24.04,20GB gp3)、Elastic IP、只開 80/443 的 Security Group,以及只有 `AmazonSSMManagedInstanceCore` 權限的 instance profile。目前在本機手動執行 `terraform apply`,state 也存在本機。
+**基礎設施**由 Terraform 建立,詳見 1.3。
 
-## 1.3 可觀測性視角
+## 1.3 基礎設施即程式碼(Terraform IaC)
+
+部署所需的 AWS 資源全部以 Terraform 宣告,放在 `infra/terraform/`。目標是讓環境**可以重複建立**:機器壞掉或要重建時,執行 `terraform apply` 就能得到同樣規格、同樣防火牆與權限設定的 EC2,不依賴任何人在 AWS Console 上手動點選。
+
+### 資源關係
+
+```mermaid
+flowchart TB
+    subgraph TF["Terraform 管理的資源(infra/terraform/)"]
+        EC2["aws_instance.app<br/>t2.micro、Ubuntu 24.04、gp3 20GB"]
+        EIP["aws_eip.app<br/>固定公開 IP"]
+        SG["aws_security_group.ec2_web<br/>入站僅 80/443,出站全開"]
+        ROLE["aws_iam_role.ec2_ssm<br/>只能由 ec2.amazonaws.com assume"]
+        POL["aws_iam_role_policy_attachment<br/>AmazonSSMManagedInstanceCore"]
+        PROF["aws_iam_instance_profile.ec2_ssm"]
+    end
+
+    subgraph DS["data source(只查詢,不建立)"]
+        VPC["aws_vpc.default<br/>帳號的預設 VPC"]
+        SUB["aws_subnets.instance_az<br/>提供 t2.micro 的可用區域中的 subnet"]
+        AMI["aws_ami.ubuntu<br/>Canonical 官方最新 Ubuntu 24.04"]
+    end
+
+    OUT["outputs<br/>instance_id、public_ip"]
+
+    EIP --> EC2
+    EC2 --> SG
+    EC2 --> PROF --> ROLE
+    POL --> ROLE
+    EC2 --> SUB --> VPC
+    SG --> VPC
+    EC2 --> AMI
+    EC2 --> OUT
+    EIP --> OUT
+```
+
+### 檔案佈局
+
+採單一 root module,不拆 module。資源只有 instance、EIP、Security Group、IAM 這幾個,拆成 network / compute / security 等 module 的維護成本,攤不回來。
+
+| 檔案 | 內容 |
+| --- | --- |
+| `providers.tf` | Terraform ≥ 1.5、AWS provider `~> 5.0`;region 固定為 `ap-northeast-3`(只有單一環境,不做參數化) |
+| `data.tf` | 查詢預設 VPC、其中的 subnet,以及 Canonical 官方的 Ubuntu 24.04 AMI |
+| `ec2.tf` | `aws_instance`:t2.micro、20GB gp3、套用 Security Group 與 instance profile;subnet 從「有提供 t2.micro 的可用區域」中挑選 |
+| `eip.tf` | `aws_eip`:直接以 `instance` 屬性綁定到 EC2,不另外建 `aws_eip_association` |
+| `security_group.tf` | 入站只允許 TCP 80、443(`0.0.0.0/0`),**不開 22**;出站全開(SSM、apt、docker pull 都需要) |
+| `iam.tf` | EC2 用的 IAM role、`AmazonSSMManagedInstanceCore` policy、instance profile |
+| `outputs.tf` | 輸出 `instance_id`(給 `deploy.sh` 用)與 `public_ip`(對應 `sslip.io` 網域) |
+
+### 設計決策
+
+| 決策 | 做法 | 理由 |
+| --- | --- | --- |
+| 用 SSM 取代 SSH | 不建 key pair、不開 22 port;EC2 掛只有 `AmazonSSMManagedInstanceCore` 的 instance profile | 對外沒有 SSH 可攻擊;存取紀錄留在 AWS;部署腳本也用同一條路(`aws ssm send-command`) |
+| 機器身分與操作者身分分開 | EC2 用 IAM **role**(instance profile),執行 Terraform 的人用自己的 IAM **user** | 兩者是不同主體,不共用同一組憑證;EC2 上不存放任何長期 AWS 金鑰 |
+| AMI 動態查詢 | `data "aws_ami"` 以 Canonical 的官方帳號 ID 過濾,取最新版 | AMI ID 因 region 而異、也會隨更新改變;用 owner 過濾可避免拿到名稱相似的非官方映像 |
+| 使用預設 VPC | 只用 data source 查詢,不自己建 VPC、subnet、route table | 單台機器不需要自訂網路;少一層要維護的資源 |
+| 固定公開 IP | Elastic IP(每小時約 USD 0.005) | 機器停止再啟動時 IP 不變,`sslip.io` 網域與前端設定才不用跟著改 |
+| 磁碟規格 | gp3、20GB | 在 free tier 的 30GB 額度內,預留 Docker image 與 log 的空間 |
+
+### 與部署流程的分工
+
+Terraform 只負責「**把機器開出來**」;機器裡面的東西不在 Terraform 範圍內:
+
+| 層 | 由誰負責 |
+| --- | --- |
+| EC2、EIP、Security Group、IAM | Terraform |
+| Docker、nginx、certbot、swap | 第一次建置時透過 SSM session 手動安裝 |
+| 正式環境 `.env` | 透過 SSM session 手動建立 |
+| 應用程式 container | `deploy.sh` 經 SSM 執行 `docker compose`(見 1.2) |
+
+### 操作方式
+
+- 在開發者本機執行 `terraform init` → `terraform plan` → 人工檢查 plan 後 `terraform apply`。目前沒有接進 CI,也沒有自動 apply。
+- **state 存在本機**(`terraform.tfstate`),`.gitignore` 排除 `*.tfstate`,`.dockerignore` 也排除,避免被打包進 image。
+- 修改設定後重新 `apply`,讓實際狀態收斂到宣告的設定;沒有另外的 rollback 機制。
+
+### 已知限制
+
+以下限制的影響與修正方式記錄在第 6 章:
+
+- **state 只有一份、存在本機。** 本機遺失就無法再用 Terraform 管理現有資源,也無法多人協作。之後改用 S3 backend 並加上鎖定。
+- **機器裡的設定不在 IaC 範圍內。** 重建 EC2 後,Docker、nginx、憑證、swap、`.env` 都要依文件手動還原;Postgres 的資料也在這台機器上,而且目前沒有備份。
+- **改 instance type 可能導致機器被重建。** subnet 是從「提供該 instance type 的可用區域」中取第一個,換規格可能換到不同的 subnet,讓 Terraform 判定必須重建。垂直擴展前要先固定 subnet,並確認 `plan` 是 update in-place。
+- **加固項目未設定。** 沒有強制 IMDSv2(`metadata_options`),EBS 也沒有明確設定 `encrypted = true`。
+
+## 1.4 可觀測性視角
 
 可觀測性系統**放在請求路徑之外**,當成旁路:它只會讀取 app、container、主機與 nginx 的資料,任何服務都不依賴它。Alloy 掛掉或 Grafana Cloud 連不上時,API 照常運作,部署也照常完成(`deploy.sh` 對缺少的觀測設定只印警告,不中止)。
 
@@ -179,7 +267,7 @@ flowchart LR
 
 Dashboard JSON 放在 `infra/grafana/dashboards/`(App、Containers、Host、Logs 四張)。告警(收不到 metrics、可用記憶體不足、5xx 比例過高、container 重啟)尚待建立,見 `openspec/changes/add-observability-stack/tasks.md` task 4.2。
 
-## 1.4 元件一覽
+## 1.5 元件一覽
 
 | 元件 | 在哪裡執行 | 職責 |
 | --- | --- | --- |
@@ -196,7 +284,7 @@ Dashboard JSON 放在 `infra/grafana/dashboards/`(App、Containers、Host、Logs
 | `redis` | compose | Celery broker(db 0)、留言限流鎖(db 1) |
 | `alloy` | compose | 收集 metrics 與 log,推到 Grafana Cloud |
 
-## 1.5 主要請求流程
+## 1.6 主要請求流程
 
 - **主揪登入。** 前端取得 Google id_token,送到 `POST /api/auth/google/`。後端驗證簽章、audience、issuer、email 是否已驗證,建立或找到使用者後,回傳 access token(body)並以 HttpOnly cookie 下發 refresh token。細節見第 5 章。
 - **建立活動。** `POST /api/events/` 建立活動與最多 20 個候選時段,回傳 `{id, shareUrl}`,並在 commit 後排入「分享連結寄給自己」的通知信。活動 id 是 8 碼隨機 base62,不可猜。
@@ -205,7 +293,7 @@ Dashboard JSON 放在 `infra/grafana/dashboards/`(App、Containers、Host、Logs
 - **定案 / 取消 / 重新開放。** 擁有者呼叫對應端點,狀態以條件式 UPDATE 轉換,commit 後寄信通知留過 email 的參與者與主揪。
 - **AI 推薦與選定餐廳。** 見 1.1 的時序圖;選定餐廳 `PUT .../selected-restaurant/` 在活動列鎖內寫入,重送同一間不會重複寫入。
 
-## 1.6 設計決策
+## 1.7 設計決策
 
 - **單機 compose,先控制成本。** 一台 t2.micro 跑完整個後端,所有元件容器化。這是 MVP 階段的刻意取捨,代價是只能垂直擴展、沒有高可用,詳見第 3 章與第 6 章。
 - **app 本身不保存狀態。** API 用 JWT 認證,不依賴 server session;需要保存的東西都在 Postgres 或 Redis。之後把資料庫與 Redis 搬出這台機器,app 就能直接水平複製。
