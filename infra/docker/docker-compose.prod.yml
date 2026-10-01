@@ -118,5 +118,55 @@ services:
     image: redis:7
     restart: unless-stopped
 
+  # Grafana Alloy (add-observability-stack design.md D4–D9): scrapes app
+  # /metrics, cadvisor (containers), unix exporter (host), tails docker + host
+  # nginx logs, redacts, and pushes everything to Grafana Cloud.
+  # Fault isolation (D9): nothing depends_on alloy and alloy depends on
+  # nothing; if it dies or Grafana Cloud is unreachable the app is unaffected.
+  # Rollback: `docker compose -f docker-compose.prod.yml stop alloy`.
+  # Secrets (D5): only these six variables, interpolated from the .env next to
+  # the project directory (same mechanism as pgbouncer). Never `env_file` —
+  # alloy must not see DATABASE_URL, SECRET_KEY, etc. Missing values only make
+  # deploy.sh print a WARNING (D9), so no `${VAR:?}` here.
+  # Mounts (D8): every host path read-only; no privileged, no cap_add, no
+  # pid: host. containerd.sock + /sys are what cadvisor needs to see Docker
+  # containers (verified on EC2, see D8). Runs as the image's default root
+  # user to read root:adm 640 nginx logs. UI port 12345 is not published.
+  # The two infra/alloy/ file mounts are rewritten to ./ by deploy.sh for the
+  # flat /opt/jiu-sync-backend/ layout, where deploy.sh also writes both files
+  # (D4); after `up -d` deploy.sh runs `restart alloy` because a changed
+  # bind-mounted file does not recreate the container.
+  alloy:
+    image: grafana/alloy:v1.20.1
+    command:
+      - run
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      GRAFANA_CLOUD_PROM_URL: ${GRAFANA_CLOUD_PROM_URL}
+      GRAFANA_CLOUD_PROM_USER: ${GRAFANA_CLOUD_PROM_USER}
+      GRAFANA_CLOUD_LOKI_URL: ${GRAFANA_CLOUD_LOKI_URL}
+      GRAFANA_CLOUD_LOKI_USER: ${GRAFANA_CLOUD_LOKI_USER}
+      GRAFANA_CLOUD_API_TOKEN: ${GRAFANA_CLOUD_API_TOKEN}
+      METRICS_TOKEN: ${METRICS_TOKEN}
+      # Go GC works harder before hitting mem_limit (D8).
+      GOMEMLIMIT: 150MiB
+    volumes:
+      - ../alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ../alloy/redact.alloy:/etc/alloy/redact.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /sys:/sys:ro
+      - /:/rootfs:ro
+      - /proc:/host/proc:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+      - /var/log/nginx:/var/log/nginx:ro
+      # positions + remote_write WAL survive restarts: no resend, no gaps (D8).
+      - alloy_data:/var/lib/alloy/data
+    mem_limit: 200m
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  alloy_data:

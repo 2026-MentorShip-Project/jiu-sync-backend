@@ -1,0 +1,42 @@
+// Shared log redaction (add-observability-stack design.md D7).
+//
+// The ONLY place the redaction rules live. config.alloy imports this module
+// (import.file "redact") and routes every log source through it before
+// loki.write; config/tests/test_alloy_config.py imports this same file into a
+// test harness and checks sample logs with the real Alloy image, so the tests
+// always exercise the production rules (no hand-copied duplicate).
+//
+// Rules (replaced with [REDACTED]):
+//   - Bearer tokens: stops at whitespace, quotes, comma or semicolon so a JSON
+//     value keeps its closing quote ("Bearer abc" -> "[REDACTED]").
+//   - JWTs (eyJ...).(...).(...).
+//   - Email addresses.
+// IP addresses are intentionally kept (D7).
+declare "secrets" {
+	argument "forward_to" {
+		comment = "Receivers that get the redacted log entries."
+	}
+
+	loki.process "default" {
+		forward_to = argument.forward_to.value
+
+		stage.replace {
+			expression = "(Bearer\\s+[^\\s\"',;]+)"
+			replace    = "[REDACTED]"
+		}
+
+		stage.replace {
+			expression = "(eyJ[\\w-]+\\.[\\w-]+\\.[\\w-]+)"
+			replace    = "[REDACTED]"
+		}
+
+		stage.replace {
+			expression = "([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})"
+			replace    = "[REDACTED]"
+		}
+	}
+
+	export "receiver" {
+		value = loki.process.default.receiver
+	}
+}
