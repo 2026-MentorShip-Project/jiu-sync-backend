@@ -78,7 +78,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - image 釘版本 `grafana/alloy:v1.20.1`(Task 1.1 選定:2026-09-28 發布的最新 stable release;本機以 docker 驗證 `--version` 與 `fmt` 正常,multi-arch image 含 amd64)。
 - 掛載全部 `:ro`:`/var/run/docker.sock`、`/run/containerd/containerd.sock`、`/sys`→`/sys`、`/`→`/rootfs`、`/proc`→`/host/proc`、`/var/lib/docker`、`/dev/disk`、`/var/log/nginx`。unix exporter 使用 `procfs_path=/host/proc`、`sysfs_path=/sys`、`rootfs_path=/rootfs`。以 root 執行(讀取 `root:adm 640` 的 nginx log)。**不開 `privileged`、不加 capabilities、不用 `pid: host`。**
 - containerd.sock 與 `/sys` 原路徑(Task 3.1 實測後 opsx:update,使用者確認):Alloy v1.20.1 的 cadvisor 讀 Docker container 需經 containerd socket,只有 docker.sock 時 container metrics 為空(本機與官方文件皆證實;官方文件建議 privileged)。2026-10-01 在 EC2 實測:`containerd.sock:ro` + `/sys:/sys:ro`、不開 privileged,可取得 app/db/worker/pgbouncer/redis 各 container 的 `container_memory_working_set_bytes`(唯一的 log 是 crio factory 註冊失敗,level=info、無害)。containerd.sock 與 docker.sock 同為 root 等級權限,風險等級不變。替代:`privileged: true`——container 被入侵即可直接接管主機,不採用;拿掉 cadvisor——看不到各 container 的資源與重啟,不採用;另跑官方 cadvisor container——同樣建議 privileged 且多吃記憶體,不採用。
-- 記憶體實測與調整:同次 EC2 實測只開 cadvisor(預設設定)即用 170.5MiB / 200MiB,因此加上 `GOMEMLIMIT` 與 D6 的 cadvisor 參數。不擴展 instance(使用者決定先試 t2.micro);Task 3.2 部署後若 Alloy 反覆被 OOM kill 重啟、或 swap 長期 > 200MB,另開 change 垂直擴展(注意 `ec2.tf` 依 AZ 選 subnet,改 instance type 可能導致 instance 被重建、資料遺失)。
+- 記憶體實測與調整:同次 EC2 實測只開 cadvisor(預設設定)即用 170.5MiB / 200MiB,因此加上 `GOMEMLIMIT` 與 D6 的 cadvisor 參數。不擴展 instance(使用者決定先試 t2.micro);擴展條件(Task 3.2 實測後修訂,使用者確認):`vmstat` 的 `si`/`so` 持續不為 0(swap 被頻繁讀寫),或 Alloy 反覆被 OOM kill 重啟,才另開 change 垂直擴展;單看 swap 用量會誤判——3.2 部署後 swap 用到 415MB,但 `si`/`so` 為 0、`wa` 為 0,只是閒置分頁被移入 swap。另開 change 垂直擴展時(注意 `ec2.tf` 依 AZ 選 subnet,改 instance type 可能導致 instance 被重建、資料遺失)。
 - named volume `alloy_data:/var/lib/alloy/data`,以 `--storage.path` 指向,保存 positions 與 remote_write WAL,讓重啟後不重送、不遺漏。
 - EC2 加 1GB swapfile、`vm.swappiness=10`、寫入 `/etc/fstab`(人工 SSM)。
 
@@ -102,7 +102,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 ## Risks / Trade-offs
 
 - [docker.sock 與 containerd.sock 等同 host root] → 所有掛載 `:ro`、不開 privileged、image 釘版本、不 publish port;單人專案接受此風險。之後有多人協作或主機上有更敏感的服務時,再評估 docker-socket-proxy。
-- [記憶體不足造成 OOM] → swap 當緩衝 + Alloy `mem_limit` + 記憶體與 swap 告警;若 Alloy 反覆 OOM 重啟或 swap 長期 > 200MB,另開 change 升級 instance(見 D8)。
+- [記憶體不足造成 OOM] → swap 當緩衝 + Alloy `mem_limit` + 記憶體與 swap 告警;若 `si`/`so` 持續不為 0 或 Alloy 反覆 OOM 重啟,另開 change 升級 instance(見 D8)。
 - [django-prometheus middleware 在每個 request 的路徑上] → 只做計數、成本極低;出問題時回滾 image。
 - [multiprocess 目錄殘留] → 放 tmpfs + `on_starting` 清空 + `child_exit` mark dead。
 - [series 數超過額度] → 白名單 + 部署後人工確認。
