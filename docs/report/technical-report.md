@@ -142,6 +142,38 @@ Redis 不負責保存核心活動資料；它主要用於 Celery 任務佇列與
 
 目前所有服務位於同一台 EC2，適合 MVP 與低流量階段，但也是單點故障。完整部署與觀測架構可參考附錄 `01-architecture.md`。
 
+### 1.2 基礎設施即程式碼（Terraform IaC）
+
+AWS 資源以 Terraform 宣告於 `infra/terraform/`，讓環境可以重複建立，不依賴手動在 Console 操作。
+
+```mermaid
+flowchart LR
+    TF["Terraform<br/>開發者本機執行"]
+    subgraph AWS["AWS ap-northeast-3"]
+        EC2["EC2 t2.micro<br/>Ubuntu 24.04、gp3 20GB"]
+        EIP["Elastic IP<br/>固定公開 IP"]
+        SG["Security Group<br/>入站僅 80/443，不開 22"]
+        IAM["IAM Role + Instance Profile<br/>僅 SSM 權限"]
+    end
+    TF --> EC2
+    TF --> EIP
+    TF --> SG
+    TF --> IAM
+    EIP --> EC2
+    SG --> EC2
+    IAM --> EC2
+```
+
+| 設計 | 做法與理由 |
+| --- | --- |
+| 不開 SSH | 不建 key pair、不開 22 port；維運與部署都透過 AWS SSM，對外攻擊面只剩 80/443。 |
+| 機器身分與操作者分離 | EC2 使用只有 `AmazonSSMManagedInstanceCore` 的 IAM role，機器上不存放長期 AWS 金鑰。 |
+| AMI 動態查詢 | 以 Canonical 官方帳號過濾最新 Ubuntu 24.04，避免寫死會過期的 AMI ID 或拿到非官方映像。 |
+| 固定 IP | Elastic IP 讓機器重啟後位址不變，`sslip.io` 網域與前端設定不必跟著改。 |
+| 單一 root module | 資源數量少，不拆 module，降低單人維護成本。 |
+
+Terraform 只負責「把機器開出來」；Docker、nginx、TLS 憑證與 `.env` 目前仍以 SSM 手動設定，應用程式則由 `deploy.sh` 部署。state 存在開發者本機，之後應改用 S3 backend；這些限制列於 Technical Debt Log。
+
 ---
 
 ## 2. 介面使用者體驗設計
