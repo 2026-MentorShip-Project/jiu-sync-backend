@@ -24,6 +24,8 @@
 - [x] 3.2 部署並確認資料(在 3.3 之後執行):執行 `deploy.sh`。驗證:(manual) Grafana Cloud Explore 查得到 `django_http_*`、`container_*`(各 container)、`node_*`(含 swap),Loki 查得到各 container 與 nginx 的 log;active series < 3k;`docker stats` 顯示 alloy 記憶體在 200MB 以內、`docker inspect` 的 RestartCount 未持續增加(反覆 OOM 即依 D8 另開擴展 change),`free -m` 的 swap 未長期 > 200MB;再執行一次 `deploy.sh`,確認 nginx log 沒有重複;`docker compose stop alloy` 期間 API 正常,之後再 `start`
   - 結果(2026-10-01):PR #28 合併(`05917f8`)後 `deploy.sh` 成功。Alloy `Up`、RestartCount 0、記憶體 150.9MiB / 200MiB(`GOMEMLIMIT` 有效)。Grafana Cloud:`django_http_*`、`container_*`、`node_*` 皆有資料,`count({__name__=~".+"})` = 346(< 3k);Loki 有各 container 的 log,nginx log 在 Drilldown 顯示為 `unknown_service`(只加了 `source="nginx"`,沒有 `service_name`,Task 4 補)。首次啟動因沒有 positions 從頭讀 docker log,redis 超過 7 天的舊 log 被 Loki 以 400 `timestamp too old` 拒收(僅首次);再部署一次後 Alloy 重啟,5 分鐘內 `level=error` 為 0,positions 有保留。`stop alloy` 期間外部 `/healthz/` 200,之後 `start` 恢復。記憶體:available 438MB、swap 415MB,但 `vmstat` 的 `si`/`so` 為 0、`wa` 0——閒置分頁,D8 擴展條件改為依 `si`/`so` 判斷。
 
+- [ ] 3.4 先改測試(紅燈):nginx 的 log stream 帶 `service_name="nginx"`(並保留 `source="nginx"`、`log_type`),docker log 的 label 不變(design.md D7)。改 `config.alloy` 使測試轉綠。驗證:(auto) `pytest` 全綠、本機以真正的 Alloy 載入設定且元件皆 healthy;(manual) 部署後 Grafana Logs Drilldown 出現 `nginx`,不再有 `unknown_service`
+
 ## 4. Dashboard 與告警
 
 - [ ] 4.1 在 Grafana Cloud 建立 App、Containers、Host、Logs 四張 dashboard 與 4 條告警(D10),JSON 匯出到 `infra/grafana/dashboards/` 與 `infra/grafana/alerts/`(確認 JSON 不含 token)。驗證:(manual) 四張 dashboard 的每個 panel 都有資料;`docker compose stop alloy` 超過 10 分鐘後收到「收不到 metrics」告警 email,之後再 `start`

@@ -66,7 +66,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 ### D7. Log 收集與遮蔽(grill Q8/Q9)
 
 - `discovery.docker` + `loki.source.docker`:label `container`(去掉開頭的 `/`)。
-- `loki.source.file`:`/var/log/nginx/access.log`、`error.log`,label `source="nginx"`、`log_type`。
+- `loki.source.file`:`/var/log/nginx/access.log`、`error.log`,label `source="nginx"`、`service_name="nginx"`、`log_type`(`service_name` 於 Task 3.2 後補:Grafana Drilldown 以 `service_name` 分組,沒有時顯示為 `unknown_service`)。
 - `loki.process` 共用遮蔽:`Bearer\s+[^\s"',;]+`(遇到引號、逗號、分號即停,避免吃掉 JSON 的結尾引號;Task 3.1 code-review 前發現 `Bearer\s+\S+` 會把 `"Bearer abc"` 變成 `"[REDACTED]`,opsx:update 使用者確認)、JWT(`eyJ[\w-]+\.[\w-]+\.[\w-]+`)、email → `[REDACTED]`;IP 保留。
 - 遮蔽規則只寫在 `redact.alloy`(`declare` 模組),`config.alloy` 以 `import.file` 引用,測試也 import 同一份檔案,確保測到的就是正式規則。
 - 遮蔽規則以樣本 log 驗證:用 docker 跑 Alloy,`loki.source.file` 讀 fixture,`loki.echo`(或寫檔)輸出後比對。在 Task 3 實作時確定驗證方式,但驗證本身不可省略。
