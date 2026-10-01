@@ -25,4 +25,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--worker-class", "gthread", "--workers", "3", "--threads", "4", "--timeout", "60", "--worker-tmp-dir", "/dev/shm"]
+# bind / gthread / workers / threads / timeout / worker_tmp_dir 與 prometheus multiprocess
+# 目錄的 hook 都在 gunicorn.conf.py(add-observability-stack design.md D2)。
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "config.wsgi:application"]

@@ -51,8 +51,12 @@ services:
     # different settings (e.g. dev's CELERY_TASK_ALWAYS_EAGER=True would run
     # tasks in-process and never enqueue them). Don't rely on wsgi.py's
     # setdefault.
+    # PROMETHEUS_MULTIPROC_DIR (add-observability-stack design.md D2): app only,
+    # not worker. On the container's own /dev/shm tmpfs, so a container restart
+    # starts metrics from zero; gunicorn.conf.py's on_starting clears it too.
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.prod
+      PROMETHEUS_MULTIPROC_DIR: /dev/shm/prometheus
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

@@ -120,6 +120,17 @@ def test_header_requires_broker_url_pointing_at_redis_service():
     assert "localhost:6381" in header
 
 
+def test_app_sets_prometheus_multiproc_dir_on_tmpfs(prod_services):
+    # add-observability-stack design.md D2:放在 container 自己的 /dev/shm,重啟即清空。
+    app_env = prod_services["app"]["environment"]
+    assert app_env["PROMETHEUS_MULTIPROC_DIR"] == "/dev/shm/prometheus"
+
+
+def test_worker_does_not_set_prometheus_multiproc_dir(worker):
+    # D2:只有 app 設;celery worker 不設(不寫 multiprocess 檔)。
+    assert "PROMETHEUS_MULTIPROC_DIR" not in worker["environment"]
+
+
 def test_app_explicitly_uses_prod_settings_same_as_worker(prod_services, worker):
     # design.md D6:假 .env 設 dev,app 仍須解析為 prod,且與 worker 相同(不靠 wsgi.py setdefault)
     app_env = prod_services["app"]["environment"]

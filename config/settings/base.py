@@ -37,6 +37,9 @@ THIRD_PARTY_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
+    # /metrics 匯出(add-observability-stack design.md D2);路由由 config.metrics 自訂、
+    # 不 include django_prometheus.urls(D3)。
+    "django_prometheus",
 ]
 
 LOCAL_APPS = [
@@ -48,7 +51,10 @@ LOCAL_APPS = [
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
+# django-prometheus 的 Before 必須最前、After 必須最後,才能量到含所有 middleware 的
+# latency 與最終 status(add-observability-stack design.md D2)。
 MIDDLEWARE = [
+    "django_prometheus.middleware.PrometheusBeforeMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -57,6 +63,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -291,6 +298,10 @@ LOGGING = {
         },
     },
 }
+
+# /metrics 的 bearer token(add-observability-stack design.md D3/D5)。未設定或空字串時
+# fail closed:/metrics 一律 404。正式環境以 `openssl rand -hex 32` 產生,放在 .env。
+METRICS_TOKEN = env("METRICS_TOKEN", default="")
 
 # Public origin of the frontend SPA — used to build shareable event links
 # (e.g. f"{FRONTEND_BASE_URL}/events/{event.id}"). dev.py overrides the
