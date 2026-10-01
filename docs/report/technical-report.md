@@ -57,21 +57,29 @@ flowchart LR
     AI["Perplexity API"]
     SMTP["SMTP 服務"]
 
-    subgraph AWS["AWS EC2｜目前為單機部署"]
-        N["nginx<br/>HTTPS、反向代理"]
-        subgraph Docker["Docker Compose"]
-            APP["Django REST API<br/>Gunicorn"]
-            WORKER["Celery Worker"]
-            PG["PgBouncer"]
-            DB[("PostgreSQL")]
-            REDIS[("Redis")]
-            ALLOY["Grafana Alloy"]
+    TF["Terraform<br/>infra/terraform/"]
+
+    subgraph AWS["AWS ap-northeast-3"]
+        EDGE["Elastic IP + Security Group<br/>僅開放 80/443"]
+        IAM["IAM Role<br/>僅 SSM 權限"]
+        subgraph EC2["EC2 t2.micro｜目前為單機部署"]
+            N["nginx<br/>HTTPS、反向代理"]
+            subgraph Docker["Docker Compose"]
+                APP["Django REST API<br/>Gunicorn"]
+                WORKER["Celery Worker"]
+                PG["PgBouncer"]
+                DB[("PostgreSQL")]
+                REDIS[("Redis")]
+                ALLOY["Grafana Alloy"]
+            end
         end
     end
 
     GC["Grafana Cloud<br/>Metrics、Logs、Dashboard"]
 
-    U -->|HTTPS| N --> APP
+    TF -.建立與管理.-> AWS
+    IAM -.instance profile.-> EC2
+    U -->|HTTPS| EDGE --> N --> APP
     APP --> PG --> DB
     APP -->|非同步任務| REDIS --> WORKER
     WORKER --> PG
