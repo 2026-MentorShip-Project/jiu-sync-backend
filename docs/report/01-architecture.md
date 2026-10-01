@@ -18,18 +18,26 @@ flowchart LR
     P["Perplexity Agent API<br/>AI 餐廳推薦"]
     M["SMTP 服務<br/>寄通知信"]
 
-    subgraph EC2["AWS EC2 t2.micro(ap-northeast-3,單台)"]
-        N["nginx(裝在 host)<br/>TLS 終止、80→443、封鎖 /metrics"]
-        subgraph C["docker compose"]
-            A["app<br/>Django + DRF<br/>gunicorn gthread 3 workers × 4 threads"]
-            W["worker<br/>Celery,concurrency=1"]
-            PB["pgbouncer<br/>transaction pooling"]
-            DB[("postgres:16")]
-            R[("redis:7<br/>db0:Celery 佇列<br/>db1:留言限流鎖")]
+    TF["Terraform<br/>infra/terraform/(開發者本機執行)"]
+
+    subgraph AWS["AWS ap-northeast-3(由 Terraform 建立)"]
+        EDGE["Elastic IP + Security Group<br/>入站僅 80/443,不開 22"]
+        IAM["IAM Role / Instance Profile<br/>僅 AmazonSSMManagedInstanceCore"]
+        subgraph EC2["EC2 t2.micro(Ubuntu 24.04,單台)"]
+            N["nginx(裝在 host)<br/>TLS 終止、80→443、封鎖 /metrics"]
+            subgraph C["docker compose"]
+                A["app<br/>Django + DRF<br/>gunicorn gthread 3 workers × 4 threads"]
+                W["worker<br/>Celery,concurrency=1"]
+                PB["pgbouncer<br/>transaction pooling"]
+                DB[("postgres:16")]
+                R[("redis:7<br/>db0:Celery 佇列<br/>db1:留言限流鎖")]
+            end
         end
     end
 
-    B -- "1 HTTPS<br/>Authorization: Bearer access token" --> N
+    TF -. "terraform apply<br/>建立 EC2、EIP、SG、IAM" .-> AWS
+    IAM -. "instance profile" .-> EC2
+    B -- "1 HTTPS<br/>Authorization: Bearer access token" --> EDGE --> N
     N -- "2 http://127.0.0.1:8000" --> A
     A -- "3 SQL" --> PB --> DB
     A -- "留言限流 SET NX EX 2" --> R
@@ -46,6 +54,8 @@ flowchart LR
 3. **app → 資料庫。** Django 經 PgBouncer 連 Postgres。PgBouncer 用 transaction pooling,讓少量的 Postgres 連線服務較多的 app 執行緒。
 4. **非同步工作。** 需要寄信的動作(建立、定案、取消、重新開放),在資料庫 transaction commit 之後才把 task 排進 Redis,由 Celery worker 寄出。寄信失敗不會讓原本的 API 失敗。
 5. **外部服務。** 只有兩個請求會呼叫外部服務:主揪登入(驗證 Google id_token)與 AI 餐廳推薦(呼叫 Perplexity)。
+
+圖中 Terraform 以虛線表示:它不在請求路徑上,只在建立或修改 AWS 資源時由開發者執行(詳見 1.3)。
 
 ### 關鍵流程:AI 餐廳推薦(`POST /api/events/{id}/restaurant-recommendations/`)
 
