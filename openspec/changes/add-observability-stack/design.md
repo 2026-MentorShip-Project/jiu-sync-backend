@@ -1,0 +1,115 @@
+## Context
+
+- 正式環境:單台 t2.micro(952MB,無 swap,available 292MB,2026-10-01 實測);compose 有 `app`(gunicorn gthread 3 workers × 4 threads,`--worker-tmp-dir /dev/shm`)、`worker`、`db`、`pgbouncer`、`redis`;nginx 裝在 host,設定不在 repo;只能用 SSM 連線。
+- `deploy.sh` 只把 compose 檔以 base64 寫到 EC2 `/opt/jiu-sync-backend/`,EC2 上沒有 repo。
+- image 同時推 `latest` 與 `sha-<7>` tag(`.github/workflows/build-push.yml`)。
+- 只有 `apps.recommendations` 輸出 JSON log;`config.exceptions.handler404` 統一 404 格式。
+- 動手前確認的不可妥協邊界(grill 前置):① 觀測系統任何故障不影響 app 運作與部署;② log 不重送、不遺漏(冪等);③ 送到第三方的 log 遮蔽敏感資料;④ `/metrics` 不對外;⑤ 跳過 explore(範圍在對話中已收斂)。
+- 參考先前專案 Find-Coffee(K8s):Alloy + node exporter + kube-state-metrics + LogQL,沒有 app metrics。
+
+## Goals / Non-Goals
+
+**Goals:** 見 specs/infra/observability。三層 metrics(app / container / host)+ log,全部推到 Grafana Cloud;EC2 只多一個 Alloy container。
+
+**Non-Goals:** 見 proposal「未涵蓋」。另外:不自建 Prometheus / Loki / Grafana;不加 `METRICS_ENABLED` 開關。
+
+## Decisions
+
+### D1. 收集與儲存:單一 Alloy → Grafana Cloud(grill 前討論)
+
+EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log 到 Grafana Cloud free tier(10k series、50GB log、14 天)。
+- 替代:EC2 自建 Prometheus / Loki / Grafana——至少需要 600MB 記憶體,t2.micro 跑不動;放在本機——看不到 prod、要開對外 port。不採用。
+
+### D2. App metrics:django-prometheus + multiprocess mode(grill Q2)
+
+- `django_prometheus` 加入 `INSTALLED_APPS`,`PrometheusBeforeMiddleware` 放 MIDDLEWARE 最前、`PrometheusAfterMiddleware` 放最後。
+- `PROMETHEUS_MULTIPROC_DIR=/dev/shm/prometheus`(compose 的 app `environment` 設定)。`/dev/shm` 是 container 自己的 tmpfs,container 重啟即清空,滿足「重啟不殘留舊數值」。
+- 新增 `gunicorn.conf.py`:沿用現有參數(bind、gthread、3 workers、4 threads、timeout 60、`worker_tmp_dir=/dev/shm`);`on_starting` 清空並建立 multiprocess 目錄;`child_exit` 呼叫 `prometheus_client.multiprocess.mark_process_dead(worker.pid)`。Dockerfile `CMD` 改為 `gunicorn -c gunicorn.conf.py config.wsgi:application`。
+- 只有 app 設 `PROMETHEUS_MULTIPROC_DIR`,celery worker 不設。
+- multiprocess mode 下不提供 `process_*` metrics,container 的 CPU / 記憶體改由 cadvisor 提供(D6)。
+- 替代:放在掛 volume 的一般目錄——需要自己寫清理 entrypoint;gunicorn statsd——看不到 Django view。不採用。
+
+### D3. `/metrics` 存取控制:bearer token,fail closed(grill Q7)
+
+- 自訂 view 包住 django-prometheus 的匯出:`METRICS_TOKEN` 未設定或空字串,或 `Authorization` 不是 `Bearer <METRICS_TOKEN>` → `raise Http404`(走既有 `handler404`,回應與不存在的路徑相同);比對用 `hmac.compare_digest`。
+- 不使用 `django_prometheus.urls` 的公開路由。
+- 第二道防線:nginx `location = /metrics { return 404; }`(人工步驟);先把 EC2 上現有 nginx 設定備份到 `infra/nginx/`,作為參考文件。
+- 替代:只靠 nginx——設定不在 repo、沒有測試;用來源 IP 判斷——經 docker-proxy 進來的請求和 Alloy 的來源 IP 分不出來。不採用。
+
+### D4. Alloy 設定檔傳送:deploy.sh base64(grill Q4)
+
+- 新增 `infra/alloy/config.alloy`;`deploy.sh` 用與 compose 檔相同的手法寫到 `/opt/jiu-sync-backend/config.alloy`;compose 掛 `./config.alloy:/etc/alloy/config.alloy:ro`。
+- `up -d` 之後執行 `docker compose restart alloy`:bind mount 內容變動不會觸發 `up -d` 重建 container。
+- 之後做 CD 時直接重用 `deploy.sh`。
+- 替代:compose `configs.content` 內嵌——`$` 需要跳脫、難讀、無法用 `alloy fmt`;自己 build Alloy image——多一條 pipeline。不採用。
+
+### D5. 機密:最小權限 token + 只傳必要變數(grill Q5)
+
+- Grafana Cloud Access Policy token 只給 `metrics:write`、`logs:write`。
+- `.env` 新增 `GRAFANA_CLOUD_PROM_URL`、`GRAFANA_CLOUD_PROM_USER`、`GRAFANA_CLOUD_LOKI_URL`、`GRAFANA_CLOUD_LOKI_USER`、`GRAFANA_CLOUD_API_TOKEN`、`METRICS_TOKEN`。
+- alloy service 用 `environment: X: ${X}` 只取這 6 個變數(compose 會自動讀同目錄的 `.env` 做變數展開,pgbouncer 已經這樣用),不使用 `env_file`。`config.alloy` 以 `sys.env()` 讀取。
+- 替代:`env_file: .env`——Alloy 會拿到 DB 密碼、`SECRET_KEY` 等用不到的機密。不採用。
+
+### D6. 收集範圍與 series 控制(grill Q12/Q16)
+
+- scrape interval 30s。
+- `prometheus.scrape "app"`:`app:8000/metrics`,帶 `authorization { type = "Bearer", credentials = sys.env("METRICS_TOKEN") }`。
+- `prometheus.exporter.cadvisor`:用 `prometheus.relabel` 白名單保留 `container_cpu_usage_seconds_total`、`container_memory_working_set_bytes`、`container_memory_rss`、`container_network_receive_bytes_total`、`container_network_transmit_bytes_total`、`container_start_time_seconds`、`container_last_seen`,其他全部 drop;同時 drop `id`、`image` 等高基數 label,只保留 container 名稱。
+- `prometheus.exporter.unix`:`set_collectors = ["cpu","meminfo","filesystem","netdev","loadavg","diskstats"]`。
+- 不做 Postgres / Redis / PgBouncer / Celery exporter。
+- 目標 active series < 3k,部署後人工確認。
+
+### D7. Log 收集與遮蔽(grill Q8/Q9)
+
+- `discovery.docker` + `loki.source.docker`:label `container`(去掉開頭的 `/`)。
+- `loki.source.file`:`/var/log/nginx/access.log`、`error.log`,label `source="nginx"`、`log_type`。
+- `loki.process` 共用遮蔽:`Bearer\s+\S+`、JWT(`eyJ[\w-]+\.[\w-]+\.[\w-]+`)、email → `[REDACTED]`;IP 保留。
+- 遮蔽規則以樣本 log 驗證:用 docker 跑 Alloy,`loki.source.file` 讀 fixture,`loki.echo`(或寫檔)輸出後比對。在 Task 3 實作時確定驗證方式,但驗證本身不可省略。
+- 不改 log 格式(JSON 化另開 change)。
+
+### D8. 資源、權限與持久化(grill Q3/Q11/Q13)
+
+- Alloy `mem_limit: 200m`、`restart: unless-stopped`,不出現在任何 service 的 `depends_on`;UI port 12345 不 publish。
+- image 釘版本 `grafana/alloy:vX.Y.Z`(Task 1 確認版本後寫死)。
+- 掛載全部 `:ro`:`/var/run/docker.sock`、`/proc`→`/host/proc`、`/sys`→`/host/sys`、`/`→`/host/root`、`/var/lib/docker`、`/dev/disk`、`/var/log/nginx`。以 root 執行(讀取 `root:adm 640` 的 nginx log)。
+- named volume `alloy_data:/var/lib/alloy/data`,以 `--storage.path` 指向,保存 positions 與 remote_write WAL,讓重啟後不重送、不遺漏。
+- EC2 加 1GB swapfile、`vm.swappiness=10`、寫入 `/etc/fstab`(人工 SSM)。
+
+### D9. 故障隔離(grill Q6)
+
+- `deploy.sh`:任一 `GRAFANA_CLOUD_*` 或 `METRICS_TOKEN` 缺少 → 印出 `WARNING` 後繼續部署,不 `exit`(與 `DATABASE_URL_DIRECT` 缺少時中止部署的處理刻意不同)。
+- `restart alloy` 失敗只警告,不影響部署結果。
+- Grafana Cloud 無法連線:Alloy 自行重試並記錄 error log,WAL 有大小上限。
+
+### D10. Dashboard 與告警(grill Q14/Q15)
+
+- 在 Grafana Cloud UI 建立 App、Containers、Host、Logs 四張 dashboard(可匯入社群 dashboard 後調整),JSON 匯出到 `infra/grafana/dashboards/`。
+- 4 條告警,通知寄到開發者 email,規則匯出到 `infra/grafana/alerts/`:
+  1. 10 分鐘內收不到任何 metrics(`absent`/no data)
+  2. `node_memory_MemAvailable_bytes` < 100MB 或 swap 用量 > 200MB,持續 5 分鐘
+  3. 5 分鐘內 5xx 比例 > 5%
+  4. 15 分鐘內任一 container 重啟
+- 門檻值先用以上保守值,上線一兩週後依實際數據調整。
+- 替代:Terraform grafana provider——需要另一組寫入 token,且 state 目前放在本機;留待之後做 CD 時再評估。
+
+## Risks / Trade-offs
+
+- [docker.sock 等同 host root] → 所有掛載 `:ro`、image 釘版本、不 publish port;單人專案接受此風險。之後有多人協作或主機上有更敏感的服務時,再評估 docker-socket-proxy。
+- [記憶體不足造成 OOM] → swap 當緩衝 + Alloy `mem_limit` + 記憶體與 swap 告警;若 swap 經常被使用,另開 change 升級 instance。
+- [django-prometheus middleware 在每個 request 的路徑上] → 只做計數、成本極低;出問題時回滾 image。
+- [multiprocess 目錄殘留] → 放 tmpfs + `on_starting` 清空 + `child_exit` mark dead。
+- [series 數超過額度] → 白名單 + 部署後人工確認。
+- [遮蔽規則漏網] → 樣本 log 測試;IP 刻意保留;log 在第三方保存 14 天。
+- [nginx 的 404 是人工設定] → app 端 token 才是主要防線,有測試保護。
+
+## Migration Plan
+
+1. Task 1:Grafana Cloud stack 與 token、EC2 `.env`、swap、記錄 baseline。
+2. Task 2:部署帶有 django-prometheus 的 image;設定 nginx `/metrics` 404。
+3. Task 3:部署 Alloy;確認 Grafana Cloud 上有資料、series 數與 Alloy 記憶體用量。
+4. Task 4:建立 dashboard 與告警。
+
+**Rollback:**
+- Alloy:`docker compose stop alloy`,或從 compose 移除後重新部署;app 不受影響。
+- App(middleware / `gunicorn.conf.py`):在 EC2 上把 compose 的 app image 暫時改成上一版的 `sha-xxxxxxx`,執行 `up -d`,之後再 `git revert`。
+- swap:`swapoff /swapfile`,並移除 `/etc/fstab` 中對應的那一行。
