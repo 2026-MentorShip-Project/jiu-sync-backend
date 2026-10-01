@@ -1,6 +1,7 @@
 ## 1. 環境健檢與前置準備
 
-- [ ] 1.1 環境健檢與 baseline:確認 `git status` / `git log` 正常且位在本 change 的分支;以 docker 執行 `grafana/alloy`(選定並記錄要釘的版本 `vX.Y.Z`)的 `--version` 與 `fmt`;`uv add django-prometheus` 之前先確認 PyPI 上的最新版本支援 Django 6.1。用 SSM 在 EC2 執行 `free -m`、`swapon --show`、`docker stats --no-stream`,結果記錄到 design.md Context。驗證:(auto) alloy 的 `--version` 與 `fmt` 指令執行成功;(manual) baseline 已寫入 design.md
+- [x] 1.1 環境健檢與 baseline:確認 `git status` / `git log` 正常且位在本 change 的分支;以 docker 執行 `grafana/alloy`(選定並記錄要釘的版本 `vX.Y.Z`)的 `--version` 與 `fmt`;`uv add django-prometheus` 之前先確認 PyPI 上的最新版本支援 Django 6.1。用 SSM 在 EC2 執行 `free -m`、`swapon --show`、`docker stats --no-stream`,結果記錄到 design.md Context。驗證:(auto) alloy 的 `--version` 與 `fmt` 指令執行成功;(manual) baseline 已寫入 design.md
+  - 結果(2026-10-01):git 正常,位於 `feature/observability`;`grafana/alloy:v1.20.1` 的 `--version` 與 `fmt` 成功(不合法設定 `fmt` 回 exit 1);baseline 已寫入 design.md Context。**待決定**:`django-prometheus` 最新 stable 2.5.0 限制 `Django<6.1`,不支援 Django 6.1.1,只有 `2.6.0.dev*` 預發布版支援(見 design.md D2),Task 2.1 前需決定採用方式。
 - [ ] 1.2 建立 Grafana Cloud stack 與只有 `metrics:write`、`logs:write` 權限的 Access Policy token;EC2 `.env` 新增 5 個 `GRAFANA_CLOUD_*` 與 `METRICS_TOKEN`(D5);EC2 建立 1GB swapfile、`vm.swappiness=10`、寫入 `/etc/fstab`(D8)。驗證:(manual) `swapon --show` 有輸出、`sysctl vm.swappiness` 為 10、`.env` 的 6 個變數齊全(只檢查 key 是否存在,不印出 value)
 
 ## 2. App 輸出 metrics(django-prometheus + `/metrics` 保護)

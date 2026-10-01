@@ -1,6 +1,7 @@
 ## Context
 
 - 正式環境:單台 t2.micro(952MB,無 swap,available 292MB,2026-10-01 實測);compose 有 `app`(gunicorn gthread 3 workers × 4 threads,`--worker-tmp-dir /dev/shm`)、`worker`、`db`、`pgbouncer`、`redis`;nginx 裝在 host,設定不在 repo;只能用 SSM 連線。
+  - Baseline(2026-10-01 以 SSM 實測,Task 1.1):`free -m` total 952 / used 660 / free 82 / shared 14 / buff/cache 340 / available 292,Swap 0/0/0;`swapon --show` 無輸出;`docker stats --no-stream`:app 160.2MiB、worker 116.2MiB、db 20.56MiB、redis 5.277MiB、pgbouncer 1.57MiB(limit 皆為 952.8MiB,即未設 `mem_limit`)。
 - `deploy.sh` 只把 compose 檔以 base64 寫到 EC2 `/opt/jiu-sync-backend/`,EC2 上沒有 repo。
 - image 同時推 `latest` 與 `sha-<7>` tag(`.github/workflows/build-push.yml`)。
 - 只有 `apps.recommendations` 輸出 JSON log;`config.exceptions.handler404` 統一 404 格式。
@@ -26,6 +27,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - `PROMETHEUS_MULTIPROC_DIR=/dev/shm/prometheus`(compose 的 app `environment` 設定)。`/dev/shm` 是 container 自己的 tmpfs,container 重啟即清空,滿足「重啟不殘留舊數值」。
 - 新增 `gunicorn.conf.py`:沿用現有參數(bind、gthread、3 workers、4 threads、timeout 60、`worker_tmp_dir=/dev/shm`);`on_starting` 清空並建立 multiprocess 目錄;`child_exit` 呼叫 `prometheus_client.multiprocess.mark_process_dead(worker.pid)`。Dockerfile `CMD` 改為 `gunicorn -c gunicorn.conf.py config.wsgi:application`。
 - 只有 app 設 `PROMETHEUS_MULTIPROC_DIR`,celery worker 不設。
+- 版本相容性(Task 1.1 查 PyPI,2026-10-01):最新 stable `django-prometheus==2.5.0` 宣告 `Django>=4.2,<6.1,!=5.0.*`(classifiers 到 6.0),**不支援本專案的 Django 6.1.1**,直接 `uv add` 會解析失敗;`2.6.0.dev*` 預發布版(最新 `2.6.0.dev22`,2026-09-19)已放寬為 `<6.2` 並列出 Django 6.1。Task 2.1 前需決定:採用 dev 版並釘死版本、等 2.6.0 正式版,或其他方案。
 - multiprocess mode 下不提供 `process_*` metrics,container 的 CPU / 記憶體改由 cadvisor 提供(D6)。
 - 替代:放在掛 volume 的一般目錄——需要自己寫清理 entrypoint;gunicorn statsd——看不到 Django view。不採用。
 
@@ -70,7 +72,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 ### D8. 資源、權限與持久化(grill Q3/Q11/Q13)
 
 - Alloy `mem_limit: 200m`、`restart: unless-stopped`,不出現在任何 service 的 `depends_on`;UI port 12345 不 publish。
-- image 釘版本 `grafana/alloy:vX.Y.Z`(Task 1 確認版本後寫死)。
+- image 釘版本 `grafana/alloy:v1.20.1`(Task 1.1 選定:2026-09-28 發布的最新 stable release;本機以 docker 驗證 `--version` 與 `fmt` 正常,multi-arch image 含 amd64)。
 - 掛載全部 `:ro`:`/var/run/docker.sock`、`/proc`→`/host/proc`、`/sys`→`/host/sys`、`/`→`/host/root`、`/var/lib/docker`、`/dev/disk`、`/var/log/nginx`。以 root 執行(讀取 `root:adm 640` 的 nginx log)。
 - named volume `alloy_data:/var/lib/alloy/data`,以 `--storage.path` 指向,保存 positions 與 remote_write WAL,讓重啟後不重送、不遺漏。
 - EC2 加 1GB swapfile、`vm.swappiness=10`、寫入 `/etc/fstab`(人工 SSM)。
