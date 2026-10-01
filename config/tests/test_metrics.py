@@ -299,8 +299,8 @@ def test_multiprocess_counters_are_aggregated_and_survive_mark_process_dead(tmp_
 
     # 每個 process 各自寫自己的 .db 檔(確認真的走 multiprocess 模式)。
     db_files = {p.name for p in tmp_path.glob("*.db")}
-    assert any(str(pid_a) in name for name in db_files)
-    assert any(str(pid_b) in name for name in db_files)
+    assert any(name.endswith(f"_{pid_a}.db") for name in db_files)
+    assert any(name.endswith(f"_{pid_b}.db") for name in db_files)
 
     def healthz_total():
         samples = _samples(_run(_READER_SCRIPT, tmp_path, TOKEN))

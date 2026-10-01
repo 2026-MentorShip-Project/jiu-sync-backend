@@ -4,7 +4,8 @@
   timeout 60、worker_tmp_dir /dev/shm——以 gunicorn 自己的設定載入結果驗證。
 - `on_starting` 清空並重建 `PROMETHEUS_MULTIPROC_DIR`(重啟不殘留舊數值);
   `child_exit` 以 worker pid 呼叫 `mark_process_dead`。
-- 未設 `PROMETHEUS_MULTIPROC_DIR`(本機直接跑 gunicorn)時兩個 hook 都不做事、不報錯。
+- 未設 `PROMETHEUS_MULTIPROC_DIR`(本機直接跑 gunicorn)時兩個 hook 都不做事、不報錯;
+  設了但為空白時 `on_starting` 直接拋錯(prometheus_client 仍會進 multiprocess mode)。
 """
 
 import importlib.util
@@ -109,14 +110,21 @@ def test_on_starting_does_not_touch_siblings(conf, tmp_path, monkeypatch):
     assert sibling.read_bytes() == b"keep"
 
 
-@pytest.mark.parametrize("value", [None, ""])
-def test_on_starting_noop_without_multiproc_dir(conf, tmp_path, monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
-    else:
-        monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", value)
+def test_on_starting_noop_without_multiproc_dir(conf, tmp_path, monkeypatch):
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     conf.on_starting(SimpleNamespace())
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_on_starting_fails_fast_when_multiproc_dir_is_blank(conf, tmp_path, monkeypatch, value):
+    # code-review:prometheus_client 只看 key 是否存在,空字串仍會進 multiprocess mode,
+    # 把 .db 檔寫進 CWD(/app)且不會被清理 / mark dead。設定錯誤要在 fork worker 前擋下。
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", value)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(RuntimeError, match="PROMETHEUS_MULTIPROC_DIR"):
+        conf.on_starting(SimpleNamespace())
     assert list(tmp_path.iterdir()) == []
 
 
@@ -145,12 +153,8 @@ def test_child_exit_removes_live_gauges_but_keeps_counters(conf, tmp_path, monke
     assert remaining == ["counter_4321.db", "gauge_livesum_9999.db"]
 
 
-@pytest.mark.parametrize("value", [None, ""])
-def test_child_exit_noop_without_multiproc_dir(conf, monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
-    else:
-        monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", value)
+def test_child_exit_noop_without_multiproc_dir(conf, monkeypatch):
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
     calls = []
     monkeypatch.setattr(conf, "mark_process_dead", lambda pid, *a, **kw: calls.append(pid))
     conf.child_exit(SimpleNamespace(), SimpleNamespace(pid=4321))

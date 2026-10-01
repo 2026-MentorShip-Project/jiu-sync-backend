@@ -8,7 +8,8 @@
   gauge 檔;counter / histogram 檔保留,已累計的數值仍在加總中。
 
 未設 `PROMETHEUS_MULTIPROC_DIR`(例如本機直接跑 gunicorn、celery worker 不會用到本檔)時
-兩個 hook 都不做事。Guarded by config/tests/test_gunicorn_conf.py.
+兩個 hook 都不做事;設了但為空白時 `on_starting` 拋錯,gunicorn 不啟動。
+Guarded by config/tests/test_gunicorn_conf.py.
 """
 
 import os
@@ -25,7 +26,14 @@ worker_tmp_dir = "/dev/shm"
 
 
 def _multiproc_dir():
-    return os.environ.get("PROMETHEUS_MULTIPROC_DIR") or None
+    """未設定回 None;設了但為空白則拋錯——prometheus_client 只看 key 是否存在,
+    空字串仍會進 multiprocess mode 並把 .db 檔寫進 CWD,且不會被清理 / mark dead。"""
+    path = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+    if path is None:
+        return None
+    if not path.strip():
+        raise RuntimeError("PROMETHEUS_MULTIPROC_DIR is set but blank; set a directory or unset it")
+    return path
 
 
 def on_starting(server):
