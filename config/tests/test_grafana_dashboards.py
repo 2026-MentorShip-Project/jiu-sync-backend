@@ -22,7 +22,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import time
 import urllib.error
@@ -111,8 +110,19 @@ def _ds_var_name(ds):
 # --- PromQL 解析(只需要找出 metric 與 label 名稱) ---------------------------
 
 PROMQL_KEYWORDS = {
-    "by", "without", "on", "ignoring", "group_left", "group_right", "bool",
-    "and", "or", "unless", "offset", "inf", "nan",
+    "by",
+    "without",
+    "on",
+    "ignoring",
+    "group_left",
+    "group_right",
+    "bool",
+    "and",
+    "or",
+    "unless",
+    "offset",
+    "inf",
+    "nan",
 }
 LABEL_LIST = re.compile(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)")
 SELECTOR = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)?\s*\{([^}]*)\}")
@@ -133,7 +143,7 @@ def promql_metrics(expr):
     names = set()
     for m in re.finditer(r"[a-zA-Z_:][a-zA-Z0-9_:]*", s):
         name = m.group(0)
-        rest = s[m.end():].lstrip()
+        rest = s[m.end() :].lstrip()
         if rest.startswith("("):
             continue  # 函式 / 聚合
         if name.lower() in PROMQL_KEYWORDS:
@@ -180,9 +190,9 @@ def unparsed_matchers(expr):
 
 def test_promql_parser_self_check():
     expr = (
-        'histogram_quantile(0.95, sum by (le, view) (rate('
+        "histogram_quantile(0.95, sum by (le, view) (rate("
         'django_http_requests_latency_seconds_by_view_method_bucket{view!="metrics"}[$__rate_interval])))'
-        ' / on(view) group_left foo_total offset 5m > 1e3'
+        " / on(view) group_left foo_total offset 5m > 1e3"
     )
     assert promql_metrics(expr) == {
         "django_http_requests_latency_seconds_by_view_method_bucket",
@@ -203,8 +213,8 @@ COMMON_LABELS = {"job", "instance"}
 
 def _django_metrics():
     """從安裝的 django-prometheus 實際註冊 metric(用獨立 registry,不污染全域)。"""
-    from prometheus_client import CollectorRegistry, Counter, Histogram
     from django_prometheus.middleware import Metrics
+    from prometheus_client import CollectorRegistry, Counter, Histogram
 
     registry = CollectorRegistry()
     created = []
@@ -263,7 +273,15 @@ NODE_COLLECTOR_METRICS = {
     "cpu": {"node_cpu_seconds_total": {"cpu", "mode"}},
     "meminfo": {
         f"node_memory_{f}_bytes": set()
-        for f in ("MemTotal", "MemAvailable", "MemFree", "Buffers", "Cached", "SwapTotal", "SwapFree")
+        for f in (
+            "MemTotal",
+            "MemAvailable",
+            "MemFree",
+            "Buffers",
+            "Cached",
+            "SwapTotal",
+            "SwapFree",
+        )
     },
     "filesystem": {
         f"node_filesystem_{f}": {"device", "fstype", "mountpoint"}
@@ -323,7 +341,9 @@ LOKI_STREAM_LABELS = {"container", "service_name", "source", "log_type"}
 
 def _loki_stream_labels():
     text = ALLOY_CONFIG.read_text(encoding="utf-8")
-    labels = set(re.findall(r'target_label\s*=\s*"(\w+)"', _alloy_block("discovery.relabel", "docker_logs")))
+    labels = set(
+        re.findall(r'target_label\s*=\s*"(\w+)"', _alloy_block("discovery.relabel", "docker_logs"))
+    )
     nginx = _alloy_block("loki.source.file", "nginx")
     labels |= {k for k in re.findall(r'"(\w+)"\s*=', nginx) if not k.startswith("__")}
     assert "loki.source.docker" in text
@@ -349,7 +369,9 @@ def test_all_dashboard_files_exist():
 def test_required_top_level_fields(dashboard):
     name, d = dashboard
     assert isinstance(d.get("title"), str) and d["title"].strip()
-    assert isinstance(d.get("uid"), str) and re.fullmatch(r"[a-z0-9-]{1,40}", d["uid"]), d.get("uid")
+    assert isinstance(d.get("uid"), str) and re.fullmatch(r"[a-z0-9-]{1,40}", d["uid"]), d.get(
+        "uid"
+    )
     assert isinstance(d.get("schemaVersion"), int) and d["schemaVersion"] >= MIN_SCHEMA_VERSION
     assert d.get("id") is None, "匯入用 JSON 不可帶 id"
     assert isinstance(d.get("panels"), list) and _panels(d)
@@ -459,7 +481,9 @@ def test_prometheus_label_names_exist(dashboard, allowed_metrics):
         known = set().union(*(allowed_metrics[m] for m in metrics)) if metrics else set()
         unknown = promql_labels(expr) - known
         assert not unknown, f"{p['title']}: 不存在的 label {unknown}"
-        assert not unparsed_matchers(expr), f"{p['title']}: matcher 只用雙引號 {unparsed_matchers(expr)}"
+        assert not unparsed_matchers(expr), (
+            f"{p['title']}: matcher 只用雙引號 {unparsed_matchers(expr)}"
+        )
         for metric, matchers in promql_selectors(expr):
             bad = matchers.keys() - allowed_metrics.get(metric, set())
             assert not bad, f"{p['title']}: {metric} 沒有 label {bad}"
@@ -474,7 +498,9 @@ def test_app_queries_exclude_metrics_view():
             f"{p['title']}: 每個 django_http_* 都要帶 matcher"
         )
         for metric, matchers in selectors:
-            assert ("!=", "metrics") in matchers.get("view", []), f'{p["title"]}: {metric} 沒有 view!="metrics"'
+            assert ("!=", "metrics") in matchers.get("view", []), (
+                f'{p["title"]}: {metric} 沒有 view!="metrics"'
+            )
 
 
 def _url_view_names():
@@ -514,8 +540,13 @@ def test_app_panels_cover_d10():
     assert re.search(r"histogram_quantile\(\s*0\.95\s*,", flat)
     assert re.search(r'status=~"5\.\."', flat) and re.search(r'status=~"4\.\."', flat)
     ai = [
-        title for title, es in exprs.items()
-        if any(f'view="{AI_RECOMMENDATION_VIEW}"' in e and re.search(r"histogram_quantile\(\s*0\.95", e) for e in es)
+        title
+        for title, es in exprs.items()
+        if any(
+            f'view="{AI_RECOMMENDATION_VIEW}"' in e
+            and re.search(r"histogram_quantile\(\s*0\.95", e)
+            for e in es
+        )
     ]
     assert ai, "缺少 AI 推薦 view 的 p95 latency panel"
 
@@ -550,7 +581,8 @@ def test_host_panels_cover_d10():
         for metric, matchers in promql_selectors(e):
             if metric.startswith("node_filesystem"):
                 assert any(
-                    op == "!~" and "tmpfs" in v and "overlay" in v for op, v in matchers.get("fstype", [])
+                    op == "!~" and "tmpfs" in v and "overlay" in v
+                    for op, v in matchers.get("fstype", [])
                 ), e
             if metric.startswith("node_network"):
                 assert any(
@@ -569,7 +601,9 @@ def test_loki_queries_use_real_stream_labels():
         for sel in selectors:
             labels = {m.group(1) for m in MATCHER.finditer(sel)}
             assert labels, (p["title"], sel)
-            assert labels <= LOKI_STREAM_LABELS, f"{p['title']}: 不存在的 stream label {labels - LOKI_STREAM_LABELS}"
+            assert labels <= LOKI_STREAM_LABELS, (
+                f"{p['title']}: 不存在的 stream label {labels - LOKI_STREAM_LABELS}"
+            )
 
 
 def test_logs_panels_cover_d10():
@@ -630,11 +664,23 @@ def grafana():
     try:
         subprocess.run(
             [docker, "run", "-d", "--name", name, "-p", "127.0.0.1::3000", GRAFANA_IMAGE],
-            check=True, capture_output=True, text=True, timeout=300,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
-        port = subprocess.run(
-            [docker, "port", name, "3000"], check=True, capture_output=True, text=True, timeout=30
-        ).stdout.strip().splitlines()[0].rsplit(":", 1)[1]
+        port = (
+            subprocess.run(
+                [docker, "port", name, "3000"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            .stdout.strip()
+            .splitlines()[0]
+            .rsplit(":", 1)[1]
+        )
         base = f"http://127.0.0.1:{port}"
         deadline = time.monotonic() + 120
         while True:
@@ -642,7 +688,7 @@ def grafana():
                 status, _ = _api(base, "/api/health")
                 if status == 200:
                     break
-            except (urllib.error.URLError, ConnectionError, socket.timeout, OSError):
+            except (TimeoutError, urllib.error.URLError, ConnectionError, OSError):
                 pass
             if time.monotonic() > deadline:
                 logs = subprocess.run([docker, "logs", name], capture_output=True, text=True).stderr
@@ -651,8 +697,14 @@ def grafana():
         # 與 Grafana Cloud 相同:各有一個 prometheus 與 loki data source 可選。
         for ds_type in ("prometheus", "loki"):
             status, body = _api(
-                base, "/api/datasources",
-                {"name": f"test-{ds_type}", "type": ds_type, "access": "proxy", "url": "http://127.0.0.1:1"},
+                base,
+                "/api/datasources",
+                {
+                    "name": f"test-{ds_type}",
+                    "type": ds_type,
+                    "access": "proxy",
+                    "url": "http://127.0.0.1:1",
+                },
             )
             assert status == 200, body
         yield base
@@ -664,7 +716,9 @@ def grafana():
 def test_imports_into_real_grafana(grafana, name):
     d = _load(name)
     # 與 UI 的 Import 相同的 API
-    status, body = _api(grafana, "/api/dashboards/import", {"dashboard": d, "overwrite": True, "inputs": []})
+    status, body = _api(
+        grafana, "/api/dashboards/import", {"dashboard": d, "overwrite": True, "inputs": []}
+    )
     assert status == 200, body
     status, saved = _api(grafana, f"/api/dashboards/uid/{d['uid']}")
     assert status == 200, saved
@@ -679,7 +733,11 @@ def test_imports_into_real_grafana(grafana, name):
 
 def _threshold_steps(panel):
     d = panel["fieldConfig"]["defaults"]
-    assert d.get("custom", {}).get("thresholdsStyle", {}).get("mode") in {"line", "dashed", "line+area"}, panel["title"]
+    assert d.get("custom", {}).get("thresholdsStyle", {}).get("mode") in {
+        "line",
+        "dashed",
+        "line+area",
+    }, panel["title"]
     return [s["value"] for s in d["thresholds"]["steps"] if s.get("value") is not None]
 
 
@@ -691,7 +749,9 @@ def _panel_with(d, needle):
 
 def test_alert_thresholds_drawn():
     """D10 #2 MemAvailable < 100MB、#3 5xx > 5%:dashboard 上畫出同一條線。"""
-    assert 100 * 1024**2 in _threshold_steps(_panel_with(_load("host.json"), "node_memory_MemAvailable_bytes"))
+    assert 100 * 1024**2 in _threshold_steps(
+        _panel_with(_load("host.json"), "node_memory_MemAvailable_bytes")
+    )
     assert 0.05 in _threshold_steps(_panel_with(_load("app.json"), 'status=~"5..'))
 
 
@@ -705,4 +765,6 @@ def test_restart_window_matches_alert():
 def test_scrape_health_panel():
     """D10 #1 收不到 metrics:dashboard 上看得到各 scrape job 的 up。"""
     panel = _panel_with(_load("host.json"), "up")
-    assert any(re.search(r"\bup\b", t["expr"]) and "by (job)" in t["expr"] for t in panel["targets"])
+    assert any(
+        re.search(r"\bup\b", t["expr"]) and "by (job)" in t["expr"] for t in panel["targets"]
+    )
