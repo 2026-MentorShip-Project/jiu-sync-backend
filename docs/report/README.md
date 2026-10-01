@@ -1,9 +1,12 @@
 # 揪甘心後端技術架構文件
 
-這組文件說明 `jiu-sync-backend` 目前的架構、設計取捨與已知限制,依下列六個主題分檔:
+這組文件說明 `jiu-sync-backend` 目前的架構、設計取捨與已知限制。
+
+如果目標是繳交或轉成 PDF，建議直接使用 [technical-report.md](technical-report.md)。這份主報告以產品情境為主軸，包含 Functional Requirements、Non-functional Requirements，以及題目要求的六個技術主題；其餘分章文件保留較完整的實作細節，可作為附錄或答辯資料。
 
 | # | 文件 | 內容 |
 | --- | --- | --- |
+| 主文 | [technical-report.md](technical-report.md) | 適合直接轉成 PDF 的精簡技術報告 |
 | 1 | [01-architecture.md](01-architecture.md) | 應用程式架構圖:執行期架構、建置與部署流程(CI/CD)、可觀測性系統的位置 |
 | 2 | [02-ux.md](02-ux.md) | 介面/使用者體驗設計(後端角度):關鍵流程與 API 設計考量 |
 | 3 | [03-scalability.md](03-scalability.md) | 擴展設計:預期規模、已做的效能設計、效能測試現況、擴展路線圖 |
