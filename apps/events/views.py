@@ -403,8 +403,7 @@ def _check_participation_preconditions(event):
 
 class ParticipantResponseCreateView(APIView):
     """``POST /api/events/{id}/responses`` — 任何人(含未登入)透過活動分享連結
-    提交初次投票。完全公開,不需要登入,不採用任何身分驗證(即使帶了
-    Authorization header 也不解析)。
+    提交初次投票。不需要登入；選擇性解析 JWT，讓主揪可使用自己的主揪暱稱。
 
     回應改回傳完整活動內容(跟 ``GET /api/events/{id}`` 同一份
     ``EventDetailSerializer`` 輸出),不是只回傳新建 response 的 ``id``——
@@ -415,14 +414,14 @@ class ParticipantResponseCreateView(APIView):
     """
 
     permission_classes = [AllowAny]
-    authentication_classes = []
+    authentication_classes = [OptionalJWTAuthentication]
 
     def post(self, request, id):
         event = _get_event_or_404(id)
         _check_participation_preconditions(event)
 
         serializer = ParticipantResponseCreateSerializer(
-            data=request.data, context={"event": event}
+            data=request.data, context={"event": event, "request": request}
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()

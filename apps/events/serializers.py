@@ -236,7 +236,7 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
     先雜湊才能寫入 ``ParticipantResponse.phone_last_three_hash``,
     ``slotAvailabilities`` 對應的是帶額外欄位的 M2M 關聯而非單一 model 欄位,
     兩者都不適合用 ``source=`` 直接映射。View 呼叫時須帶入
-    ``context={"event": event}``,``validate_slotAvailabilities`` 用來確認
+    ``context={"event": event, "request": request}``,``validate_slotAvailabilities`` 用來確認
     候選時段確實屬於該活動、且每個時段都恰好表態一次。
     """
 
@@ -260,7 +260,9 @@ class ParticipantResponseCreateSerializer(serializers.Serializer):
     def validate_nickname(self, value):
         trimmed = value.strip()
         event = self.context["event"]
-        if trimmed == event.host_nickname:
+        request = self.context.get("request")
+        is_host = request is not None and request.user == event.owner
+        if trimmed == event.host_nickname and not is_host:
             raise serializers.ValidationError(
                 "此暱稱與主揪暱稱相同，請改用其他暱稱",
                 code="NICKNAME_CONFLICTS_WITH_HOST",
