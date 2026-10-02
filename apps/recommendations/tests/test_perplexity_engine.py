@@ -1076,16 +1076,19 @@ def test_deeply_nested_json_raises_upstream_invalid_response(post):
         _recommend(post, body)
 
 
-# 執行計畫書 §6/§7 的防編造與品質要求:D8 只允許放寬規則 1、移除「輸出純 JSON」,
-# 其餘規則必須保留。
+# 保留防編造與品質要求；同步驗證以五間為目標及未確認資訊的新版規則。
 @pytest.mark.parametrize(
     "phrase",
     [
         "缺一不可",
         "不要把這個資訊只寫在文字敘述裡",
         "寧可留空也不可以編造",
-        "不可以說已放寬範圍，但回傳結果的地址其實都還在原本範圍內",
-        "不可以填寫制式化、與實際搜尋結果對不上的說明文字",
+        "結果地址須與該範圍相符",
+        "不可填寫制式化、與實際結果不符的說明",
+        "以回傳 5 間不同餐廳為目標",
+        "若可推薦的餐廳不足 5 間，繼續搜尋鄰近區域",
+        "不可編造或重複列店湊數",
+        "不得為湊足數量而忽略使用者的忌口／過敏條件",
     ],
 )
 def test_system_prompt_keeps_plan_guards(post, phrase):
@@ -1096,9 +1099,11 @@ def test_system_prompt_keeps_plan_guards(post, phrase):
 @pytest.mark.parametrize(
     "phrase",
     [
-        "而不是只寫「可避開牛肉」這種空泛描述",
+        "菜單、食材或過敏原資訊若無法確認，須具體註明",
         "每一筆都要反映該餐廳的實際特色",
-        "例如避免推薦只有吧檯座位的小店給大團體",
+        "容量若無法確認，須具體註明",
+        "以推薦 5 間不同餐廳為目標搜尋",
+        "原範圍內不足 5 間時繼續搜尋鄰近區域",
     ],
 )
 def test_user_prompt_keeps_plan_requirements(post, phrase):
