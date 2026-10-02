@@ -1341,6 +1341,78 @@ def test_participant_vote_nickname_conflicts_with_host_nickname_after_trim_retur
     assert ParticipantResponse.objects.count() == 0
 
 
+@pytest.mark.parametrize("nickname", ["小明", "  小明  "])
+def test_host_can_vote_with_host_nickname(nickname):
+    owner = _create_user()
+    event = _create_event(owner, host_nickname="小明")
+    response = _auth_client(owner).post(
+        _responses_url(event.id),
+        _response_payload(
+            nickname=nickname,
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+        ),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    vote = ParticipantResponse.objects.get(event=event)
+    assert vote.nickname == event.host_nickname
+    assert check_password("123", vote.phone_last_three_hash)
+    assert response.json()["isOwner"] is True
+
+
+def test_other_authenticated_user_cannot_vote_with_host_nickname():
+    owner = _create_user()
+    other = _create_user(email="other@example.com", google_sub="sub-2")
+    event = _create_event(owner)
+    response = _auth_client(other).post(
+        _responses_url(event.id),
+        _response_payload(
+            nickname=event.host_nickname,
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+        ),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["code"] == "NICKNAME_CONFLICTS_WITH_HOST"
+    assert not event.responses.exists()
+
+
+@pytest.mark.parametrize("phone", [None, "12", "abc"])
+def test_host_vote_requires_valid_phone_last_three(phone):
+    owner = _create_user()
+    event = _create_event(owner)
+    payload = _response_payload(
+        nickname=event.host_nickname,
+        slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+    )
+    if phone is None:
+        payload.pop("phoneLastThree")
+    else:
+        payload["phoneLastThree"] = phone
+    response = _auth_client(owner).post(_responses_url(event.id), payload, format="json")
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert not event.responses.exists()
+
+
+def test_invalid_bearer_token_can_still_submit_vote_anonymously():
+    event = _create_event(_create_user())
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION="Bearer garbage-invalid-token")
+    response = client.post(
+        _responses_url(event.id),
+        _response_payload(
+            slotAvailabilities=_slot_availabilities(available=[event.slots.first().id]),
+        ),
+        format="json",
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["isOwner"] is False
+
+
 def test_participant_vote_with_comment_is_stored():
     """新增:帶選填 comment 欄位 → 201,DB 該筆投票的 comment 為送出的值。"""
     owner = _create_user()
