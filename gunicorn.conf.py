@@ -1,6 +1,7 @@
 """gunicorn 設定(add-observability-stack design.md D2)。
 
-參數沿用原本 Dockerfile `CMD`。另外處理 prometheus_client multiprocess mode:
+參數沿用原本 Dockerfile `CMD`,threads 後來由 4 改為 8(D12)。
+另外處理 prometheus_client multiprocess mode:
 
 - `on_starting`(master 啟動、fork worker 前):清空並重建 `PROMETHEUS_MULTIPROC_DIR`,
   app 整體重啟後不殘留上次的數值。目錄在 container 自己的 /dev/shm(tmpfs)。
@@ -20,7 +21,8 @@ from prometheus_client.multiprocess import mark_process_dead
 bind = "0.0.0.0:8000"
 worker_class = "gthread"
 workers = 3
-threads = 4
+# 4 → 8(2026-10-02,design.md D12):AI 推薦同步等 Perplexity ~30 秒,12 個位子不夠。
+threads = 8
 timeout = 60
 worker_tmp_dir = "/dev/shm"
 

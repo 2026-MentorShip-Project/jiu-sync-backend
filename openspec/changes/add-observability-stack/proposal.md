@@ -12,6 +12,7 @@
 - EC2 新增 1GB swap(人工步驟)
 - Grafana Cloud 建 4 張 dashboard 與 4 條告警,JSON 匯出進 repo
 - 不改任何既有 API 行為
+- (2026-10-02 追加)gunicorn `threads` 4 → 8,同時處理的請求由 12 增為 24(design.md D12)
 - (2026-10-02 追加)`apps.*` / `config.*` logger 改為一行一筆 JSON 輸出到 stdout,並在登入、活動狀態變更、投票、通知信 task 加上關鍵事件 log(design.md D11)
 
 未涵蓋(明確排除):root 與第三方 logger 的 JSON 化;Postgres / Redis / PgBouncer / Celery 專屬 exporter;本機 compose 加 Alloy;docker-socket-proxy;Terraform 管理 Grafana 資源;CD pipeline。

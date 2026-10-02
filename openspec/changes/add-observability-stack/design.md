@@ -116,6 +116,15 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - 不開 gunicorn access log:nginx access log 已由 Alloy 收進 Loki(D7),重複且增加量。
 - 替代:純文字一行——肉眼好讀,但 Loki 只能字串比對;只改設定不加 log 點——info 不再被丟,但事件本來就沒有記,仍然看不到使用行為。
 
+### D12. gunicorn threads 4 → 8(2026-10-02 opsx:update,Task 4.4)
+
+背景:2026-10-04 預計 30–40 人同時使用。3 workers × 4 threads 只有 12 個同時處理的位子;AI 推薦同步呼叫 Perplexity 約 30 秒(上限 45 秒),12 人同時按就會讓所有 API 排隊,超過 nginx / gunicorn 60 秒逾時回 502/504。使用者確認改為 8 threads(24 個位子)。
+
+- 只改 `threads`,`workers` 維持 3:記憶體主要由 worker process 數決定(各約 80–100MB),同一 worker 的 thread 共用記憶體,t2.micro 無法再加 worker。等待上游屬 I/O,GIL 會釋放,多 thread 有效;CPU 密集工作不會因此變快。
+- DB 連線:每個 thread 一條 Django 連線到 PgBouncer(`CONN_MAX_AGE=60`),24 + Celery 1 遠低於 `MAX_CLIENT_CONN=100`;PgBouncer 為 transaction pooling、後端 `DEFAULT_POOL_SIZE=10`,AI view 呼叫 Perplexity 時不在 transaction 內、未開 `ATOMIC_REQUESTS`,不會長時間佔住後端連線。
+- 不解決的部分:超過 24 個同時 AI 請求仍會排隊。限制 AI 同時數或改非同步留待活動後另開 change。
+- 驗證:部署後在 App dashboard 觀察 latency 與 5xx;Host dashboard 觀察 MemAvailable 無明顯下降。
+
 ## Risks / Trade-offs
 
 - [docker.sock 與 containerd.sock 等同 host root] → 所有掛載 `:ro`、不開 privileged、image 釘版本、不 publish port;單人專案接受此風險。之後有多人協作或主機上有更敏感的服務時,再評估 docker-socket-proxy。
