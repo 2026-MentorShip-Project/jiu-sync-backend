@@ -225,6 +225,9 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
+# worker 不把 sys.stdout 換成 LoggingProxy,app 的 JSON log 才不會被包上 Celery 前綴
+# 而無法被 Loki 解析(add-observability-stack design.md D11)。
+CELERY_WORKER_REDIRECT_STDOUTS = False
 # 正式環境需要真的部署一個 Celery worker 程序消費佇列，預設 False（真非同步）。
 # dev.py 覆寫成 True——本機/測試沒有另外跑 worker，.delay() 同步在原地執行完，
 # 見 openspec/changes/add-event-lifecycle/design.md D2。
@@ -273,8 +276,9 @@ PERPLEXITY_TIMEOUT_SECONDS = env.int("PERPLEXITY_TIMEOUT_SECONDS", default=45)
 # 見 openspec/changes/add-ai-restaurant-recommendation/design.md D3/D12。
 AI_RECOMMENDATION_QUOTA_PER_USER = env.int("AI_RECOMMENDATION_QUOTA_PER_USER", default=20)
 
-# 結構化 JSON log:只設定 apps.recommendations(每行一個 JSON 物件到 stdout,供
-# Loki 依欄位過濾)。其他 logger 維持 Django 預設,不改既有輸出格式。
+# 結構化 JSON log(每行一個 JSON 物件到 stdout,供 Loki 依欄位過濾)。
+# apps.recommendations 用白名單、不輸出訊息本文;其餘 apps.* / config.* 見
+# openspec/changes/add-observability-stack/design.md D11。
 # disable_existing_loggers 必須為 False,否則會把已建立的其他 logger 靜音。
 # 見 openspec/changes/add-ai-restaurant-recommendation/design.md D11。
 LOGGING = {
@@ -282,6 +286,8 @@ LOGGING = {
     "disable_existing_loggers": False,
     "formatters": {
         "json": {"()": "apps.recommendations.logging.JsonFormatter"},
+        # 含訊息本文的 JSON(add-observability-stack design.md D11)。
+        "app_json": {"()": "config.logging.AppJsonFormatter"},
     },
     "handlers": {
         "recommendations_stdout": {
@@ -289,8 +295,16 @@ LOGGING = {
             "class": "apps.recommendations.logging.StdoutStreamHandler",
             "formatter": "json",
         },
+        "app_stdout": {
+            "class": "apps.recommendations.logging.StdoutStreamHandler",
+            "formatter": "app_json",
+        },
     },
     "loggers": {
+        # 其餘 app 自身的 logger(D11)。root 與第三方 logger 不動,避免雜訊。
+        # apps.recommendations 是更具體的 logger 且不 propagate,不會重複輸出。
+        "apps": {"handlers": ["app_stdout"], "level": "INFO", "propagate": False},
+        "config": {"handlers": ["app_stdout"], "level": "INFO", "propagate": False},
         "apps.recommendations": {
             "handlers": ["recommendations_stdout"],
             "level": "INFO",

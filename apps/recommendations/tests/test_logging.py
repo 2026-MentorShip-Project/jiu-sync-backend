@@ -5,7 +5,8 @@
 兩個 seam:
 - `JsonFormatter.format(record)`:直接餵 `logging.LogRecord`,驗證輸出字串。
 - Django 設定好的 `apps.recommendations` logger:驗證實際寫到 stdout 的是 JSON,
-  而其他 logger(`apps.events`、`config.exceptions`)維持原本行為。
+  其他 logger 不套用本 app 的白名單 handler(2026-10-02 起改由 add-observability-stack
+  design.md D11 的 `apps` / `config` JSON handler 輸出)。
 
 注意:`apps.recommendations` 設 `propagate: False`,pytest 的 `caplog` 掛在 root
 logger 上抓不到它,所以這裡用 `capsys` 讀 stdout,不用 `caplog`。
@@ -323,21 +324,18 @@ def test_recommendations_logger_does_not_propagate_to_root():
     assert handler.records == []
 
 
-def test_other_loggers_keep_default_behavior(caplog, capsys):
-    events_logger = logging.getLogger("apps.events.views")
-    exceptions_logger = logging.getLogger("config.exceptions")
+def test_other_loggers_do_not_use_recommendations_whitelist_handler(capsys):
+    # 2026-10-02 需求變更(add-observability-stack design.md D11):其他 app logger
+    # 改由 `apps` / `config` 的 JSON handler 輸出(含訊息本文),詳細行為見
+    # config/tests/test_app_logging.py。這裡只確認它們不會被套上本 app 的白名單
+    # handler(否則訊息本文會消失)。
+    logging.getLogger("apps.events.views").warning("event warning %s", "abc")
 
-    with caplog.at_level(logging.WARNING):
-        events_logger.warning("event warning %s", "abc")
-        exceptions_logger.error("API error response: %s", "GET")
-
-    messages = [(r.name, r.getMessage()) for r in caplog.records]
-    assert ("apps.events.views", "event warning abc") in messages
-    assert ("config.exceptions", "API error response: GET") in messages
-    # 其他 logger 沒有被掛上 JSON handler,stdout 不會出現 JSON 行
-    assert "event warning abc" not in capsys.readouterr().out
-    for name in ("apps.events", "apps.events.views", "config.exceptions", "config"):
-        assert logging.getLogger(name).handlers == []
+    data = json.loads(capsys.readouterr().out.strip())
+    assert data["message"] == "event warning abc"
+    for name in ("apps.events", "apps.events.views", "config.exceptions"):
+        handlers = logging.getLogger(name).handlers
+        assert not any(isinstance(h.formatter, JsonFormatter) for h in handlers)
 
 
 _DISABLE_PROBE = """
@@ -367,10 +365,12 @@ def test_django_setup_does_not_disable_loggers_created_before_it():
     assert result.stdout.strip().splitlines()[-1] == "[False, False]"
 
 
-def test_logging_setting_only_configures_recommendations_logger():
+def test_logging_setting_keeps_recommendations_logger_config():
+    # 2026-10-02 需求變更(design.md D11):LOGGING 另外設定 `apps` / `config`,
+    # 本 app 的設定維持不變。
     assert settings.LOGGING["disable_existing_loggers"] is False
-    assert set(settings.LOGGING["loggers"]) == {"apps.recommendations"}
     cfg = settings.LOGGING["loggers"]["apps.recommendations"]
     assert cfg["level"] == "INFO"
     assert cfg["propagate"] is False
+    assert cfg["handlers"] == ["recommendations_stdout"]
     assert "root" not in settings.LOGGING

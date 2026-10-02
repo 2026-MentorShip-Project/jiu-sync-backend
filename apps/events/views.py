@@ -23,6 +23,7 @@ from apps.notifications.tasks import (
     send_event_reopened_email,
 )
 from config.exceptions import ApiError, Gone
+from config.logging import log_event_on_commit
 
 from .authentication import OptionalJWTAuthentication
 from .lifecycle import compute_display_status
@@ -98,6 +99,18 @@ def _schedule_notification(task, event_id, *task_args):
             )
 
     transaction.on_commit(_run)
+
+
+def _log_event_transition(event_name, event_id, user):
+    """主揪對活動的狀態變更事件 log,commit 後輸出(add-observability-stack D11)。
+    只帶 id,不帶活動標題與 email。"""
+    log_event_on_commit(
+        logger,
+        event_name,
+        event_name.replace(".", " "),
+        event_id=str(event_id),
+        user_id=str(user.id),
+    )
 
 
 def _get_client_ip(request):
@@ -292,6 +305,7 @@ class EventCreateView(EventListView):
         # hostEmail 欄位——EventCreateSerializer 根本不宣告該欄位。
         event = serializer.save(owner=request.user, host_email=request.user.email)
         _schedule_notification(send_event_created_email, event.id)
+        _log_event_transition("event.created", event.id, request.user)
 
         # rstrip 避免 FRONTEND_BASE_URL 若帶結尾斜線組出雙斜線的 shareUrl。
         frontend_base_url = settings.FRONTEND_BASE_URL.rstrip("/")
@@ -425,7 +439,14 @@ class ParticipantResponseCreateView(APIView):
             data=request.data, context={"event": event}
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        participant_response = serializer.save()
+        log_event_on_commit(
+            logger,
+            "event.response_created",
+            "participant response created",
+            event_id=str(event.id),
+            response_id=str(participant_response.id),
+        )
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         response_serializer = EventDetailSerializer(event, context={"request": request})
@@ -823,6 +844,7 @@ class EventFinalizeView(APIView):
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         _schedule_notification(send_event_finalized_email, event.id, event.finalized_at)
+        _log_event_transition("event.finalized", event.id, request.user)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
@@ -880,6 +902,7 @@ class EventCancelView(APIView):
 
         event = _get_event_or_404(id, queryset=_event_with_responses_queryset())
         _schedule_notification(send_event_cancelled_email, event.id, event.cancelled_at)
+        _log_event_transition("event.cancelled", event.id, request.user)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
@@ -936,6 +959,7 @@ class EventReopenView(APIView):
         _schedule_notification(
             send_event_reopened_email, event.id, event.response_deadline
         )
+        _log_event_transition("event.reopened", event.id, request.user)
 
         response_serializer = EventDetailSerializer(event, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_200_OK)
