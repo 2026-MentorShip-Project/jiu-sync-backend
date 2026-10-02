@@ -72,6 +72,26 @@ metrics 端點 SHALL 只在請求帶有與設定相符的 bearer token 時回傳
 - **WHEN** 部署導致收集元件重啟
 - **THEN** 外部平台上重啟前已送出的 nginx log 沒有重複
 
+### Requirement: 應用程式 log 結構化輸出與關鍵事件紀錄
+
+應用程式自身(`apps.*`、`config.*`)的 log SHALL 以每行一筆 JSON 輸出到 stdout,含時間、等級、logger 名稱、訊息本文與事件名稱,INFO 以上 SHALL NOT 被丟棄。登入成功、登出、活動建立 / 定案 / 取消 / 重新開放、參與者投票、通知信寄出或略過 SHALL 各記一筆事件 log,只以 id 識別對象,SHALL NOT 含 email、活動標題、留言內容或 token。狀態變更的事件 log SHALL 只在資料寫入成功(交易 commit)後輸出。
+
+#### Scenario: 一般 warning 可依欄位篩選
+- **WHEN** `apps.events` 或 `config.exceptions` 記錄一筆 WARNING
+- **THEN** stdout 出現一行 JSON,`level` 為 `WARNING`、`logger` 為該 logger 名稱、`message` 為訊息本文
+
+#### Scenario: 主揪建立活動
+- **WHEN** 已登入主揪成功建立活動
+- **THEN** 輸出 `event` 為 `event.created` 的 log,含 `event_id` 與 `user_id`,不含 email 與活動標題
+
+#### Scenario: 交易回滾不留下事件 log
+- **WHEN** 狀態變更所在的交易被回滾
+- **THEN** 不輸出該狀態變更的事件 log
+
+#### Scenario: 通知信因狀態已變而略過
+- **WHEN** 通知信 task 執行時活動狀態已不符合
+- **THEN** 輸出 `event` 為 `notification.skipped` 的 log,含 `reason`
+
 ### Requirement: 觀測系統故障不影響應用程式
 
 收集元件停止、被 OOM kill、或外部平台無法連線時,應用程式、worker 與資料庫 SHALL 正常運作。收集元件的記憶體用量 SHALL 有上限。正式環境缺少外部平台設定時,部署 SHALL 輸出警告並繼續完成應用程式部署,SHALL NOT 中止。

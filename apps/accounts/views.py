@@ -10,6 +10,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from config.exceptions import ApiError
+from config.logging import log_event_on_commit
 
 from .models import User
 from .serializers import GoogleLoginSerializer, UserSerializer
@@ -61,7 +62,13 @@ class GoogleLoginView(APIView):
         try:
             claims = verify_google_id_token(serializer.validated_data["idToken"])
         except GoogleTokenError as exc:
-            logger.warning("Google id_token verification failed: %s", exc)
+            # 只記例外類型,不記訊息:google-auth 對格式錯誤的 token 會把 token
+            # 原文放進例外訊息(add-observability-stack design.md D11)。
+            logger.warning(
+                "Google id_token verification failed: %s",
+                type(exc.__cause__ or exc).__name__,
+                extra={"event": "auth.login_failed"},
+            )
             raise ApiError(
                 "Google 登入驗證失敗，請重新登入", code="INVALID_ID_TOKEN", status_code=401
             ) from exc
@@ -71,6 +78,7 @@ class GoogleLoginView(APIView):
         display_name = claims.get("name", "")
         avatar_url = claims.get("picture", "")
 
+        is_new_user = True
         try:
             with transaction.atomic():
                 user = User.objects.create_user(
@@ -80,6 +88,7 @@ class GoogleLoginView(APIView):
                     avatar_url=avatar_url,
                 )
         except IntegrityError as exc:
+            is_new_user = False
             diag = getattr(exc.__cause__, "diag", None)
             constraint_name = getattr(diag, "constraint_name", None)
             if constraint_name == "accounts_user_google_sub_key":
@@ -109,6 +118,13 @@ class GoogleLoginView(APIView):
 
         refresh = RefreshToken.for_user(user)
         record_refresh_token(user, refresh)
+        log_event_on_commit(
+            logger,
+            "auth.login_succeeded",
+            "login succeeded",
+            user_id=str(user.id),
+            is_new_user=is_new_user,
+        )
 
         response = Response(
             {
@@ -207,6 +223,7 @@ class LogoutView(APIView):
             )
 
         revoke_refresh_token_record(record)
+        log_event_on_commit(logger, "auth.logout", "logout", user_id=str(request.user.id))
 
         response = Response(status=205)
         response.delete_cookie(REFRESH_TOKEN_COOKIE_NAME, path=REFRESH_TOKEN_COOKIE_PATH)

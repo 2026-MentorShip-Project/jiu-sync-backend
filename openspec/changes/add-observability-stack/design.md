@@ -70,7 +70,7 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
 - `loki.process` 共用遮蔽:`Bearer\s+[^\s"',;]+`(遇到引號、逗號、分號即停,避免吃掉 JSON 的結尾引號;Task 3.1 code-review 前發現 `Bearer\s+\S+` 會把 `"Bearer abc"` 變成 `"[REDACTED]`,opsx:update 使用者確認)、JWT(`eyJ[\w-]+\.[\w-]+\.[\w-]+`)、email → `[REDACTED]`;IP 保留。
 - 遮蔽規則只寫在 `redact.alloy`(`declare` 模組),`config.alloy` 以 `import.file` 引用,測試也 import 同一份檔案,確保測到的就是正式規則。
 - 遮蔽規則以樣本 log 驗證:用 docker 跑 Alloy,`loki.source.file` 讀 fixture,`loki.echo`(或寫檔)輸出後比對。在 Task 3 實作時確定驗證方式,但驗證本身不可省略。
-- 不改 log 格式(JSON 化另開 change)。
+- 不改 log 格式(JSON 化另開 change)。2026-10-02 修訂:app 自身 logger 的 JSON 化改併入本 change,見 D11;Alloy 端收集與遮蔽規則不變。
 
 ### D8. 資源、權限與持久化(grill Q3/Q11/Q13)
 
@@ -99,6 +99,31 @@ EC2 只跑 Alloy,`prometheus.remote_write` 推 metrics、`loki.write` 推 log �
   4. 15 分鐘內任一 container 重啟
 - 門檻值先用以上保守值,上線一兩週後依實際數據調整。
 - 替代:Terraform grafana provider——需要另一組寫入 token,且 state 目前放在本機;留待之後做 CD 時再評估。
+
+### D11. App 全面結構化 log 與關鍵事件 log 點(2026-10-02 opsx:update,Task 4.3)
+
+背景:Task 4.1 後在 Loki 幾乎看不到 app log。實測 `apps.events`、`apps.accounts`、`config.*` 沒有任何 handler、root 為 WARNING:`logger.info` 全部被丟棄;warning/error 只經 Python `lastResort` 印出裸訊息(無時間、等級、logger 名稱)。30–40 人實際使用前需要能查到發生了什麼。使用者確認(grill):範圍含新增關鍵 log 點、JSON 格式含訊息本文、併入本 change。
+
+- **掛載點**:`LOGGING` 新增 `apps`、`config` 兩個 logger(level INFO、`propagate: False`),handler 為既有 `StdoutStreamHandler`,formatter 為新的 `config.logging.AppJsonFormatter`。`apps.recommendations` 既有設定(白名單 JSON、不輸出訊息本文,見 add-ai-restaurant-recommendation D11)完全不動——它是更具體的 logger 且 `propagate: False`,不會重複輸出。root 與第三方 logger(httpx、urllib3、celery、django)不動,避免雜訊;Celery worker 預設接管 root 也不受影響。
+- **格式**:每筆一行 JSON:`timestamp`、`level`、`logger`、`message`(`record.getMessage()`)、`event`(extra 帶入,無則 null)、白名單 extra 欄位、有例外時 `exc_type`/`exc_message`/`traceback`。序列化失敗時退回只含固定欄位與 `format_error` 的一行,不讓整筆消失。白名單:`event`、`user_id`、`event_id`、`response_id`、`task`、`reason`、`recipient_count`、`is_new_user`。
+- **個資**:訊息本文與 extra SHALL NOT 含 email、活動標題、留言內容、token;一律用 id。Alloy 的 email/JWT/Bearer 遮蔽(D7)是第二道防線,不是主要依賴。
+- **關鍵 log 點**(INFO,`event` 名稱固定):
+  - `auth.login_succeeded`(`user_id`、`is_new_user`)、`auth.logout`(`user_id`);既有登入失敗 warning 補 `event=auth.login_failed`,且改為只記例外類型(code-review 抓到 google-auth 對格式錯誤的 token 會把 token 原文放進例外訊息,原本經 `lastResort` 印出,非 `eyJ` 開頭時 Alloy 遮蔽不到)。
+  - `event.created`、`event.finalized`、`event.cancelled`、`event.reopened`(`event_id`、`user_id`);`event.response_created`(`event_id`、`response_id`,參與者匿名不記 user)。
+  - 通知信 task:`notification.sent`(`task`、`event_id`、`recipient_count`)、`notification.skipped`(`task`、`event_id`、`reason` ∈ `event_missing`/`status_changed`/`stale`/`no_recipients`)。寄信例外照舊拋出,由 Celery 記錄失敗,不吞掉。
+- **寫入後才記**:狀態變更的 log 以 `transaction.on_commit()` 送出,交易 rollback 時不留下「已建立」的假紀錄;不在 atomic 內時立即執行。
+- `CELERY_WORKER_REDIRECT_STDOUTS = False`:Celery worker 預設把 `sys.stdout` 換成 LoggingProxy,`StdoutStreamHandler` 會寫進它,通知信 task 的 JSON 被包上 `[... WARNING/ForkPoolWorker-n]` 前綴而無法以 `| json` 解析(實作時發現)。
+- 不開 gunicorn access log:nginx access log 已由 Alloy 收進 Loki(D7),重複且增加量。
+- 替代:純文字一行——肉眼好讀,但 Loki 只能字串比對;只改設定不加 log 點——info 不再被丟,但事件本來就沒有記,仍然看不到使用行為。
+
+### D12. gunicorn threads 4 → 8(2026-10-02 opsx:update,Task 4.4)
+
+背景:2026-10-04 預計 30–40 人同時使用。3 workers × 4 threads 只有 12 個同時處理的位子;AI 推薦同步呼叫 Perplexity 約 30 秒(上限 45 秒),12 人同時按就會讓所有 API 排隊,超過 nginx / gunicorn 60 秒逾時回 502/504。使用者確認改為 8 threads(24 個位子)。
+
+- 只改 `threads`,`workers` 維持 3:記憶體主要由 worker process 數決定(各約 80–100MB),同一 worker 的 thread 共用記憶體,t2.micro 無法再加 worker。等待上游屬 I/O,GIL 會釋放,多 thread 有效;CPU 密集工作不會因此變快。
+- DB 連線:每個 thread 一條 Django 連線到 PgBouncer(`CONN_MAX_AGE=60`),24 + Celery 1 遠低於 `MAX_CLIENT_CONN=100`;PgBouncer 為 transaction pooling、後端 `DEFAULT_POOL_SIZE=10`,AI view 呼叫 Perplexity 時不在 transaction 內、未開 `ATOMIC_REQUESTS`,不會長時間佔住後端連線。
+- 不解決的部分:超過 24 個同時 AI 請求仍會排隊。限制 AI 同時數或改非同步留待活動後另開 change。
+- 驗證:部署後在 App dashboard 觀察 latency 與 5xx;Host dashboard 觀察 MemAvailable 無明顯下降。
 
 ## Risks / Trade-offs
 

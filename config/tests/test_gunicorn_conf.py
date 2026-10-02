@@ -1,6 +1,6 @@
 """`gunicorn.conf.py` 與 Dockerfile `CMD`(add-observability-stack design.md D2)。
 
-- 參數沿用原本 Dockerfile `CMD`:bind 0.0.0.0:8000、gthread、3 workers、4 threads、
+- 參數沿用原本 Dockerfile `CMD`:bind 0.0.0.0:8000、gthread、3 workers、8 threads(D12 由 4 改)、
   timeout 60、worker_tmp_dir /dev/shm——以 gunicorn 自己的設定載入結果驗證。
 - `on_starting` 清空並重建 `PROMETHEUS_MULTIPROC_DIR`(重啟不殘留舊數值);
   `child_exit` 以 worker pid 呼叫 `mark_process_dead`。
@@ -50,7 +50,8 @@ def test_gunicorn_loads_same_parameters_as_previous_cmd(monkeypatch):
     assert cfg.bind == ["0.0.0.0:8000"]
     assert cfg.worker_class_str == "gthread"
     assert cfg.workers == 3
-    assert cfg.threads == 4
+    # 2026-10-02 需求變更:4 → 8(add-observability-stack design.md D12)。
+    assert cfg.threads == 8
     assert cfg.timeout == 60
     assert cfg.worker_tmp_dir == "/dev/shm"
 

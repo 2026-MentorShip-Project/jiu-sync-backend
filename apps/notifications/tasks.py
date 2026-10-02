@@ -1,8 +1,39 @@
+import logging
+
 from celery import shared_task
 from django.conf import settings
 from django.core.mail import send_mail
 
 from apps.events.models import Event
+
+logger = logging.getLogger(__name__)
+
+
+def _log_sent(task, event_id, recipient_count):
+    """寄出後記一筆(add-observability-stack design.md D11)。不記收件人 email 與標題。"""
+    logger.info(
+        "notification sent",
+        extra={
+            "event": "notification.sent",
+            "task": task,
+            "event_id": str(event_id),
+            "recipient_count": recipient_count,
+        },
+    )
+
+
+def _log_skipped(task, event_id, reason):
+    """reason: event_missing / status_changed / stale / no_recipients(D11)。"""
+    logger.info(
+        "notification skipped: %s",
+        reason,
+        extra={
+            "event": "notification.skipped",
+            "task": task,
+            "event_id": str(event_id),
+            "reason": reason,
+        },
+    )
 
 
 @shared_task
@@ -66,8 +97,13 @@ def send_event_created_email(event_id):
     核對 ``event`` 是否存在（純防禦性，理論上不會發生，系統沒有刪除活動的
     功能）。
     """
+    task = "send_event_created_email"
     event = Event.objects.filter(pk=event_id).first()
-    if event is None or not event.host_email:
+    if event is None:
+        _log_skipped(task, event_id, "event_missing")
+        return
+    if not event.host_email:
+        _log_skipped(task, event_id, "no_recipients")
         return
 
     body = (
@@ -80,6 +116,7 @@ def send_event_created_email(event_id):
         settings.DEFAULT_FROM_EMAIL,
         [event.host_email],
     )
+    _log_sent(task, event_id, 1)
 
 
 @shared_task
@@ -95,16 +132,23 @@ def send_event_finalized_email(event_id, finalized_at):
     現在的 ``finalized_at`` 一致，不一致代表這是被後續 transition 蓋過的
     過期 task，不該寄信（design.md D10）。
     """
+    task = "send_event_finalized_email"
     event = Event.objects.select_related("final_slot").filter(pk=event_id).first()
-    if event is None or event.status != Event.Status.FINALIZED:
+    if event is None:
+        _log_skipped(task, event_id, "event_missing")
+        return
+    if event.status != Event.Status.FINALIZED:
         # code-review 抓到:on_commit 排入佇列後、task 真正執行前，活動可能
         # 已經被後續請求改成別的狀態（例如很快又被取消）——這裡是 task 實際
         # 執行當下唯一能重新核對狀態的地方，早期檢查用的是排入當下的舊值。
+        _log_skipped(task, event_id, "status_changed")
         return
     if event.finalized_at != finalized_at:
+        _log_skipped(task, event_id, "stale")
         return
     recipients = _notification_recipients(event)
     if not recipients:
+        _log_skipped(task, event_id, "no_recipients")
         return
 
     slot = event.final_slot
@@ -117,6 +161,7 @@ def send_event_finalized_email(event_id, finalized_at):
     ]
     body = "\n".join(line for line in lines if line)
     _send_to_each_recipient(f"「{event.title}」已定案", body, recipients)
+    _log_sent(task, event_id, len(recipients))
 
 
 @shared_task
@@ -127,14 +172,21 @@ def send_event_cancelled_email(event_id, cancelled_at):
     ``cancelled_at``:同 ``send_event_finalized_email`` 的 ``finalized_at``，
     過期 task 判斷用（design.md D10）。
     """
+    task = "send_event_cancelled_email"
     event = Event.objects.filter(pk=event_id).first()
-    if event is None or event.status != Event.Status.CANCELLED:
+    if event is None:
+        _log_skipped(task, event_id, "event_missing")
+        return
+    if event.status != Event.Status.CANCELLED:
         # 同 send_event_finalized_email 的理由——task 執行當下重新核對狀態。
+        _log_skipped(task, event_id, "status_changed")
         return
     if event.cancelled_at != cancelled_at:
+        _log_skipped(task, event_id, "stale")
         return
     recipients = _notification_recipients(event)
     if not recipients:
+        _log_skipped(task, event_id, "no_recipients")
         return
 
     body = (
@@ -142,6 +194,7 @@ def send_event_cancelled_email(event_id, cancelled_at):
         f"活動詳情：{_event_share_url(event)}"
     )
     _send_to_each_recipient(f"「{event.title}」已取消", body, recipients)
+    _log_sent(task, event_id, len(recipients))
 
 
 @shared_task
@@ -154,14 +207,21 @@ def send_event_reopened_email(event_id, response_deadline):
     UPDATE 寫入的 ``response_deadline`` 本身當作 transition 身分——若資料庫
     現在的值跟排入當下不同，代表活動後來又被重新開放過一次。
     """
+    task = "send_event_reopened_email"
     event = Event.objects.filter(pk=event_id).first()
-    if event is None or event.status != Event.Status.ACTIVE:
+    if event is None:
+        _log_skipped(task, event_id, "event_missing")
+        return
+    if event.status != Event.Status.ACTIVE:
         # 同 send_event_finalized_email 的理由——task 執行當下重新核對狀態。
+        _log_skipped(task, event_id, "status_changed")
         return
     if event.response_deadline != response_deadline:
+        _log_skipped(task, event_id, "stale")
         return
     recipients = _notification_recipients(event)
     if not recipients:
+        _log_skipped(task, event_id, "no_recipients")
         return
 
     body = (
@@ -170,3 +230,4 @@ def send_event_reopened_email(event_id, response_deadline):
         f"活動詳情：{_event_share_url(event)}"
     )
     _send_to_each_recipient(f"「{event.title}」已重新開放投票", body, recipients)
+    _log_sent(task, event_id, len(recipients))
