@@ -7,7 +7,6 @@
 - 重寫 `README.md`（繁體中文，主檔）：專案簡介與亮點、技術棧、精簡 Quick Start、部署與可觀測性摘要、開發流程（OpenSpec / TDD）與 Branch 規範
 - 新增 `README.en.md`（英文版），內容與中文主檔段落對應；兩份檔案頂端互相連結
 - 架構、ER、API、安全性等細節不重複撰寫，改以連結指向 `docs/report/`
-- 新增 README 結構測試，自動檢查必要段落、雙語互連與相對連結是否有效
 
 ## Capabilities
 
@@ -21,5 +20,5 @@
 
 ## Impact
 
-- 檔案：`README.md`（改寫）、`README.en.md`（新增）、`config/tests/test_readme.py`（新增）
+- 檔案：`README.md`（改寫）、`README.en.md`（新增）
 - 不影響程式碼、API、相依套件與部署流程
