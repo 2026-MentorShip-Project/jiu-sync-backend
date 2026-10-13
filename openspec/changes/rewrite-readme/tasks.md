@@ -7,4 +7,5 @@
 
 ## 2. 英文版 README.en.md 與雙向連結
 
-- [ ] 2.1 [RED→GREEN]（design.md D2、D4）擴充 `config/tests/test_readme.py`：`README.en.md` 存在；包含 D1 九個段落的英文標題；`README.md` 頂端連到 `README.en.md`，`README.en.md` 頂端連回 `README.md`；英文版相對連結同樣全部有效；兩份檔案段落數量一致。確認為 FAIL 後，撰寫 `README.en.md`（對應中文主檔，並註明以中文版為準），在 `README.md` 頂端加入語言切換連結 — (auto) `uv run pytest config/tests/test_readme.py -q`、`uv run pytest -q`、`uv run ruff check .` 全綠；(manual) 使用者檢視英文版內容與兩份互相連結
+- [x] 2.1 [RED→GREEN]（design.md D2、D4）擴充 `config/tests/test_readme.py`：`README.en.md` 存在；包含 D1 九個段落的英文標題；`README.md` 頂端連到 `README.en.md`，`README.en.md` 頂端連回 `README.md`；英文版相對連結同樣全部有效；兩份檔案段落數量一致。確認為 FAIL 後，撰寫 `README.en.md`（對應中文主檔，並註明以中文版為準），在 `README.md` 頂端加入語言切換連結 — (auto) `uv run pytest config/tests/test_readme.py -q`、`uv run pytest -q`、`uv run ruff check .` 全綠；(manual) 使用者檢視英文版內容與兩份互相連結
+  - 結果:RED 時 2 則失敗、9 則錯誤(`test_readme_zh_links_to_english_at_top`、`test_readme_en_exists` 失敗;其餘 9 則英文版測試因 `README.en.md` 不存在,在 fixture 就出錯),`head_link_targets` 的單元測試當時就通過。撰寫 `README.en.md`、在 `README.md` 第一行加上 `繁體中文 | [English](README.en.md)` 後 GREEN:`test_readme.py` 33 passed、全套 1139 passed、ruff 全綠。code-review 後修正:語言切換連結從「前 3 個非空白行」收緊為「第一個非空白行」(先補邊界測試並確認紅燈,見 incident-log 2026-10-13)、改用 `README_ZH.name`/`README_EN.name`、抽出 `relative_link_targets`、Alloy「旁路」的英譯改為 out-of-band sidecar;修正後 `test_readme.py` 34 passed。

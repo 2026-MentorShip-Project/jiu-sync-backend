@@ -13,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 README_ZH = REPO_ROOT / "README.md"
+README_EN = REPO_ROOT / "README.en.md"
 
 # D1 第 2–9 段的 H2 標題(依序)。
 # 第 1 段(標題)為唯一的 H1,另以 test_readme_zh_has_single_h1_title 檢查。
@@ -26,6 +27,21 @@ ZH_SECTION_HEADINGS = [
     "Branch 規範",
     "延伸文件",
 ]
+
+# 與 ZH_SECTION_HEADINGS 一一對應的英文標題(task 2.1,design.md D2、D4)。
+EN_SECTION_HEADINGS = [
+    "Highlights",
+    "Tech Stack",
+    "Architecture",
+    "Quick Start",
+    "Deployment & Observability",
+    "Development Workflow",
+    "Branch Conventions",
+    "Further Reading",
+]
+
+# 語言切換連結必須出現在檔案第一個非空白行(D2「頂端第一行互相連結」)。
+LANG_SWITCH_MAX_LINES = 1
 
 QUICK_START_FILES = [".env.example", "docker-compose.yml"]
 
@@ -83,6 +99,17 @@ def headings(markdown: str, level: int) -> list[str]:
     ]
 
 
+def head_link_targets(markdown: str, max_lines: int = LANG_SWITCH_MAX_LINES) -> list[str]:
+    """回傳檔案頂端前 max_lines 個非空白行中的連結 target(用於檢查語言切換連結)。"""
+    head = [line for line in markdown.splitlines() if line.strip()][:max_lines]
+    return link_targets("\n".join(head))
+
+
+def relative_link_targets(markdown: str) -> list[str]:
+    """回傳排序後的相對連結 target(略過外部連結與頁內錨點)。"""
+    return sorted(t for t in link_targets(markdown) if not t.startswith(_SKIP_PREFIXES))
+
+
 # --- 連結檢查器本身(負向案例) ---
 
 
@@ -138,6 +165,26 @@ class TestSection:
         assert section("", "Quick Start") == ""
 
 
+class TestHeadLinkTargets:
+    def test_finds_link_in_first_line(self):
+        assert head_link_targets("[English](README.en.md)\n# Title\n") == ["README.en.md"]
+
+    def test_skips_leading_blank_lines(self):
+        assert head_link_targets("\n\n  \n[EN](README.en.md)\n") == ["README.en.md"]
+
+    def test_ignores_link_below_head(self):
+        md = "# Title\n\nintro\n\nmore\n\n[English](README.en.md)\n"
+        assert head_link_targets(md) == []
+
+    def test_ignores_link_on_second_non_empty_line(self):
+        # D2:語言切換必須在第一行;H1 之後、或「以中文版為準」說明中的連結不算
+        md = "# Title\n\n> see [中文](README.md)\n"
+        assert head_link_targets(md) == []
+
+    def test_empty_markdown(self):
+        assert head_link_targets("") == []
+
+
 # --- README.md(繁中主檔) ---
 
 
@@ -178,3 +225,65 @@ def test_readme_zh_links_architecture_doc(readme_zh):
 def test_quick_start_referenced_files_exist(readme_zh, filename):
     assert filename in section(readme_zh, "Quick Start"), f"Quick Start 未提到 {filename}"
     assert (REPO_ROOT / filename).is_file()
+
+
+def test_readme_zh_links_to_english_at_top(readme_zh):
+    assert README_EN.name in head_link_targets(readme_zh), "README.md 頂端缺少 README.en.md 連結"
+
+
+# --- README.en.md(英文版) ---
+
+
+@pytest.fixture(scope="module")
+def readme_en() -> str:
+    assert README_EN.is_file(), "README.en.md 不存在"
+    return README_EN.read_text(encoding="utf-8")
+
+
+def test_readme_en_exists():
+    assert README_EN.is_file()
+
+
+def test_heading_lists_correspond():
+    assert len(EN_SECTION_HEADINGS) == len(ZH_SECTION_HEADINGS)
+    assert len(set(EN_SECTION_HEADINGS)) == len(EN_SECTION_HEADINGS)
+
+
+def test_readme_en_has_single_h1_title(readme_en):
+    assert len(headings(readme_en, 1)) == 1
+
+
+def test_readme_en_has_d1_sections_in_order(readme_en):
+    # 英文版的 H2 必須與清單完全一致(不多不少、順序相同)
+    assert headings(readme_en, 2) == EN_SECTION_HEADINGS
+
+
+def test_readme_en_links_to_chinese_at_top(readme_en):
+    assert README_ZH.name in head_link_targets(readme_en), "README.en.md 頂端缺少 README.md 連結"
+
+
+def test_readme_en_relative_links_resolve(readme_en):
+    assert find_broken_links(readme_en, README_EN.parent) == []
+
+
+def test_readme_en_links_architecture_doc(readme_en):
+    assert "docs/report/01-architecture.md" in link_targets(section(readme_en, "Architecture"))
+
+
+@pytest.mark.parametrize("filename", QUICK_START_FILES)
+def test_readme_en_quick_start_mentions_files(readme_en, filename):
+    assert filename in section(readme_en, "Quick Start"), f"英文版 Quick Start 未提到 {filename}"
+
+
+def test_readmes_have_same_section_count(readme_zh, readme_en):
+    assert len(headings(readme_zh, 2)) == len(headings(readme_en, 2))
+
+
+def test_readmes_have_same_relative_links(readme_zh, readme_en):
+    # 翻譯不應增減連結;互相連結的語言切換 target 除外
+    switch = {README_ZH.name, README_EN.name}
+
+    def relative(md: str) -> list[str]:
+        return [t for t in relative_link_targets(md) if t not in switch]
+
+    assert relative(readme_zh) == relative(readme_en)
